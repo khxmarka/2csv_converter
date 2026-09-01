@@ -15,9 +15,18 @@ var reservedStems = map[string]struct{}{
 }
 
 // FileBase делает из имени таблицы безопасную основу имени Windows-файла.
+// Пустое после чистки → "table".
 func FileBase(table string) string {
+	return FileBaseDefault(table, "table")
+}
+
+// FileBaseDefault — тот же санитайз Windows, что FileBase; пустой итог → empty.
+func FileBaseDefault(name, empty string) string {
+	if empty == "" {
+		empty = "table"
+	}
 	var b strings.Builder
-	for _, r := range table {
+	for _, r := range name {
 		if r < 32 || r == 0x7F || unicode.IsControl(r) || strings.ContainsRune(`<>:"/\|?*`, r) {
 			b.WriteByte('_')
 			continue
@@ -26,7 +35,7 @@ func FileBase(table string) string {
 	}
 	s := strings.TrimRight(b.String(), " .")
 	if s == "" {
-		return "table"
+		return empty
 	}
 	stem := s
 	if i := strings.IndexByte(s, '.'); i >= 0 {

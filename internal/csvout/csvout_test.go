@@ -41,6 +41,12 @@ func TestFileBase(t *testing.T) {
 			t.Fatalf("FileBase(%q)=%q, ожидалось %q", in, got, want)
 		}
 	}
+	if got := FileBaseDefault("", "book"); got != "book" {
+		t.Fatalf("FileBaseDefault empty book: %q", got)
+	}
+	if got := FileBaseDefault("", "sheet"); got != "sheet" {
+		t.Fatalf("FileBaseDefault empty sheet: %q", got)
+	}
 }
 
 func TestNormalizeRow(t *testing.T) {
@@ -365,5 +371,64 @@ func TestReservedTableNameFile(t *testing.T) {
 	}
 	if filepath.Base(res.Path) != "_NUL.csv" {
 		t.Fatalf("зарезервированное имя: %s", res.Path)
+	}
+}
+
+func TestCreatePlainHasHeaderAndNoMerge(t *testing.T) {
+	dir := t.TempDir()
+	reg := NewRegistry()
+	sql := commitInsert(t, reg, dir, "t", []string{"id"}, []string{"1"})
+	w, err := CreatePlain(reg, dir, "t", []string{"col"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Row([]string{"excel"}); err != nil {
+		t.Fatal(err)
+	}
+	plain, err := w.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Base(plain.Path) != "t(1).csv" {
+		t.Fatalf("Excel не должен дописывать INSERT: %s", plain.Path)
+	}
+	if readCSV(t, sql.Path) != "\"id\"\n\"1\"\n" {
+		t.Fatalf("SQL CSV испорчен: %q", readCSV(t, sql.Path))
+	}
+	got := readCSV(t, plain.Path)
+	if got != "\"col\"\n\"excel\"\n" {
+		t.Fatalf("заголовок + данные: %q", got)
+	}
+}
+
+func TestCreatePlainAbortKeepsFirst(t *testing.T) {
+	dir := t.TempDir()
+	reg := NewRegistry()
+	w1, err := CreatePlain(reg, dir, "book_First", []string{"h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w1.Row([]string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := w1.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, err := CreatePlain(reg, dir, "book_Second", []string{"h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Row([]string{"b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w2.Abort(); err != nil {
+		t.Fatal(err)
+	}
+	if readCSV(t, first.Path) != "\"h\"\n\"a\"\n" {
+		t.Fatal("провал второго листа удалил первый CSV")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "book_Second.csv")); err == nil {
+		t.Fatal("после Abort второго листа CSV быть не должно")
 	}
 }

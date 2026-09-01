@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-  Готовит sql2csv на чистой Windows-машине: Go (если нет), модули, sql2csv.exe.
+  Готовит 2csv на чистой Windows-машине: Go (если нет), модули, 2csv.exe.
   Повторный запуск идемпотентен: уже установленный Go не переустанавливается,
   окружение не ломается.
 #>
@@ -140,14 +140,14 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-Write-Step "go build -o sql2csv.exe ."
-& go build -o sql2csv.exe .
+Write-Step "go build -o 2csv.exe ."
+& go build -o 2csv.exe .
 if ($LASTEXITCODE -ne 0) {
     Write-Fail "go build завершился с кодом $LASTEXITCODE"
     exit 1
 }
 
-$exe = Join-Path $ProjectRoot 'sql2csv.exe'
+$exe = Join-Path $ProjectRoot '2csv.exe'
 if (-not (Test-Path -LiteralPath $exe)) {
     Write-Fail "сборка прошла, но $exe не появился"
     exit 1
@@ -155,5 +155,5 @@ if (-not (Test-Path -LiteralPath $exe)) {
 
 Write-Host ""
 Write-Host "Готово: $exe"
-Write-Host "Запуск: .\sql2csv.exe   (корень C:\Source\db скрипт не трогает)"
+Write-Host "Запуск: .\2csv.exe   (после запуска спросит combo/db; C:\Source скрипт не трогает)"
 exit 0

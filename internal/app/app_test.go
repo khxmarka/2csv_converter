@@ -11,6 +11,7 @@ import (
 	"sql2csv/internal/converted"
 	"sql2csv/internal/logx"
 	"sql2csv/internal/scan"
+	"sql2csv/internal/xlsconv"
 )
 
 func TestRunMissingRoot(t *testing.T) {
@@ -272,5 +273,114 @@ func TestHeaderFromFirstFileByPath(t *testing.T) {
 	want := "\"id\",\"name\"\n\"1\",\"first\"\n\"2\",\"later\"\n"
 	if string(got) != want {
 		t.Fatalf("заголовок должен быть от a.sql, не от того кто добежал:\n got %q\nwant %q\nлог:\n%s", got, want, buf.String())
+	}
+}
+
+func TestRunExcelTreeConvertedTxt(t *testing.T) {
+	root := t.TempDir()
+	alpha := filepath.Join(root, "Alpha")
+	beta := filepath.Join(root, "Beta")
+	if err := os.MkdirAll(alpha, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(beta, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := xlsconv.WriteXLSX(filepath.Join(alpha, "a.xlsx"), []xlsconv.Sheet{
+		{Name: "One", Rows: [][]string{{"h1"}, {"v1"}}},
+		{Name: "Two", Rows: [][]string{{"h2"}, {"v2"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	six := make([]xlsconv.Sheet, 6)
+	for i := range six {
+		six[i] = xlsconv.Sheet{Name: string(rune('A' + i)), Rows: [][]string{{"x"}}}
+	}
+	if err := xlsconv.WriteXLS(filepath.Join(beta, "six.xls"), six); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(alpha, "dump.sql"), []byte("INSERT INTO t (id) VALUES (1);\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	res, err := Run(logx.New(&buf), root)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	log := buf.String()
+
+	for _, p := range []string{
+		filepath.Join(alpha, "a_One.csv"),
+		filepath.Join(alpha, "a_Two.csv"),
+		filepath.Join(alpha, "t.csv"),
+	} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("нет %s: %v\nлог:\n%s", p, err, log)
+		}
+	}
+	entries, err := os.ReadDir(beta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.EqualFold(filepath.Ext(e.Name()), ".csv") {
+			t.Fatalf("Beta не должна иметь CSV при 6 листах: %s", e.Name())
+		}
+	}
+
+	raw, err := os.ReadFile(converted.Path(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "Alpha\n" {
+		t.Fatalf("converted.txt=%q, ожидалось только Alpha", raw)
+	}
+	if strings.Join(res.SuccessTops, ",") != "Alpha" {
+		t.Fatalf("tops=%v", res.SuccessTops)
+	}
+	if strings.Contains(log, "six.xls") || strings.Contains(strings.ToLower(log), "лист") {
+		t.Fatalf("пропуск >5 листов не логировать:\n%s", log)
+	}
+	if strings.Count(log, "папка полностью завершена: Alpha") != 1 || strings.Count(log, "папка полностью завершена: Beta") != 1 {
+		t.Fatalf("завершение папок:\n%s", log)
+	}
+	if strings.Contains(log, "error:") {
+		t.Fatalf("критических ошибок не ожидалось:\n%s", log)
+	}
+}
+
+func TestRunBrokenExcelLogsAndContinues(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "A")
+	b := filepath.Join(root, "B")
+	if err := os.MkdirAll(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(a, "bad.xlsx"), []byte("not excel"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b, "ok.sql"), []byte("INSERT INTO ok (id) VALUES (1);\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	res, err := Run(logx.New(&buf), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(b, "ok.csv")); err != nil {
+		t.Fatalf("SQL после битого Excel: %v", err)
+	}
+	if strings.Join(res.SuccessTops, ",") != "B" {
+		t.Fatalf("tops=%v", res.SuccessTops)
+	}
+	log := buf.String()
+	if !strings.Contains(log, "не удалось открыть") {
+		t.Fatalf("ожидалась критическая ошибка открытия xlsx:\n%s", log)
 	}
 }

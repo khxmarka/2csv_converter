@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -19,8 +20,8 @@ const (
 )
 
 // Run выполняет запуск и возвращает код выхода процесса.
-func Run(args []string, stdout, stderr io.Writer) int {
-	flags := flag.NewFlagSet("sql2csv", flag.ContinueOnError)
+func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	flags := flag.NewFlagSet("2csv", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	flags.Usage = func() { printUsage(stderr) }
 	help := flags.Bool("help", false, "показать справку и выйти")
@@ -39,30 +40,58 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
+	fmt.Fprint(stderr, "combo/db: ")
+	root, err := readRoot(stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return exitUsage
+	}
+
 	log := logx.New(stderr)
-	if _, err := app.Run(log, config.Root); err != nil {
+	if _, err := app.Run(log, root); err != nil {
 		log.Errorf("%v", err)
 		return exitFatal
 	}
 	return exitOK
 }
 
-func printUsage(w io.Writer) {
-	fmt.Fprintf(w, `sql2csv — конвертер INSERT-ов из SQL-файлов в CSV.
+func readRoot(stdin io.Reader) (string, error) {
+	if stdin == nil {
+		return "", fmt.Errorf("ожидалось combo или db")
+	}
+	sc := bufio.NewScanner(stdin)
+	if !sc.Scan() {
+		if err := sc.Err(); err != nil {
+			return "", err
+		}
+		return "", fmt.Errorf("ожидалось combo или db")
+	}
+	return config.RootFor(sc.Text())
+}
 
-Рекурсивно обходит %s, из каждого .sql извлекает операторы
-INSERT ... VALUES и сохраняет CSV рядом с исходным файлом. По итогам запуска
-пишет %s\converted.txt.
+func printUsage(w io.Writer) {
+	fmt.Fprintf(w, `2csv — конвертер SQL INSERT и Excel (.xlsx / .xls) в CSV.
+
+После запуска спрашивает combo/db:
+  db     рекурсивно обходит %s
+  combo  рекурсивно обходит %s
+
+В выбранном корне:
+  .sql         INSERT ... VALUES → CSV рядом с файлом
+  .xlsx, .xls  каждый лист → отдельный CSV рядом с книгой
+               (больше 5 листов — книга целиком пропускается)
+
+По итогам запуска пишет converted.txt в выбранный корень.
 
 Использование:
-  sql2csv          запустить обработку
-  sql2csv --help   показать эту справку
+  2csv          спросить combo/db и запустить обработку
+  2csv --help   показать эту справку
 
 Коды выхода:
   0  корень существует и обработан
-  1  корень отсутствует или не является директорией
-  2  ошибка в аргументах командной строки
+  1  выбранный корень отсутствует или не является директорией
+  2  ошибка в аргументах командной строки или неверный ответ combo/db
 
 Правила обработки описаны в CONSTRAINTS_AND_POLICY.md.
-`, config.Root, config.Root)
+`, config.RootDB, config.RootCombo)
 }

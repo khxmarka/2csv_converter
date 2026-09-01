@@ -1,4 +1,4 @@
-// Package scan проверяет корень и находит в нём SQL-файлы (§3 политики).
+// Package scan проверяет корень и находит рабочие файлы (§3 политики).
 package scan
 
 import (
@@ -10,9 +10,19 @@ import (
 	"strings"
 )
 
-// SQLFile — найденный .sql и его место в дереве относительно корня.
+// Kind — тип рабочего файла.
+type Kind int
+
+const (
+	KindSQL Kind = iota
+	KindXLSX
+	KindXLS
+)
+
+// SQLFile — найденный .sql / .xlsx / .xls и его место в дереве относительно корня.
 type SQLFile struct {
 	Path string
+	Kind Kind
 
 	// TopFolder — первый сегмент пути относительно корня.
 	// Пусто для файлов, лежащих прямо в корне: они конвертируются,
@@ -22,6 +32,9 @@ type SQLFile struct {
 
 // InRoot сообщает, что файл лежит прямо в корне, а не в подпапке.
 func (f SQLFile) InRoot() bool { return f.TopFolder == "" }
+
+// IsExcel — книга .xlsx или .xls.
+func (f SQLFile) IsExcel() bool { return f.Kind == KindXLSX || f.Kind == KindXLS }
 
 // Skip — единица, пропущенная при обходе: symlink или недоступный каталог.
 type Skip struct {
@@ -50,7 +63,7 @@ func ValidateRoot(path string) error {
 	return nil
 }
 
-// Find рекурсивно обходит root и собирает пути *.sql без учёта регистра.
+// Find рекурсивно обходит root и собирает пути *.sql, *.xlsx и *.xls без учёта регистра.
 // Symlink-и не раскрываются: и ссылки на каталоги, и ссылки на файлы попадают в Skips.
 // Ошибка чтения отдельного каталога не прерывает обход, ошибка чтения самого корня — прерывает.
 func Find(root string) (Result, error) {
@@ -77,7 +90,11 @@ func Find(root string) (Result, error) {
 			}
 			return nil
 		}
-		if entry.IsDir() || !hasSQLExt(path) {
+		if entry.IsDir() {
+			return nil
+		}
+		kind, ok := workKind(path)
+		if !ok {
 			return nil
 		}
 		if err := probeOpen(path); err != nil {
@@ -89,7 +106,7 @@ func Find(root string) (Result, error) {
 			res.Skips = append(res.Skips, Skip{Path: path, Reason: err.Error()})
 			return nil
 		}
-		res.Files = append(res.Files, SQLFile{Path: path, TopFolder: top})
+		res.Files = append(res.Files, SQLFile{Path: path, Kind: kind, TopFolder: top})
 		return nil
 	})
 	if err != nil {
@@ -101,7 +118,7 @@ func Find(root string) (Result, error) {
 	return res, nil
 }
 
-// TopFolders возвращает отсортированный список верхних папок, в которых нашлись .sql.
+// TopFolders возвращает отсортированный список верхних папок, в которых нашлись рабочие файлы.
 func (r Result) TopFolders() []string {
 	seen := make(map[string]struct{})
 	for _, f := range r.Files {
@@ -133,8 +150,17 @@ func isLink(mode fs.FileMode) bool {
 	return mode&(fs.ModeSymlink|fs.ModeIrregular) != 0
 }
 
-func hasSQLExt(path string) bool {
-	return strings.EqualFold(filepath.Ext(path), ".sql")
+func workKind(path string) (Kind, bool) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".sql":
+		return KindSQL, true
+	case ".xlsx":
+		return KindXLSX, true
+	case ".xls":
+		return KindXLS, true
+	default:
+		return 0, false
+	}
 }
 
 // probeOpen проверяет, что файл можно открыть, и сразу закрывает его.

@@ -8,12 +8,16 @@ import (
 	"path/filepath"
 )
 
-const maxNameIndex = 1_000_000
+const (
+	maxNameIndex = 1_000_000
+	tmpPattern   = ".2csv-*.tmp"
+)
 
 // Writer пишет один INSERT во временный файл. После Commit: если CSV ключа
 // ещё нет — переименовывает temp в свободное {table}.csv / {table}(n).csv;
 // если ключ уже открыт в этом запуске — дописывает только строки данных.
 type Writer struct {
+	reg       *Registry
 	slot      *slot
 	dir       string
 	base      string
@@ -45,12 +49,13 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 	base := FileBase(table)
 	s := reg.acquire(dir, base)
 
-	tmp, err := os.CreateTemp(dir, ".sql2csv-*.tmp")
+	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("временный CSV: %w", err)
 	}
 	w := &Writer{
+		reg:  reg,
 		slot: s,
 		dir:  dir,
 		base: base,
@@ -63,6 +68,40 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 		return w, nil
 	}
 	w.nCol = len(columns)
+	if _, err := io.WriteString(w.buf, encodeRow(columns)); err != nil {
+		_ = w.Abort()
+		return nil, err
+	}
+	return w, nil
+}
+
+// CreatePlain открывает CSV с строкой заголовка и без склейки с INSERT.
+// base уже санитайзнут; файл — первое свободное {base}.csv / {base}(n).csv.
+func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, error) {
+	if reg == nil {
+		return nil, fmt.Errorf("csvout: нужен Registry")
+	}
+	if len(columns) < 1 {
+		return nil, fmt.Errorf("csvout: ширина листа должна быть ≥ 1")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	s := reg.acquireUnique()
+	tmp, err := os.CreateTemp(dir, tmpPattern)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("временный CSV: %w", err)
+	}
+	w := &Writer{
+		reg:  reg,
+		slot: s,
+		dir:  dir,
+		base: base,
+		nCol: len(columns),
+		tmp:  tmp,
+		buf:  bufio.NewWriterSize(tmp, 64*1024),
+	}
 	if _, err := io.WriteString(w.buf, encodeRow(columns)); err != nil {
 		_ = w.Abort()
 		return nil, err
@@ -141,6 +180,10 @@ func (w *Writer) Commit() (Result, error) {
 }
 
 func (w *Writer) place(tmpName string) (string, error) {
+	if w.reg != nil {
+		dmu := w.reg.lockDir(w.dir)
+		defer dmu.Unlock()
+	}
 	for n := 0; n < maxNameIndex; n++ {
 		path := filepath.Join(w.dir, csvName(w.base, n))
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)

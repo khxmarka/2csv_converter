@@ -1,4 +1,4 @@
-// Команда sql2csv: консольный конвертер INSERT-ов из .sql в CSV.
+// Команда 2csv: консольный конвертер INSERT-ов из .sql и листов Excel в CSV.
 package main
 
 import (
@@ -8,5 +8,5 @@ import (
 )
 
 func main() {
-	os.Exit(cli.Run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(cli.Run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
