@@ -9,7 +9,7 @@ import (
 
 const FileName = "converted.txt"
 
-// Path возвращает C:\Source\db\converted.txt или аналог для тестового корня.
+// Path возвращает converted.txt в выбранном корне обхода (или тестовом корне).
 func Path(root string) string {
 	return filepath.Join(root, FileName)
 }

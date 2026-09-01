@@ -155,6 +155,49 @@ func TestFindIgnoresNonSQL(t *testing.T) {
 	}
 }
 
+func TestFindCollectsExcelIgnoresOtherTables(t *testing.T) {
+	root := t.TempDir()
+	alpha := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(alpha, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]Kind{
+		filepath.Join(alpha, "a.xlsx"):   KindXLSX,
+		filepath.Join(alpha, "B.XLS"):    KindXLS,
+		filepath.Join(alpha, "dump.sql"): KindSQL,
+	}
+	for path := range files {
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"skip.xlsm", "old.xlsb", "calc.ods", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(alpha, name), []byte("no"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := Find(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Files) != 3 {
+		t.Fatalf("файлов: %#v", result.Files)
+	}
+	byPath := map[string]Kind{}
+	for _, f := range result.Files {
+		byPath[f.Path] = f.Kind
+		if f.TopFolder != "Alpha" {
+			t.Fatalf("TopFolder=%q для %s", f.TopFolder, f.Path)
+		}
+	}
+	for path, want := range files {
+		if byPath[path] != want {
+			t.Fatalf("%s: kind=%v want=%v", path, byPath[path], want)
+		}
+	}
+}
+
 func TestFindSkipsUnreadableSQL(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("на Windows chmod не отбирает право чтения у владельца")

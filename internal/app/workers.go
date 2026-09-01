@@ -11,6 +11,7 @@ import (
 	"sql2csv/internal/csvout"
 	"sql2csv/internal/logx"
 	"sql2csv/internal/scan"
+	"sql2csv/internal/xlsconv"
 )
 
 const maxWorkers = 16
@@ -75,17 +76,21 @@ func (a *accumulator) start(file scan.SQLFile) {
 	a.refreshHang()
 }
 
-func (a *accumulator) add(file scan.SQLFile, fr convert.Result) {
+func (a *accumulator) add(file scan.SQLFile, out fileOutcome) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if fr.OpenErr != nil {
+	if out.openErr != nil {
 		a.filesFail++
-		a.log.Errorf("%s: не удалось открыть: %v", file.Path, fr.OpenErr)
-	} else {
-		a.insertOK += fr.Created
-		a.insertSkip += fr.Skipped
-		a.csv += fr.CSV
-		if fr.Created > 0 && file.TopFolder != "" {
+		a.log.Errorf("%s: не удалось открыть: %v", file.Path, out.openErr)
+	} else if !out.skipTooMany {
+		if out.writeErr != nil {
+			a.filesFail++
+			a.log.Errorf("%s: не удалось создать CSV: %v", file.Path, out.writeErr)
+		}
+		a.insertOK += out.created
+		a.insertSkip += out.skipped
+		a.csv += out.csv
+		if (out.created > 0 || out.csv > 0) && file.TopFolder != "" {
 			a.tops[file.TopFolder] = struct{}{}
 		}
 	}
@@ -170,12 +175,36 @@ func groupByDir(files []scan.SQLFile) [][]scan.SQLFile {
 	return groups
 }
 
-func convertOne(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (fr convert.Result) {
+type fileOutcome struct {
+	openErr     error
+	writeErr    error
+	created     int
+	skipped     int
+	csv         int
+	skipTooMany bool
+}
+
+func convertOne(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (out fileOutcome) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Errorf("%s: сбой обработки (%v), файл пропущен", file.Path, rec)
-			fr = convert.Result{Skipped: 1}
+			out = fileOutcome{skipped: 1}
 		}
 	}()
-	return convert.File(log, reg, file)
+	if file.IsExcel() {
+		xr := xlsconv.File(reg, file.Path)
+		return fileOutcome{
+			openErr:     xr.OpenErr,
+			writeErr:    xr.WriteErr,
+			csv:         xr.CSV,
+			skipTooMany: xr.SkipTooMany,
+		}
+	}
+	fr := convert.File(log, reg, file)
+	return fileOutcome{
+		openErr: fr.OpenErr,
+		created: fr.Created,
+		skipped: fr.Skipped,
+		csv:     fr.CSV,
+	}
 }

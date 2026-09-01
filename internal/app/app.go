@@ -19,7 +19,7 @@ type Result struct {
 	SuccessTops []string
 }
 
-// Run проверяет корень, находит .sql и конвертирует INSERT в CSV рядом с ними.
+// Run проверяет корень, находит .sql/.xlsx/.xls и пишет CSV рядом с ними.
 func Run(log *logx.Logger, root string) (Result, error) {
 	var empty Result
 	if err := scan.ValidateRoot(root); err != nil {
