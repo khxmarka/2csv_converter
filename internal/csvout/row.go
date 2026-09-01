@@ -15,6 +15,9 @@ func NormalizeRow(cells []insert.Cell, nCol int) (row []string, padded bool, err
 	if nCol < 0 {
 		nCol = 0
 	}
+	if nCol == 0 {
+		nCol = len(cells)
+	}
 	if len(cells) > nCol {
 		return nil, false, ErrTooManyValues
 	}

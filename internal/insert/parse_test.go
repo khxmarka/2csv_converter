@@ -203,7 +203,7 @@ INSERT IGNORE INTO c (x) VALUES (NULL);
 	}
 }
 
-func TestParseSkipSelectSetNoColumns(t *testing.T) {
+func TestParseSkipSelectSet(t *testing.T) {
 	sql := `
 INSERT INTO t SELECT * FROM u;
 INSERT INTO t SET a=1;
@@ -211,17 +211,50 @@ INSERT INTO t VALUES (1);
 INSERT INTO ok (id) VALUES (1);
 `
 	inserts, skips := collect(t, sql)
-	if len(inserts) != 1 || inserts[0].meta.Table != "ok" {
+	if len(inserts) != 2 {
 		t.Fatalf("успешных: %+v", inserts)
 	}
-	if len(skips) != 3 {
-		t.Fatalf("ожидалось 3 пропуска, получено %d: %+v", len(skips), skips)
+	if inserts[0].meta.Table != "t" || len(inserts[0].meta.Columns) != 0 {
+		t.Fatalf("VALUES без колонок: %+v", inserts[0].meta)
 	}
-	reasons := skips[0].Reason + skips[1].Reason + skips[2].Reason
-	for _, want := range []string{"SELECT", "SET", "нет списка колонок"} {
-		if !strings.Contains(reasons, want) && !strings.Contains(skips[0].Reason+skips[1].Reason+skips[2].Reason, want) {
+	if inserts[1].meta.Table != "ok" {
+		t.Fatalf("второй INSERT: %+v", inserts[1].meta)
+	}
+	if len(skips) != 2 {
+		t.Fatalf("ожидалось 2 пропуска, получено %d: %+v", len(skips), skips)
+	}
+	reasons := skips[0].Reason + skips[1].Reason
+	for _, want := range []string{"SELECT", "SET"} {
+		if !strings.Contains(reasons, want) {
 			t.Fatalf("в причинах нет %q: %+v", want, skips)
 		}
+	}
+}
+
+func TestParseValuesWithoutColumns(t *testing.T) {
+	sql := `INSERT INTO dle_xfsearch VALUES (334,10,'genre','Action'),(335,10,'genre','Adventure'),(336,10,'genre','Fantastique'),(337,10,'genre','Mystère')`
+	inserts, skips := collect(t, sql)
+	if len(skips) != 0 {
+		t.Fatalf("пропусков не ожидалось: %+v", skips)
+	}
+	if len(inserts) != 1 {
+		t.Fatalf("ожидался 1 INSERT, получено %d", len(inserts))
+	}
+	got := inserts[0]
+	if got.meta.Table != "dle_xfsearch" {
+		t.Fatalf("таблица: %q", got.meta.Table)
+	}
+	if len(got.meta.Columns) != 0 {
+		t.Fatalf("колонки должны быть пусты: %v", got.meta.Columns)
+	}
+	if len(got.rows) != 4 {
+		t.Fatalf("строк: %d, %+v", len(got.rows), got.rows)
+	}
+	if got.rows[0][0].Text != "334" || got.rows[0][3].Text != "Action" {
+		t.Fatalf("первая строка: %+v", got.rows[0])
+	}
+	if got.rows[3][3].Text != "Mystère" {
+		t.Fatalf("последняя строка: %+v", got.rows[3])
 	}
 }
 

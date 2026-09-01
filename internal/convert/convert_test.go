@@ -296,3 +296,38 @@ func TestFixtureInterleaveABA(t *testing.T) {
 		t.Fatalf("B.csv:\n got %q\nwant %q", gotB, wantB)
 	}
 }
+
+func TestValuesWithoutColumnsNoHeader(t *testing.T) {
+	dir := t.TempDir()
+	sql := `INSERT INTO dle_xfsearch VALUES (334,10,'genre','Action'),(335,10,'genre','Adventure'),(336,10,'genre','Fantastique'),(337,10,'genre','Mystère')`
+	res, _ := runFile(t, dir, "dump.sql", sql)
+	if res.Created != 1 || res.CSV != 1 || res.Skipped != 0 {
+		t.Fatalf("created=%d csv=%d skipped=%d", res.Created, res.CSV, res.Skipped)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "dle_xfsearch.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\"334\",\"10\",\"genre\",\"Action\"\n\"335\",\"10\",\"genre\",\"Adventure\"\n\"336\",\"10\",\"genre\",\"Fantastique\"\n\"337\",\"10\",\"genre\",\"Mystère\"\n"
+	if string(got) != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestValuesWithoutColumnsThenWithColumnsAppends(t *testing.T) {
+	dir := t.TempDir()
+	reg := csvout.NewRegistry()
+	res1, _ := runFileReg(t, reg, dir, "a.sql", `INSERT INTO t VALUES (1, 'a');`)
+	res2, _ := runFileReg(t, reg, dir, "b.sql", `INSERT INTO t (id, name) VALUES (2, 'b');`)
+	if res1.Created != 1 || res1.CSV != 1 || res2.Created != 1 || res2.CSV != 0 {
+		t.Fatalf("created/csv %d/%d и %d/%d", res1.Created, res1.CSV, res2.Created, res2.CSV)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\"1\",\"a\"\n\"2\",\"b\"\n"
+	if string(got) != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+}

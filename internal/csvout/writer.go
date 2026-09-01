@@ -37,8 +37,9 @@ type Result struct {
 }
 
 // Create открывает временный файл в dir. Заголовок пишется только если это
-// первый успешный INSERT ключа (слот ещё без пути). Иначе колонки игнорируются,
-// ширина берётся из заголовка, в temp идут только строки данных.
+// первый успешный INSERT ключа (слот ещё без пути) и список колонок не пуст.
+// Иначе колонки игнорируются, ширина берётся из заголовка или первой строки
+// VALUES, в temp идут только строки данных.
 func Create(reg *Registry, dir, table string, columns []string) (*Writer, error) {
 	if reg == nil {
 		return nil, fmt.Errorf("csvout: нужен Registry")
@@ -65,6 +66,9 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 	if s.path != "" {
 		w.appending = true
 		w.nCol = s.nCol
+		return w, nil
+	}
+	if len(columns) == 0 {
 		return w, nil
 	}
 	w.nCol = len(columns)
@@ -121,6 +125,9 @@ func (w *Writer) NCol() int {
 func (w *Writer) Row(values []string) error {
 	if w == nil || w.closed {
 		return fmt.Errorf("csvout: запись в закрытый Writer")
+	}
+	if w.nCol == 0 {
+		w.nCol = len(values)
 	}
 	if len(values) > w.nCol {
 		return ErrTooManyValues

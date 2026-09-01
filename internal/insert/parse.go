@@ -133,9 +133,21 @@ func parseInsert(s *src, h Handler) error {
 		return err
 	}
 
+	var cols []string
+	valuesSeen := false
+
 	switch {
 	case b == '(':
-		// список колонок — нормальный путь
+		cols, err = parseColumnList(s)
+		if err != nil {
+			if err == io.EOF {
+				return skip("незакрытый INSERT", table)
+			}
+			return skip(err.Error(), table)
+		}
+		if len(cols) == 0 {
+			return skip("пустой список колонок", table)
+		}
 	default:
 		if ok, err := s.tryKeyword("SET"); err != nil {
 			return err
@@ -145,42 +157,8 @@ func parseInsert(s *src, h Handler) error {
 		if ok, err := s.tryKeyword("VALUES"); err != nil {
 			return err
 		} else if ok {
-			return skip("нет списка колонок", table)
-		}
-		if ok, err := s.tryKeyword("SELECT"); err != nil {
-			return err
-		} else if ok {
-			return skip("INSERT ... SELECT", table)
-		}
-		return skip("нет списка колонок", table)
-	}
-
-	cols, err := parseColumnList(s)
-	if err != nil {
-		if err == io.EOF {
-			return skip("незакрытый INSERT", table)
-		}
-		return skip(err.Error(), table)
-	}
-	if len(cols) == 0 {
-		return skip("пустой список колонок", table)
-	}
-
-	if err := s.skipSpaceAndComments(); err != nil {
-		return err
-	}
-	if ok, err := s.tryKeyword("SELECT"); err != nil {
-		return err
-	} else if ok {
-		return skip("INSERT ... SELECT", table)
-	}
-	if ok, err := s.tryKeyword("VALUES"); err != nil {
-		return err
-	} else if !ok {
-		if ok, err := s.tryKeyword("SET"); err != nil {
-			return err
-		} else if ok {
-			return skip("INSERT ... SET", table)
+			valuesSeen = true
+			break
 		}
 		if ok, err := s.tryKeyword("SELECT"); err != nil {
 			return err
@@ -188,6 +166,32 @@ func parseInsert(s *src, h Handler) error {
 			return skip("INSERT ... SELECT", table)
 		}
 		return skip("нет VALUES", table)
+	}
+
+	if !valuesSeen {
+		if err := s.skipSpaceAndComments(); err != nil {
+			return err
+		}
+		if ok, err := s.tryKeyword("SELECT"); err != nil {
+			return err
+		} else if ok {
+			return skip("INSERT ... SELECT", table)
+		}
+		if ok, err := s.tryKeyword("VALUES"); err != nil {
+			return err
+		} else if !ok {
+			if ok, err := s.tryKeyword("SET"); err != nil {
+				return err
+			} else if ok {
+				return skip("INSERT ... SET", table)
+			}
+			if ok, err := s.tryKeyword("SELECT"); err != nil {
+				return err
+			} else if ok {
+				return skip("INSERT ... SELECT", table)
+			}
+			return skip("нет VALUES", table)
+		}
 	}
 
 	meta := Meta{Table: table, Columns: cols, Offset: start.Offset, Line: start.Line}
@@ -228,7 +232,7 @@ func parseInsert(s *src, h Handler) error {
 			}
 			return skip("битый INSERT: "+err.Error(), table)
 		}
-		if len(cells) > len(cols) {
+		if len(cols) > 0 && len(cells) > len(cols) {
 			surplus = true
 		}
 		if !surplus {
