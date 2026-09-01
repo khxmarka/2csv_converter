@@ -67,6 +67,13 @@ func TestNormalizeRow(t *testing.T) {
 	if err != ErrTooManyValues {
 		t.Fatalf("лишние значения: %v", err)
 	}
+	row, padded, err = NormalizeRow(cells, 0)
+	if err != nil || padded {
+		t.Fatalf("nCol=0: padded=%v err=%v", padded, err)
+	}
+	if len(row) != 3 || row[0] != "1" || row[1] != "" || row[2] != "" {
+		t.Fatalf("nCol=0 row=%q", row)
+	}
 }
 
 func TestCommitBytesAndNoBOM(t *testing.T) {
@@ -371,6 +378,32 @@ func TestReservedTableNameFile(t *testing.T) {
 	}
 	if filepath.Base(res.Path) != "_NUL.csv" {
 		t.Fatalf("зарезервированное имя: %s", res.Path)
+	}
+}
+
+func TestCreateNoHeaderFromEmptyColumns(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Create(NewRegistry(), dir, "dle_xfsearch", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Row([]string{"334", "10", "genre", "Action"}); err != nil {
+		t.Fatal(err)
+	}
+	if w.NCol() != 4 {
+		t.Fatalf("ширина после первой строки: %d", w.NCol())
+	}
+	if err := w.Row([]string{"335", "10", "genre", "Adventure"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := w.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readCSV(t, res.Path)
+	want := "\"334\",\"10\",\"genre\",\"Action\"\n\"335\",\"10\",\"genre\",\"Adventure\"\n"
+	if got != want {
+		t.Fatalf("CSV без шапки:\n got %q\nwant %q", got, want)
 	}
 }
 
