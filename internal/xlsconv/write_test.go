@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"sql2csv/internal/csvout"
+
+	"github.com/xuri/excelize/v2"
 )
 
 func csvFiles(t *testing.T, dir string) []string {
@@ -80,6 +83,28 @@ func TestWriteOneSheet(t *testing.T) {
 	}
 }
 
+func TestStreamingXLSXPreservesInnerEmptyRowsAndDropsTrailing(t *testing.T) {
+	src := writeXLSX(t, []specSheet{{
+		Name: "Rows",
+		Rows: [][]string{
+			{"header"},
+			{""},
+			{"value"},
+			{""},
+			{""},
+		},
+	}})
+	res := File(csvout.NewRegistry(), src)
+	if res.OpenErr != nil || res.WriteErr != nil || res.CSV != 1 {
+		t.Fatalf("результат: %+v", res)
+	}
+	got := readFile(t, res.Paths[0])
+	want := "\"header\"\n\"\"\n\"value\"\n"
+	if got != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestWriteTwoSheetsTwoFiles(t *testing.T) {
 	sheets := []specSheet{
 		{Name: "First", Rows: [][]string{{"a"}}},
@@ -140,7 +165,54 @@ func TestWriteSixSheetsNoCSV(t *testing.T) {
 	}
 }
 
-func TestWriteExistingNameGetsIndex(t *testing.T) {
+func TestChartSheetCountsTowardWorkbookLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "charts.xlsx")
+	book := excelize.NewFile()
+	for i := 2; i <= 5; i++ {
+		if _, err := book.NewSheet("Sheet" + strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := book.SetCellValue("Sheet1", "A1", "category"); err != nil {
+		t.Fatal(err)
+	}
+	if err := book.SetCellValue("Sheet1", "A2", "A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := book.SetCellValue("Sheet1", "B1", "value"); err != nil {
+		t.Fatal(err)
+	}
+	if err := book.SetCellValue("Sheet1", "B2", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := book.AddChartSheet("Chart1", &excelize.Chart{
+		Type: excelize.Col,
+		Series: []excelize.ChartSeries{{
+			Name:       "Sheet1!$B$1",
+			Categories: "Sheet1!$A$2",
+			Values:     "Sheet1!$B$2",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := book.SaveAs(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := book.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	res := File(csvout.NewRegistry(), path)
+	if !res.SkipTooMany || res.CSV != 0 {
+		t.Fatalf("chart sheet должен быть шестым листом: %+v", res)
+	}
+	if got := csvFiles(t, dir); len(got) != 0 {
+		t.Fatalf("при шести листах CSV быть не должно: %v", got)
+	}
+}
+
+func TestWriteExistingNameIsOverwritten(t *testing.T) {
 	sheets := []specSheet{{Name: "Only", Rows: [][]string{{"new"}}}}
 	for _, format := range []struct {
 		name string
@@ -160,14 +232,14 @@ func TestWriteExistingNameGetsIndex(t *testing.T) {
 			if res.OpenErr != nil || res.CSV != 1 {
 				t.Fatalf("err=%v csv=%d", res.OpenErr, res.CSV)
 			}
-			if filepath.Base(res.Paths[0]) != "book_Only(1).csv" {
-				t.Fatalf("ожидался book_Only(1).csv, получено %s", res.Paths[0])
+			if filepath.Base(res.Paths[0]) != "book_Only.csv" {
+				t.Fatalf("ожидался book_Only.csv, получено %s", res.Paths[0])
 			}
-			if readFile(t, old) != "KEEP" {
-				t.Fatal("чужой CSV затёрт")
+			if readFile(t, old) != "\"new\"\n" {
+				t.Fatalf("CSV не перезаписан: %q", readFile(t, old))
 			}
-			if readFile(t, res.Paths[0]) != "\"new\"\n" {
-				t.Fatalf("новый CSV: %q", readFile(t, res.Paths[0]))
+			if _, err := os.Stat(filepath.Join(dir, "book_Only(1).csv")); !os.IsNotExist(err) {
+				t.Fatalf("book_Only(1).csv не должен создаваться, err=%v", err)
 			}
 		})
 	}
@@ -228,7 +300,7 @@ func TestWriteEmptySheetSkipped(t *testing.T) {
 	}
 }
 
-func TestWriteDoesNotAppendToSQLCSV(t *testing.T) {
+func TestWriteOverwritesSQLCSVWithoutAppending(t *testing.T) {
 	src := writeXLSX(t, []specSheet{{Name: "Only", Rows: [][]string{{"excel"}}}})
 	dir := filepath.Dir(src)
 	reg := csvout.NewRegistry()
@@ -251,15 +323,12 @@ func TestWriteDoesNotAppendToSQLCSV(t *testing.T) {
 	if res.OpenErr != nil || res.CSV != 1 {
 		t.Fatalf("err=%v csv=%d", res.OpenErr, res.CSV)
 	}
-	if filepath.Base(res.Paths[0]) != "book_Only(1).csv" {
-		t.Fatalf("Excel не должен дописывать SQL-файл: %s", res.Paths[0])
+	if filepath.Base(res.Paths[0]) != "book_Only.csv" || res.Paths[0] != sqlRes.Path {
+		t.Fatalf("Excel должен заменить целевой CSV: SQL=%s Excel=%s", sqlRes.Path, res.Paths[0])
 	}
 	sqlRaw := readFile(t, sqlRes.Path)
-	if !strings.Contains(sqlRaw, "\"id\"") || strings.Contains(sqlRaw, "excel") {
-		t.Fatalf("SQL CSV испорчен: %q", sqlRaw)
-	}
-	if readFile(t, res.Paths[0]) != "\"excel\"\n" {
-		t.Fatalf("Excel CSV: %q", readFile(t, res.Paths[0]))
+	if strings.Contains(sqlRaw, "\"id\"") || sqlRaw != "\"excel\"\n" {
+		t.Fatalf("CSV должен содержать только Excel без дописывания: %q", sqlRaw)
 	}
 }
 

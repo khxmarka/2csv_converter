@@ -2,6 +2,7 @@ package logx
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -28,5 +29,20 @@ func TestHangThenLineKeepsOneStatus(t *testing.T) {
 	}
 	if strings.Contains(got, "info:") || strings.Contains(got, "warn:") {
 		t.Fatalf("лишние уровни: %q", got)
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
+}
+
+func TestLoggerCapturesFirstWriteError(t *testing.T) {
+	log := New(failingWriter{})
+	log.Hang("status")
+	log.Errorf("later error")
+	if err := log.Err(); err == nil || !strings.Contains(err.Error(), "write failed") {
+		t.Fatalf("Err=%v", err)
 	}
 }

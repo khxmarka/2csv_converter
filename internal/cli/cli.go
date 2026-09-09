@@ -40,7 +40,9 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	fmt.Fprint(stderr, "combo/db: ")
+	if _, err := fmt.Fprint(stderr, "combo/db: "); err != nil {
+		return exitFatal
+	}
 	root, err := readRoot(stdin)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
@@ -77,11 +79,13 @@ func printUsage(w io.Writer) {
   combo  рекурсивно обходит %s
 
 В выбранном корне:
-  .sql         INSERT ... VALUES → CSV рядом с файлом
+  .sql         INSERT ... VALUES с PII в таблице/колонках → CSV рядом
   .xlsx, .xls  каждый лист → отдельный CSV рядом с книгой
                (больше 5 листов — книга целиком пропускается)
 
-По итогам запуска пишет converted.txt в выбранный корень.
+converted.txt накапливает завершённые верхние папки.
+При следующих запусках эти папки не обходятся; сброс — удалить файл вручную.
+Существующий целевой CSV заменяется, варианты (n) не создаются.
 
 Использование:
   2csv          спросить combo/db и запустить обработку

@@ -1,10 +1,12 @@
 package convert
 
 import (
+	"bufio"
 	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -52,7 +54,7 @@ INSERT INTO users (id, name) VALUES (1, 'Ann');
 INSERT INTO orders (id) VALUES (9);
 `
 	res, _ := runFile(t, dir, "dump.sql", sql)
-	if res.Created != 2 || res.CSV != 2 || res.Skipped != 0 {
+	if res.Created != 1 || res.CSV != 1 || res.Skipped != 1 {
 		t.Fatalf("created=%d csv=%d skipped=%d", res.Created, res.CSV, res.Skipped)
 	}
 	users := filepath.Join(dir, "users.csv")
@@ -60,16 +62,55 @@ INSERT INTO orders (id) VALUES (9);
 	if _, err := os.Stat(users); err != nil {
 		t.Fatalf("нет users.csv: %v", err)
 	}
-	if _, err := os.Stat(orders); err != nil {
-		t.Fatalf("нет orders.csv: %v", err)
+	if _, err := os.Stat(orders); !os.IsNotExist(err) {
+		t.Fatalf("orders.csv не должен создаваться, err=%v", err)
+	}
+}
+
+func TestPIIFilterMatchesColumnAndStaysSilent(t *testing.T) {
+	dir := t.TempDir()
+	sql := `
+INSERT INTO settings (id, email) VALUES (1, 'a@example.com');
+INSERT INTO audit_log (id, status) VALUES (2, 'ok');
+`
+	res, log := runFile(t, dir, "dump.sql", sql)
+	if res.Created != 1 || res.CSV != 1 || res.Skipped != 1 {
+		t.Fatalf("created=%d csv=%d skipped=%d", res.Created, res.CSV, res.Skipped)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "settings.csv")); err != nil {
+		t.Fatalf("нет settings.csv: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "audit_log.csv")); !os.IsNotExist(err) {
+		t.Fatalf("audit_log.csv не должен создаваться, err=%v", err)
+	}
+	if log != "" {
+		t.Fatalf("PII-фильтр должен пропускать INSERT без лога: %q", log)
+	}
+}
+
+func TestPIIFilterWithoutColumnsUsesOnlyTableName(t *testing.T) {
+	dir := t.TempDir()
+	sql := `
+INSERT INTO users VALUES (1, 'Ann');
+INSERT INTO settings VALUES (2, 'dark');
+`
+	res, _ := runFile(t, dir, "dump.sql", sql)
+	if res.Created != 1 || res.CSV != 1 || res.Skipped != 1 {
+		t.Fatalf("created=%d csv=%d skipped=%d", res.Created, res.CSV, res.Skipped)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "users.csv")); err != nil {
+		t.Fatalf("нет users.csv: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "settings.csv")); !os.IsNotExist(err) {
+		t.Fatalf("settings.csv не должен создаваться, err=%v", err)
 	}
 }
 
 func TestTwoInsertsSameTableMerged(t *testing.T) {
 	dir := t.TempDir()
 	sql := `
-INSERT INTO t (id, item) VALUES (1, 'first');
-INSERT INTO t (id, item) VALUES (2, 'second');
+INSERT INTO t (id, name) VALUES (1, 'first');
+INSERT INTO t (id, name) VALUES (2, 'second');
 `
 	res, log := runFile(t, dir, "dump.sql", sql)
 	if res.Created != 2 || res.CSV != 1 || res.Skipped != 0 {
@@ -84,11 +125,11 @@ INSERT INTO t (id, item) VALUES (2, 'second');
 		t.Fatal("два INSERT в t не должны давать t(1).csv")
 	}
 	got := string(raw)
-	want := "\"id\",\"item\"\n\"1\",\"first\"\n\"2\",\"second\"\n"
+	want := "\"id\",\"name\"\n\"1\",\"first\"\n\"2\",\"second\"\n"
 	if got != want {
 		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
 	}
-	if strings.Count(got, `"id","item"`) != 1 {
+	if strings.Count(got, `"id","name"`) != 1 {
 		t.Fatalf("вторая строка заголовка:\n%s", got)
 	}
 	if strings.Contains(log, "VALUES") {
@@ -99,8 +140,8 @@ INSERT INTO t (id, item) VALUES (2, 'second');
 func TestTwoSQLFilesSameTableMerged(t *testing.T) {
 	dir := t.TempDir()
 	reg := csvout.NewRegistry()
-	res1, _ := runFileReg(t, reg, dir, "a.sql", `INSERT INTO t (id) VALUES (1);`)
-	res2, _ := runFileReg(t, reg, dir, "b.sql", `INSERT INTO t (id) VALUES (2);`)
+	res1, _ := runFileReg(t, reg, dir, "a.sql", `INSERT INTO t (email) VALUES (1);`)
+	res2, _ := runFileReg(t, reg, dir, "b.sql", `INSERT INTO t (email) VALUES (2);`)
 	if res1.Created != 1 || res1.CSV != 1 || res2.Created != 1 || res2.CSV != 0 {
 		t.Fatalf("created/csv %d/%d и %d/%d", res1.Created, res1.CSV, res2.Created, res2.CSV)
 	}
@@ -112,7 +153,7 @@ func TestTwoSQLFilesSameTableMerged(t *testing.T) {
 		t.Fatal("два .sql в одной папке не должны плодить t(1).csv")
 	}
 	got := string(raw)
-	want := "\"id\"\n\"1\"\n\"2\"\n"
+	want := "\"email\"\n\"1\"\n\"2\"\n"
 	if got != want {
 		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
 	}
@@ -129,8 +170,8 @@ func TestSameTableDifferentDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := csvout.NewRegistry()
-	runFileReg(t, reg, alpha, "a.sql", `INSERT INTO t (id) VALUES (1);`)
-	runFileReg(t, reg, beta, "b.sql", `INSERT INTO t (id) VALUES (2);`)
+	runFileReg(t, reg, alpha, "a.sql", `INSERT INTO t (email) VALUES (1);`)
+	runFileReg(t, reg, beta, "b.sql", `INSERT INTO t (email) VALUES (2);`)
 	rawA, err := os.ReadFile(filepath.Join(alpha, "t.csv"))
 	if err != nil {
 		t.Fatal(err)
@@ -139,46 +180,64 @@ func TestSameTableDifferentDirs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(rawA) != "\"id\"\n\"1\"\n" || string(rawB) != "\"id\"\n\"2\"\n" {
+	if string(rawA) != "\"email\"\n\"1\"\n" || string(rawB) != "\"email\"\n\"2\"\n" {
 		t.Fatalf("Alpha=%q Beta=%q", rawA, rawB)
 	}
 }
 
-func TestPreexistingCSVThenMergeIntoIndexed(t *testing.T) {
+func TestPreexistingCSVOverwrittenThenMerged(t *testing.T) {
 	dir := t.TempDir()
 	old := filepath.Join(dir, "t.csv")
 	if err := os.WriteFile(old, []byte("KEEP"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	sql := `
-INSERT INTO t (id) VALUES (1);
-INSERT INTO t (id) VALUES (2);
+INSERT INTO t (email) VALUES (1);
+INSERT INTO t (email) VALUES (2);
 `
 	res, _ := runFile(t, dir, "dump.sql", sql)
 	if res.Created != 2 || res.CSV != 1 {
 		t.Fatalf("created=%d csv=%d", res.Created, res.CSV)
 	}
-	keep, _ := os.ReadFile(old)
-	if string(keep) != "KEEP" {
-		t.Fatalf("чужой t.csv затёрт: %q", keep)
-	}
-	got, err := os.ReadFile(filepath.Join(dir, "t(1).csv"))
+	got, err := os.ReadFile(old)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "t(2).csv")); err == nil {
-		t.Fatal("склейка этого запуска не должна плодить t(2).csv")
+	if _, err := os.Stat(filepath.Join(dir, "t(1).csv")); !os.IsNotExist(err) {
+		t.Fatalf("склейка этого запуска не должна плодить t(1).csv, err=%v", err)
 	}
-	if string(got) != "\"id\"\n\"1\"\n\"2\"\n" {
-		t.Fatalf("t(1).csv=%q", got)
+	if string(got) != "\"email\"\n\"1\"\n\"2\"\n" {
+		t.Fatalf("t.csv=%q", got)
+	}
+}
+
+func TestRejectedInsertDoesNotOverwriteExistingCSV(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "users.csv")
+	if err := os.WriteFile(path, []byte("KEEP"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := runFile(t, dir, "dump.sql", `
+INSERT INTO users (email) VALUES ('a@example.test', 'extra');
+INSERT INTO users (email) VALUES ('valid@example.test'), ('unclosed);
+`)
+	if res.Created != 0 || res.CSV != 0 || res.Skipped != 2 {
+		t.Fatalf("created=%d csv=%d skipped=%d", res.Created, res.CSV, res.Skipped)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "KEEP" {
+		t.Fatalf("отклонённый INSERT изменил существующий CSV: %q", raw)
 	}
 }
 
 func TestSecondInsertTooManyDoesNotSpoilFirst(t *testing.T) {
 	dir := t.TempDir()
 	sql := `
-INSERT INTO t (id, item) VALUES (1, 'ok');
-INSERT INTO t (id, item, extra) VALUES (2, 'x', 'y');
+INSERT INTO t (id, name) VALUES (1, 'ok');
+INSERT INTO t (id, name, extra) VALUES (2, 'x', 'y');
 `
 	res, log := runFile(t, dir, "dump.sql", sql)
 	if res.Created != 1 || res.CSV != 1 || res.Skipped != 1 {
@@ -188,7 +247,7 @@ INSERT INTO t (id, item, extra) VALUES (2, 'x', 'y');
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) != "\"id\",\"item\"\n\"1\",\"ok\"\n" {
+	if string(raw) != "\"id\",\"name\"\n\"1\",\"ok\"\n" {
 		t.Fatalf("первый CSV испорчен: %q", raw)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "t(1).csv")); err == nil {
@@ -200,7 +259,7 @@ func TestSkipDoesNotStopNextInsert(t *testing.T) {
 	dir := t.TempDir()
 	sql := `
 INSERT INTO t SELECT * FROM u;
-INSERT INTO ok (id) VALUES (1);
+INSERT INTO ok (email) VALUES (1);
 INSERT INTO t SET a=1;
 `
 	res, log := runFile(t, dir, "dump.sql", sql)
@@ -233,7 +292,7 @@ func TestOpenMissingFile(t *testing.T) {
 
 func TestPaddedRowWritesWithoutLoggingValues(t *testing.T) {
 	dir := t.TempDir()
-	res, log := runFile(t, dir, "dump.sql", `INSERT INTO t (a, b, c) VALUES (1);`)
+	res, log := runFile(t, dir, "dump.sql", `INSERT INTO t (a, email, c) VALUES (1);`)
 	if res.Created != 1 {
 		t.Fatalf("created=%d", res.Created)
 	}
@@ -241,7 +300,7 @@ func TestPaddedRowWritesWithoutLoggingValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) != "\"a\",\"b\",\"c\"\n\"1\",\"\",\"\"\n" {
+	if string(raw) != "\"a\",\"email\",\"c\"\n\"1\",\"\",\"\"\n" {
 		t.Fatalf("CSV=%q", raw)
 	}
 	if strings.Contains(log, "VALUES (1)") {
@@ -263,7 +322,7 @@ func TestFixtureSameTableTwice(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "orders(1).csv")); err == nil {
 		t.Fatal("ожидался один orders.csv")
 	}
-	want := "\"id\",\"item\"\n\"100\",\"first\"\n\"200\",\"INSERT INTO x (id) VALUES (9)\"\n"
+	want := "\"id\",\"name\"\n\"100\",\"first\"\n\"200\",\"INSERT INTO x (id) VALUES (9)\"\n"
 	if string(got) != want {
 		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
 	}
@@ -288,7 +347,7 @@ func TestFixtureInterleaveABA(t *testing.T) {
 		t.Fatal("вклинивание B не должно плодить A(1).csv")
 	}
 	wantA := "\"id\",\"name\"\n\"1\",\"a1\"\n\"2\",\"a2\"\n\"3\",\"a3\"\n"
-	wantB := "\"code\",\"qty\"\n\"b1\",\"10\"\n\"b2\",\"20\"\n"
+	wantB := "\"code\",\"email\"\n\"b1\",\"10\"\n\"b2\",\"20\"\n"
 	if string(gotA) != wantA {
 		t.Fatalf("A.csv:\n got %q\nwant %q", gotA, wantA)
 	}
@@ -297,14 +356,41 @@ func TestFixtureInterleaveABA(t *testing.T) {
 	}
 }
 
+func TestPIIFixtures(t *testing.T) {
+	tests := []struct {
+		name    string
+		created int
+		skipped int
+		files   []string
+	}{
+		{name: "10_pii.sql", created: 2, files: []string{"archive.csv", "user_profiles.csv"}},
+		{name: "11_no_pii.sql", skipped: 3},
+		{name: "12_mixed_pii.sql", created: 2, skipped: 2, files: []string{"audit_log.csv", "users.csv"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			res, log := runFile(t, dir, tt.name, testfilesSQL(t, tt.name))
+			if res.Created != tt.created || res.Skipped != tt.skipped || res.CSV != len(tt.files) {
+				t.Fatalf("created=%d skipped=%d csv=%d log=%q", res.Created, res.Skipped, res.CSV, log)
+			}
+			for _, name := range tt.files {
+				if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+					t.Fatalf("нет %s: %v", name, err)
+				}
+			}
+		})
+	}
+}
+
 func TestValuesWithoutColumnsNoHeader(t *testing.T) {
 	dir := t.TempDir()
-	sql := `INSERT INTO dle_xfsearch VALUES (334,10,'genre','Action'),(335,10,'genre','Adventure'),(336,10,'genre','Fantastique'),(337,10,'genre','Mystère')`
+	sql := `INSERT INTO users VALUES (334,10,'genre','Action'),(335,10,'genre','Adventure'),(336,10,'genre','Fantastique'),(337,10,'genre','Mystère')`
 	res, _ := runFile(t, dir, "dump.sql", sql)
 	if res.Created != 1 || res.CSV != 1 || res.Skipped != 0 {
 		t.Fatalf("created=%d csv=%d skipped=%d", res.Created, res.CSV, res.Skipped)
 	}
-	got, err := os.ReadFile(filepath.Join(dir, "dle_xfsearch.csv"))
+	got, err := os.ReadFile(filepath.Join(dir, "users.csv"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,20 +400,102 @@ func TestValuesWithoutColumnsNoHeader(t *testing.T) {
 	}
 }
 
+func TestLegacyFixturesRemainCompatibleWithPIIFilter(t *testing.T) {
+	t.Run("skips then ok", func(t *testing.T) {
+		dir := t.TempDir()
+		res, _ := runFile(t, dir, "03.sql", testfilesSQL(t, "03_skips_then_ok.sql"))
+		if res.Created != 1 || res.CSV != 1 || res.Skipped != 2 {
+			t.Fatalf("результат: %+v", res)
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, "ok.csv"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "\"email\",\"label\"\n\"survived@example.test\",\"survived\"\n"
+		if string(raw) != want {
+			t.Fatalf("ok.csv:\n got %q\nwant %q", raw, want)
+		}
+	})
+
+	t.Run("second row wider than established header", func(t *testing.T) {
+		dir := t.TempDir()
+		res, _ := runFile(t, dir, "06.sql", testfilesSQL(t, "06_second_too_many.sql"))
+		if res.Created != 1 || res.CSV != 1 || res.Skipped != 1 {
+			t.Fatalf("результат: %+v", res)
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := "\"id\",\"name\"\n\"1\",\"ok\"\n"
+		if string(raw) != want {
+			t.Fatalf("t.csv:\n got %q\nwant %q", raw, want)
+		}
+	})
+}
+
 func TestValuesWithoutColumnsThenWithColumnsAppends(t *testing.T) {
 	dir := t.TempDir()
 	reg := csvout.NewRegistry()
-	res1, _ := runFileReg(t, reg, dir, "a.sql", `INSERT INTO t VALUES (1, 'a');`)
-	res2, _ := runFileReg(t, reg, dir, "b.sql", `INSERT INTO t (id, name) VALUES (2, 'b');`)
+	res1, _ := runFileReg(t, reg, dir, "a.sql", `INSERT INTO users VALUES (1, 'a');`)
+	res2, _ := runFileReg(t, reg, dir, "b.sql", `INSERT INTO users (id, name) VALUES (2, 'b');`)
 	if res1.Created != 1 || res1.CSV != 1 || res2.Created != 1 || res2.CSV != 0 {
 		t.Fatalf("created/csv %d/%d и %d/%d", res1.Created, res1.CSV, res2.Created, res2.CSV)
 	}
-	got, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	got, err := os.ReadFile(filepath.Join(dir, "users.csv"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := "\"1\",\"a\"\n\"2\",\"b\"\n"
 	if string(got) != want {
 		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestLargeInsertThroughFilePipeline(t *testing.T) {
+	const rows = 10_000
+	var sql strings.Builder
+	sql.WriteString("INSERT INTO users (id, email) VALUES\n")
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			sql.WriteString(",\n")
+		}
+		sql.WriteByte('(')
+		sql.WriteString(strconv.Itoa(i))
+		sql.WriteString(",'user")
+		sql.WriteString(strconv.Itoa(i))
+		sql.WriteString("@example.test')")
+	}
+	sql.WriteString(";\n")
+
+	dir := t.TempDir()
+	res, log := runFile(t, dir, "large.sql", sql.String())
+	if res.Created != 1 || res.CSV != 1 || res.Skipped != 0 || res.Failed {
+		t.Fatalf("результат=%+v log=%q", res, log)
+	}
+	f, err := os.Open(filepath.Join(dir, "users.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	lines := 0
+	for scanner.Scan() {
+		lines++
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if lines != rows+1 {
+		t.Fatalf("строк CSV=%d, ожидалось %d", lines, rows+1)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".2csv-") {
+			t.Fatalf("после Commit остался temp: %s", entry.Name())
+		}
 	}
 }

@@ -1,10 +1,13 @@
 package insert
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
 )
+
+var errInvalidInsertModifier = errors.New("после OR ожидается REPLACE или IGNORE")
 
 // Parse читает r потоково и вызывает Handler на каждый INSERT ... VALUES.
 // Остальной SQL и отвергнутые INSERT не являются ошибкой: они уходят в Skip.
@@ -87,10 +90,13 @@ func parseInsert(s *src, h Handler) error {
 		if h.Skip != nil {
 			h.Skip(Skip{Offset: start.Offset, Line: start.Line, Table: table, Reason: reason})
 		}
-		return s.skipUntilSemicolon(true)
+		return s.skipUntilSemicolon(true, false)
 	}
 
 	if err := skipModifiers(s); err != nil {
+		if errors.Is(err, errInvalidInsertModifier) {
+			return skip(err.Error(), "")
+		}
 		return err
 	}
 	if ok, err := s.tryKeyword("INTO"); err != nil {
@@ -104,7 +110,7 @@ func parseInsert(s *src, h Handler) error {
 		if err == io.EOF {
 			return skip("незакрытый INSERT", "")
 		}
-		return err
+		return skip(err.Error(), "")
 	}
 	if table == "" {
 		return skip("пустое имя таблицы", "")
@@ -169,7 +175,10 @@ func parseInsert(s *src, h Handler) error {
 	}
 
 	if !valuesSeen {
-		if err := s.skipSpaceAndComments(); err != nil {
+		if err := s.skipTailSpaceAndComments(); err != nil {
+			if errors.Is(err, errUnclosedBlockComment) {
+				return skip(err.Error(), table)
+			}
 			return err
 		}
 		if ok, err := s.tryKeyword("SELECT"); err != nil {
@@ -198,6 +207,7 @@ func parseInsert(s *src, h Handler) error {
 	began := false
 	surplus := false
 	rows := 0
+	expectRow := false
 
 	begin := func() error {
 		if began {
@@ -216,14 +226,21 @@ func parseInsert(s *src, h Handler) error {
 		}
 		b, err := s.peek()
 		if err == io.EOF {
+			if expectRow {
+				return skip("после запятой нет строки VALUES", table)
+			}
 			break
 		}
 		if err != nil {
 			return err
 		}
 		if b != '(' {
+			if expectRow {
+				return skip("после запятой нет строки VALUES", table)
+			}
 			break
 		}
+		expectRow = false
 		cells, err := parseRow(s)
 		if err != nil {
 			if began {
@@ -246,7 +263,10 @@ func parseInsert(s *src, h Handler) error {
 			}
 		}
 		rows++
-		if err := s.skipSpaceAndComments(); err != nil {
+		if err := s.skipTailSpaceAndComments(); err != nil {
+			if errors.Is(err, errUnclosedBlockComment) {
+				return skip(err.Error(), table)
+			}
 			return err
 		}
 		b, err = s.peek()
@@ -258,6 +278,7 @@ func parseInsert(s *src, h Handler) error {
 		}
 		if b == ',' {
 			_, _ = s.next()
+			expectRow = true
 			continue
 		}
 		break
@@ -269,8 +290,12 @@ func parseInsert(s *src, h Handler) error {
 	if rows == 0 {
 		return skip("нет строк VALUES", table)
 	}
-	if err := consumeTail(s); err != nil {
+	validTail, err := consumeTail(s)
+	if err != nil {
 		return err
+	}
+	if !validTail {
+		return skip("неожиданный хвост INSERT", table)
 	}
 	if h.End != nil {
 		return h.End()
@@ -278,32 +303,43 @@ func parseInsert(s *src, h Handler) error {
 	return nil
 }
 
-func consumeTail(s *src) error {
-	if err := s.skipSpaceAndComments(); err != nil {
-		return err
+func consumeTail(s *src) (bool, error) {
+	if err := s.skipTailSpaceAndComments(); err != nil {
+		if errors.Is(err, errUnclosedBlockComment) || errors.Is(err, errIncompleteInsertTail) {
+			return false, nil
+		}
+		return false, err
 	}
 	b, err := s.peek()
 	if err == io.EOF {
-		return nil
+		return true, nil
 	}
 	if err != nil {
-		return err
+		return false, err
 	}
 	if b == ';' {
 		_, _ = s.next()
-		return nil
+		return true, nil
 	}
 	if ok, err := s.tryKeyword("ON"); err != nil {
-		return err
+		return false, err
 	} else if ok {
-		return s.skipUntilSemicolon(false)
+		err := s.skipUntilSemicolon(false, true)
+		if errors.Is(err, errUnclosedBlockComment) || errors.Is(err, errIncompleteInsertTail) {
+			return false, nil
+		}
+		return true, err
 	}
 	if ok, err := s.tryKeyword("RETURNING"); err != nil {
-		return err
+		return false, err
 	} else if ok {
-		return s.skipUntilSemicolon(false)
+		err := s.skipUntilSemicolon(false, true)
+		if errors.Is(err, errUnclosedBlockComment) || errors.Is(err, errIncompleteInsertTail) {
+			return false, nil
+		}
+		return true, err
 	}
-	return nil
+	return false, nil
 }
 
 func skipModifiers(s *src) error {
@@ -316,13 +352,17 @@ func skipModifiers(s *src) error {
 			return err
 		}
 		if ok {
-			if _, err := s.tryKeyword("REPLACE"); err != nil {
+			if replace, err := s.tryKeyword("REPLACE"); err != nil {
 				return err
+			} else if replace {
+				continue
 			}
-			if _, err := s.tryKeyword("IGNORE"); err != nil {
+			if ignore, err := s.tryKeyword("IGNORE"); err != nil {
 				return err
+			} else if ignore {
+				continue
 			}
-			continue
+			return errInvalidInsertModifier
 		}
 		matched := false
 		for _, kw := range []string{"IGNORE", "DELAYED", "LOW_PRIORITY", "HIGH_PRIORITY"} {
@@ -439,6 +479,7 @@ func parseColumnList(s *src) ([]string, error) {
 	_, _ = s.next()
 
 	var cols []string
+	expectIdent := true
 	for {
 		if err := s.skipSpaceAndComments(); err != nil {
 			return nil, err
@@ -449,11 +490,21 @@ func parseColumnList(s *src) ([]string, error) {
 		}
 		if b == ')' {
 			_, _ = s.next()
+			if expectIdent && len(cols) > 0 {
+				return nil, fmt.Errorf("запятая без колонки")
+			}
 			return cols, nil
 		}
-		if b == ',' {
+		if !expectIdent {
+			if b != ',' {
+				return nil, fmt.Errorf("битый список колонок")
+			}
 			_, _ = s.next()
+			expectIdent = true
 			continue
+		}
+		if b == ',' {
+			return nil, fmt.Errorf("запятая без колонки")
 		}
 		name, err := parseIdent(s)
 		if err != nil {
@@ -473,22 +524,7 @@ func parseColumnList(s *src) ([]string, error) {
 			name = cleanIdent(next)
 		}
 		cols = append(cols, name)
-		if err := s.skipSpaceAndComments(); err != nil {
-			return nil, err
-		}
-		b, err = s.peek()
-		if err != nil {
-			return nil, err
-		}
-		switch b {
-		case ',':
-			_, _ = s.next()
-		case ')':
-			_, _ = s.next()
-			return cols, nil
-		default:
-			return nil, fmt.Errorf("битый список колонок")
-		}
+		expectIdent = false
 	}
 }
 
@@ -566,6 +602,9 @@ func parseRow(s *src) ([]Cell, error) {
 			_, _ = s.next()
 			expectValue = true
 			continue
+		}
+		if !expectValue {
+			return nil, fmt.Errorf("между значениями нет запятой")
 		}
 		cell, err := parseValue(s)
 		if err != nil {

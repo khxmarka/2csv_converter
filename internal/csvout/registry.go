@@ -2,6 +2,8 @@ package csvout
 
 import (
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -27,10 +29,22 @@ func NewRegistry() *Registry {
 }
 
 func mergeKey(dir, base string) string {
-	if abs, err := filepath.Abs(dir); err == nil {
-		dir = abs
+	dir = canonicalPath(dir)
+	if runtime.GOOS == "windows" {
+		base = strings.ToLower(base)
 	}
 	return dir + "\x00" + base
+}
+
+func canonicalPath(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
 }
 
 func (r *Registry) acquire(dir, base string) *slot {
@@ -54,9 +68,7 @@ func (r *Registry) acquireUnique() *slot {
 }
 
 func (r *Registry) lockDir(dir string) *sync.Mutex {
-	if abs, err := filepath.Abs(dir); err == nil {
-		dir = abs
-	}
+	dir = canonicalPath(dir)
 	r.mu.Lock()
 	m, ok := r.byDir[dir]
 	if !ok {

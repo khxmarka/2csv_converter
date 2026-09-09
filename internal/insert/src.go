@@ -2,11 +2,15 @@ package insert
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"strings"
 )
 
 const readBuf = 64 * 1024
+
+var errUnclosedBlockComment = errors.New("незакрытый блочный комментарий")
+var errIncompleteInsertTail = errors.New("незавершённый хвост INSERT")
 
 type src struct {
 	br   *bufio.Reader
@@ -99,6 +103,34 @@ func (s *src) skipSpaceAndComments() error {
 	}
 }
 
+func (s *src) skipTailSpaceAndComments() error {
+	for {
+		b, err := s.peek()
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		switch {
+		case isSpace(b):
+			if _, err := s.next(); err != nil {
+				return err
+			}
+		case b == '-' && s.starts("--"):
+			if err := s.skipLineComment(); err != nil {
+				return err
+			}
+		case b == '/' && s.starts("/*"):
+			if err := s.skipBlockCommentStrict(); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
 func (s *src) starts(lit string) bool {
 	xs, err := s.br.Peek(len(lit))
 	return err == nil && string(xs) == lit
@@ -146,6 +178,38 @@ func (s *src) skipBlockComment() error {
 				_, _ = s.next()
 				return nil
 			}
+		}
+	}
+}
+
+func (s *src) skipBlockCommentStrict() error {
+	if _, err := s.next(); err != nil { // /
+		return err
+	}
+	if _, err := s.next(); err != nil { // *
+		return err
+	}
+	for {
+		b, err := s.next()
+		if err != nil {
+			if err == io.EOF {
+				return errUnclosedBlockComment
+			}
+			return err
+		}
+		if b != '*' {
+			continue
+		}
+		n, err := s.peek()
+		if err == io.EOF {
+			return errUnclosedBlockComment
+		}
+		if err != nil {
+			return err
+		}
+		if n == '/' {
+			_, _ = s.next()
+			return nil
 		}
 	}
 }
@@ -261,11 +325,15 @@ func (s *src) consumeUnquotedWord() (string, error) {
 	return b.String(), nil
 }
 
-func (s *src) skipUntilSemicolon(stopAtStmt bool) error {
+func (s *src) skipUntilSemicolon(stopAtStmt, strictComments bool) error {
 	depth := 0
+	seenContent := false
 	for {
 		b, err := s.peek()
 		if err == io.EOF {
+			if strictComments && (!seenContent || depth != 0) {
+				return errIncompleteInsertTail
+			}
 			return nil
 		}
 		if err != nil {
@@ -274,33 +342,52 @@ func (s *src) skipUntilSemicolon(stopAtStmt bool) error {
 		switch {
 		case b == ';':
 			_, _ = s.next()
+			if strictComments && (!seenContent || depth != 0) {
+				return errIncompleteInsertTail
+			}
 			return nil
 		case b == '-' && s.starts("--"):
 			if err := s.skipLineComment(); err != nil {
 				return err
 			}
 		case b == '/' && s.starts("/*"):
-			if err := s.skipBlockComment(); err != nil {
+			var err error
+			if strictComments {
+				err = s.skipBlockCommentStrict()
+			} else {
+				err = s.skipBlockComment()
+			}
+			if err != nil {
 				return err
 			}
 		case b == '\'', b == '"', b == '`':
+			seenContent = true
 			if err := s.skipQuoted(b); err != nil {
 				if err == io.EOF {
+					if strictComments {
+						return errIncompleteInsertTail
+					}
 					return nil
 				}
 				return err
 			}
 		case b == '[':
+			seenContent = true
 			if err := s.skipBracketIdent(); err != nil {
 				if err == io.EOF {
+					if strictComments {
+						return errIncompleteInsertTail
+					}
 					return nil
 				}
 				return err
 			}
 		case b == '(':
+			seenContent = true
 			depth++
 			_, _ = s.next()
 		case b == ')':
+			seenContent = true
 			if depth > 0 {
 				depth--
 			}
@@ -313,10 +400,14 @@ func (s *src) skipUntilSemicolon(stopAtStmt bool) error {
 			if ok && isStmtStart(word) {
 				return nil
 			}
+			seenContent = true
 			if _, err := s.next(); err != nil {
 				return err
 			}
 		default:
+			if !isSpace(b) {
+				seenContent = true
+			}
 			if _, err := s.next(); err != nil {
 				return err
 			}

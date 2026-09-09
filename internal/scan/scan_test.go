@@ -17,6 +17,17 @@ func TestValidateRootMissing(t *testing.T) {
 	}
 }
 
+func TestFindMissingRootReturnsBlockingSkip(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "нет-такой-папки")
+	result, err := Find(missing)
+	if err != nil {
+		t.Fatalf("ошибка обхода должна быть частью Result: %v", err)
+	}
+	if len(result.Skips) != 1 || !result.Skips[0].BlocksCompletion || result.Skips[0].Path != missing {
+		t.Fatalf("Skips=%+v", result.Skips)
+	}
+}
+
 func TestValidateRootIsFile(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "db")
 	if err := os.WriteFile(file, []byte("not a dir"), 0o644); err != nil {
@@ -58,6 +69,40 @@ func TestFindOnFixtureTree(t *testing.T) {
 	}
 	if got := result.TopFolders(); !reflect.DeepEqual(got, []string{"Alpha", "Beta"}) {
 		t.Fatalf("верхние папки: получено %v, ожидалось [Alpha Beta]", got)
+	}
+	if !reflect.DeepEqual(result.TopDirs, []string{"Alpha", "Beta", "Gamma"}) {
+		t.Fatalf("верхние каталоги: %v", result.TopDirs)
+	}
+}
+
+func TestFindSkippingExcludesCompletedTopFolder(t *testing.T) {
+	root := filepath.Join("testdata", "tree")
+	result, err := FindSkipping(root, map[string]struct{}{"Alpha": {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []SQLFile{
+		{Path: filepath.Join(root, "Beta", "beta.Sql"), TopFolder: "Beta"},
+		{Path: filepath.Join(root, "root_level.sql"), TopFolder: ""},
+	}
+	if !reflect.DeepEqual(result.Files, want) {
+		t.Fatalf("получено: %#v\nожидалось: %#v", result.Files, want)
+	}
+	if !reflect.DeepEqual(result.TopDirs, []string{"Beta", "Gamma"}) {
+		t.Fatalf("верхние каталоги: %v", result.TopDirs)
+	}
+}
+
+func TestSkipTopFolderForWalkError(t *testing.T) {
+	root := filepath.Join("root")
+	if got := skipTopFolder(root, filepath.Join(root, "Alpha", "locked", "file.sql"), false); got != "Alpha" {
+		t.Fatalf("TopFolder=%q", got)
+	}
+	if got := skipTopFolder(root, filepath.Join(root, "Alpha"), true); got != "Alpha" {
+		t.Fatalf("прямой верхний каталог: %q", got)
+	}
+	if got := skipTopFolder(root, filepath.Join(root, "root.sql"), false); got != "" {
+		t.Fatalf("корневой файл не должен иметь TopFolder: %q", got)
 	}
 }
 
@@ -198,7 +243,7 @@ func TestFindCollectsExcelIgnoresOtherTables(t *testing.T) {
 	}
 }
 
-func TestFindSkipsUnreadableSQL(t *testing.T) {
+func TestFindLeavesUnreadableSQLForConverterToReport(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("на Windows chmod не отбирает право чтения у владельца")
 	}
@@ -220,11 +265,11 @@ func TestFindSkipsUnreadableSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
-	if len(result.Files) != 0 {
-		t.Fatalf("нечитаемый .sql не должен попадать в Files: %#v", result.Files)
+	if len(result.Files) != 1 || result.Files[0].Path != path {
+		t.Fatalf("нечитаемый .sql должен дойти до слоя конвертации: %#v", result.Files)
 	}
-	if len(result.Skips) != 1 || result.Skips[0].Path != path {
-		t.Fatalf("нечитаемый .sql должен попасть в Skips: %#v", result.Skips)
+	if len(result.Skips) != 0 {
+		t.Fatalf("scan не должен заранее открывать рабочий файл: %#v", result.Skips)
 	}
 }
 

@@ -2,6 +2,8 @@
 package csvout
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"unicode"
 )
@@ -13,6 +15,8 @@ var reservedStems = map[string]struct{}{
 	"LPT1": {}, "LPT2": {}, "LPT3": {}, "LPT4": {}, "LPT5": {},
 	"LPT6": {}, "LPT7": {}, "LPT8": {}, "LPT9": {},
 }
+
+const maxCSVBaseUTF16 = 251 // 255 UTF-16 units minus ".csv"
 
 // FileBase делает из имени таблицы безопасную основу имени Windows-файла.
 // Пустое после чистки → "table".
@@ -45,6 +49,39 @@ func FileBaseDefault(name, empty string) string {
 		return "_" + s
 	}
 	return s
+}
+
+func limitCSVBase(base string) string {
+	total := 0
+	for _, r := range base {
+		if r > 0xFFFF {
+			total += 2
+		} else {
+			total++
+		}
+	}
+	if total <= maxCSVBaseUTF16 {
+		return base
+	}
+
+	sum := sha256.Sum256([]byte(base))
+	suffix := "~" + hex.EncodeToString(sum[:8])
+	prefixLimit := maxCSVBaseUTF16 - len(suffix)
+	var b strings.Builder
+	units := 0
+	for _, r := range base {
+		n := 1
+		if r > 0xFFFF {
+			n = 2
+		}
+		if units+n > prefixLimit {
+			break
+		}
+		b.WriteRune(r)
+		units += n
+	}
+	b.WriteString(suffix)
+	return b.String()
 }
 
 func csvName(base string, n int) string {

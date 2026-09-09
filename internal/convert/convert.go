@@ -7,6 +7,7 @@ import (
 	"sql2csv/internal/csvout"
 	"sql2csv/internal/insert"
 	"sql2csv/internal/logx"
+	"sql2csv/internal/pii"
 	"sql2csv/internal/scan"
 )
 
@@ -17,6 +18,7 @@ type Result struct {
 	Skipped int
 	Paths   []string
 	OpenErr error
+	Failed  bool // в файле была критическая ошибка чтения/записи CSV
 }
 
 // File разбирает sql-файл и пишет CSV в ту же директорию.
@@ -42,9 +44,10 @@ func File(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile) Result {
 	}); err != nil {
 		s.dropWriter()
 		s.skipped++
+		s.failed = true
 		log.Errorf("%s: %v", sql.Path, err)
 	}
-	return Result{Created: s.created, CSV: s.csvNew, Skipped: s.skipped, Paths: s.paths}
+	return Result{Created: s.created, CSV: s.csvNew, Skipped: s.skipped, Paths: s.paths, Failed: s.failed}
 }
 
 type session struct {
@@ -57,6 +60,7 @@ type session struct {
 	created int
 	csvNew  int
 	skipped int
+	failed  bool
 	paths   []string
 }
 
@@ -71,9 +75,14 @@ func (s *session) dropWriter() {
 func (s *session) begin(meta insert.Meta) error {
 	s.dropWriter()
 	s.meta = meta
+	if !pii.Match(meta.Table) && !pii.MatchAny(meta.Columns) {
+		s.skipped++
+		return nil
+	}
 	w, err := csvout.Create(s.reg, s.dir, meta.Table, meta.Columns)
 	if err != nil {
 		s.skipped++
+		s.failed = true
 		s.log.Errorf("%s таблица %s: не удалось создать CSV: %v", s.sql.Path, meta.Table, err)
 		return nil
 	}
@@ -94,6 +103,7 @@ func (s *session) row(cells []insert.Cell) error {
 	if err := s.writer.Row(values); err != nil {
 		s.dropWriter()
 		s.skipped++
+		s.failed = true
 		s.log.Errorf("%s таблица %s: запись CSV: %v", s.sql.Path, s.meta.Table, err)
 	}
 	return nil
@@ -108,6 +118,7 @@ func (s *session) end() error {
 	res, err := w.Commit()
 	if err != nil {
 		s.skipped++
+		s.failed = true
 		s.log.Errorf("%s таблица %s: не удалось записать CSV: %v", s.sql.Path, s.meta.Table, err)
 		return nil
 	}
