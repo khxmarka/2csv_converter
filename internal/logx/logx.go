@@ -15,6 +15,7 @@ type Logger struct {
 	mu   sync.Mutex
 	w    io.Writer
 	hang string
+	err  error
 }
 
 func New(w io.Writer) *Logger {
@@ -36,7 +37,7 @@ func (l *Logger) Hang(msg string) {
 	if msg == "" {
 		return
 	}
-	fmt.Fprint(l.w, msg)
+	l.print(msg)
 	l.hang = msg
 }
 
@@ -64,9 +65,9 @@ func (l *Logger) line(s string) {
 	defer l.mu.Unlock()
 	saved := l.hang
 	l.clearHang()
-	fmt.Fprintln(l.w, s)
+	l.println(s)
 	if saved != "" {
-		fmt.Fprint(l.w, saved)
+		l.print(saved)
 		l.hang = saved
 	}
 }
@@ -76,6 +77,30 @@ func (l *Logger) clearHang() {
 		return
 	}
 	n := utf8.RuneCountInString(l.hang)
-	fmt.Fprint(l.w, "\r"+strings.Repeat(" ", n)+"\r")
+	l.print("\r" + strings.Repeat(" ", n) + "\r")
 	l.hang = ""
+}
+
+func (l *Logger) print(s string) {
+	if l.err != nil {
+		return
+	}
+	_, l.err = fmt.Fprint(l.w, s)
+}
+
+func (l *Logger) println(s string) {
+	if l.err != nil {
+		return
+	}
+	_, l.err = fmt.Fprintln(l.w, s)
+}
+
+// Err возвращает первую ошибку записи в лог.
+func (l *Logger) Err() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.err
 }

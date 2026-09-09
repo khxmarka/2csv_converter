@@ -3,4 +3,4 @@ INSERT INTO t SELECT id FROM users;
 INSERT INTO t SET name = 'nope';
 
 -- Этот должен пройти → ok.csv
-INSERT INTO ok (id, label) VALUES (1, 'survived');
+INSERT INTO ok (email, label) VALUES ('survived@example.test', 'survived');

@@ -2,19 +2,33 @@ package csvout
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 )
 
-const (
-	maxNameIndex = 1_000_000
-	tmpPattern   = ".2csv-*.tmp"
-)
+const tmpPattern = ".2csv-*.tmp"
+
+// CleanupTemps удаляет незавершённые временные файлы прошлого аварийного
+// запуска в конкретной рабочей директории.
+func CleanupTemps(dir string) error {
+	paths, err := filepath.Glob(filepath.Join(dir, tmpPattern))
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, path := range paths {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
 
 // Writer пишет один INSERT во временный файл. После Commit: если CSV ключа
-// ещё нет — переименовывает temp в свободное {table}.csv / {table}(n).csv;
+// ещё нет — заменяет целевой {table}.csv содержимым temp;
 // если ключ уже открыт в этом запуске — дописывает только строки данных.
 type Writer struct {
 	reg       *Registry
@@ -47,7 +61,7 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	base := FileBase(table)
+	base := limitCSVBase(FileBase(table))
 	s := reg.acquire(dir, base)
 
 	tmp, err := os.CreateTemp(dir, tmpPattern)
@@ -79,8 +93,8 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 	return w, nil
 }
 
-// CreatePlain открывает CSV с строкой заголовка и без склейки с INSERT.
-// base уже санитайзнут; файл — первое свободное {base}.csv / {base}(n).csv.
+// CreatePlain открывает CSV со строкой заголовка и без склейки с INSERT.
+// base уже санитайзнут; при Commit целевой {base}.csv заменяется.
 func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, error) {
 	if reg == nil {
 		return nil, fmt.Errorf("csvout: нужен Registry")
@@ -90,6 +104,10 @@ func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, er
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
+	}
+	base = limitCSVBase(base)
+	if base == "" {
+		base = "table"
 	}
 	s := reg.acquireUnique()
 	tmp, err := os.CreateTemp(dir, tmpPattern)
@@ -191,28 +209,11 @@ func (w *Writer) place(tmpName string) (string, error) {
 		dmu := w.reg.lockDir(w.dir)
 		defer dmu.Unlock()
 	}
-	for n := 0; n < maxNameIndex; n++ {
-		path := filepath.Join(w.dir, csvName(w.base, n))
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-		if err != nil {
-			if os.IsExist(err) {
-				continue
-			}
-			return "", err
-		}
-		if err := f.Close(); err != nil {
-			_ = os.Remove(path)
-			return "", err
-		}
-		if err := os.Remove(path); err != nil {
-			return "", err
-		}
-		if err := os.Rename(tmpName, path); err != nil {
-			return "", err
-		}
-		return path, nil
+	path := filepath.Join(w.dir, csvName(w.base, 0))
+	if err := replaceFile(tmpName, path); err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("нет свободного имени для %s.csv в %s", w.base, w.dir)
+	return path, nil
 }
 
 func appendCopy(dst, src string) error {
@@ -225,12 +226,18 @@ func appendCopy(dst, src string) error {
 	if err != nil {
 		return err
 	}
+	info, err := out.Stat()
+	if err != nil {
+		return errors.Join(err, out.Close())
+	}
+	originalSize := info.Size()
 	_, copyErr := io.Copy(out, in)
 	closeErr := out.Close()
-	if copyErr != nil {
-		return copyErr
+	if copyErr != nil || closeErr != nil {
+		rollbackErr := os.Truncate(dst, originalSize)
+		return errors.Join(copyErr, closeErr, rollbackErr)
 	}
-	return closeErr
+	return nil
 }
 
 func (w *Writer) unlock() {

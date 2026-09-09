@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 )
@@ -38,14 +39,17 @@ func (f SQLFile) IsExcel() bool { return f.Kind == KindXLSX || f.Kind == KindXLS
 
 // Skip — единица, пропущенная при обходе: symlink или недоступный каталог.
 type Skip struct {
-	Path   string
-	Reason string
+	Path             string
+	Reason           string
+	TopFolder        string
+	BlocksCompletion bool
 }
 
 // Result — итог обхода: найденные файлы (отсортированы по пути) и пропуски.
 type Result struct {
-	Files []SQLFile
-	Skips []Skip
+	Files   []SQLFile
+	Skips   []Skip
+	TopDirs []string
 }
 
 // ValidateRoot проверяет, что корень существует и является директорией.
@@ -65,16 +69,32 @@ func ValidateRoot(path string) error {
 
 // Find рекурсивно обходит root и собирает пути *.sql, *.xlsx и *.xls без учёта регистра.
 // Symlink-и не раскрываются: и ссылки на каталоги, и ссылки на файлы попадают в Skips.
-// Ошибка чтения отдельного каталога не прерывает обход, ошибка чтения самого корня — прерывает.
+// Ошибки чтения каталогов возвращаются как блокирующие Skips и не роняют обход.
 func Find(root string) (Result, error) {
+	return FindSkipping(root, nil)
+}
+
+// FindSkipping работает как Find, но целиком исключает уже завершённые верхние
+// папки до открытия находящихся в них файлов.
+func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 	var res Result
 
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			if path == root {
-				return walkErr
+				res.Skips = append(res.Skips, Skip{
+					Path:             path,
+					Reason:           walkErr.Error(),
+					BlocksCompletion: true,
+				})
+				return nil
 			}
-			res.Skips = append(res.Skips, Skip{Path: path, Reason: walkErr.Error()})
+			res.Skips = append(res.Skips, Skip{
+				Path:             path,
+				Reason:           walkErr.Error(),
+				TopFolder:        skipTopFolder(root, path, entry != nil && entry.IsDir()),
+				BlocksCompletion: true,
+			})
 			if entry != nil && entry.IsDir() {
 				return fs.SkipDir
 			}
@@ -82,6 +102,9 @@ func Find(root string) (Result, error) {
 		}
 		if path == root {
 			return nil
+		}
+		if entry.IsDir() && isCompletedTop(root, path, completed) {
+			return fs.SkipDir
 		}
 		if isLink(entry.Type()) {
 			res.Skips = append(res.Skips, Skip{Path: path, Reason: "symlink или reparse point, не следуем"})
@@ -91,14 +114,13 @@ func Find(root string) (Result, error) {
 			return nil
 		}
 		if entry.IsDir() {
+			if top, direct := directTopDir(root, path); direct {
+				res.TopDirs = append(res.TopDirs, top)
+			}
 			return nil
 		}
 		kind, ok := workKind(path)
 		if !ok {
-			return nil
-		}
-		if err := probeOpen(path); err != nil {
-			res.Skips = append(res.Skips, Skip{Path: path, Reason: err.Error()})
 			return nil
 		}
 		top, err := topFolder(root, path)
@@ -115,7 +137,57 @@ func Find(root string) (Result, error) {
 
 	sort.Slice(res.Files, func(i, j int) bool { return res.Files[i].Path < res.Files[j].Path })
 	sort.Slice(res.Skips, func(i, j int) bool { return res.Skips[i].Path < res.Skips[j].Path })
+	sort.Strings(res.TopDirs)
 	return res, nil
+}
+
+func isCompletedTop(root, path string, completed map[string]struct{}) bool {
+	if len(completed) == 0 {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil || rel == "." || filepath.Dir(rel) != "." {
+		return false
+	}
+	if runtime.GOOS != "windows" {
+		_, ok := completed[rel]
+		return ok
+	}
+	for name := range completed {
+		if strings.EqualFold(name, rel) {
+			return true
+		}
+	}
+	return false
+}
+
+func directTopDir(root, path string) (string, bool) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) != 1 || rel == "." {
+		return "", false
+	}
+	return parts[0], true
+}
+
+func skipTopFolder(root, path string, isDir bool) string {
+	if isDir {
+		if top, direct := directTopDir(root, path); direct {
+			return top
+		}
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[0]
 }
 
 // TopFolders возвращает отсортированный список верхних папок, в которых нашлись рабочие файлы.
@@ -161,19 +233,6 @@ func workKind(path string) (Kind, bool) {
 	default:
 		return 0, false
 	}
-}
-
-// probeOpen проверяет, что файл можно открыть, и сразу закрывает его.
-// Содержимое не читается: разбор INSERT — отдельный слой.
-func probeOpen(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("не удалось открыть: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("не удалось закрыть после проверки: %w", err)
-	}
-	return nil
 }
 
 func topFolder(root, path string) (string, error) {

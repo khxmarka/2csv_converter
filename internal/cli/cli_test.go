@@ -2,10 +2,17 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"strings"
 	"testing"
 )
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
+}
 
 func TestRunHelp(t *testing.T) {
 	var stdout, stderr bytes.Buffer
@@ -17,6 +24,11 @@ func TestRunHelp(t *testing.T) {
 	if !strings.Contains(stdout.String(), "2csv") {
 		t.Fatalf("справка должна печататься в stdout, получено: %q", stdout.String())
 	}
+	for _, want := range []string{"PII", "converted.txt", "не обходятся", "варианты (n) не создаются"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("в справке нет %q: %q", want, stdout.String())
+		}
+	}
 	if strings.Contains(stderr.String(), "combo/db:") {
 		t.Fatalf("приглашение не должно печататься при --help, stderr: %q", stderr.String())
 	}
@@ -25,6 +37,16 @@ func TestRunHelp(t *testing.T) {
 	}
 	if stdin.reads != 0 {
 		t.Fatal("--help не должен читать stdin")
+	}
+}
+
+func TestRunStopsWhenPromptCannotBeWritten(t *testing.T) {
+	stdin := &blockingReader{t: t}
+	if code := Run(nil, stdin, io.Discard, failingWriter{}); code != exitFatal {
+		t.Fatalf("код=%d, ожидался %d", code, exitFatal)
+	}
+	if stdin.reads != 0 {
+		t.Fatal("после ошибки stderr нельзя читать stdin")
 	}
 }
 

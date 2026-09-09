@@ -2,6 +2,7 @@
 package app
 
 import (
+	"fmt"
 	"sort"
 
 	"sql2csv/internal/converted"
@@ -25,26 +26,51 @@ func Run(log *logx.Logger, root string) (Result, error) {
 	if err := scan.ValidateRoot(root); err != nil {
 		return empty, err
 	}
+	releaseRoot, err := acquireRootLock(root)
+	if err != nil {
+		return empty, err
+	}
+	defer releaseRoot()
 
-	found, err := scan.Find(root)
+	completed, err := converted.Read(root)
+	if err != nil {
+		log.Errorf("не удалось прочитать %s: %v", converted.Path(root), err)
+		completed = make(map[string]struct{})
+	}
+
+	found, err := scan.FindSkipping(root, completed)
 	if err != nil {
 		return empty, err
 	}
 
-	acc := processFiles(log, found.Files)
+	blocked := make(map[string]struct{})
+	scanFails := 0
+	for _, skipped := range found.Skips {
+		if !skipped.BlocksCompletion {
+			continue
+		}
+		scanFails++
+		log.Errorf("%s: ошибка обхода: %s", skipped.Path, skipped.Reason)
+		if skipped.TopFolder != "" {
+			blocked[skipped.TopFolder] = struct{}{}
+		}
+	}
+
+	acc := processFiles(log, root, found.Files, blocked)
+	acc.completeEmptyTops(found.TopDirs)
 	insertOK, insertSkip, csvCount, filesFail, tops := acc.snapshot()
 	out := Result{
 		Scan:        found,
 		InsertOK:    insertOK,
 		InsertSkip:  insertSkip,
 		CSV:         csvCount,
-		FilesFail:   filesFail,
+		FilesFail:   filesFail + scanFails,
 		SuccessTops: mapsKeys(tops),
 	}
-	if err := converted.Write(root, out.SuccessTops); err != nil {
-		log.Errorf("не удалось записать %s: %v", converted.Path(root), err)
-	}
 	log.Hang("")
+	if err := log.Err(); err != nil {
+		return out, fmt.Errorf("не удалось писать лог: %w", err)
+	}
 	return out, nil
 }
 

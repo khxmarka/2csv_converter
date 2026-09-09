@@ -1,6 +1,7 @@
 package insert
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -269,6 +270,104 @@ func TestParseSkipEmptyValues(t *testing.T) {
 	}
 }
 
+func TestParseRejectsMalformedSeparatorsAndContinues(t *testing.T) {
+	tests := map[string]string{
+		"values without comma": `INSERT INTO bad (email, name) VALUES ('a' 'Ann');
+			INSERT INTO ok (email) VALUES ('ok@example.test');`,
+		"rows without comma": `INSERT INTO bad (email) VALUES ('a') ('b');
+			INSERT INTO ok (email) VALUES ('ok@example.test');`,
+		"trailing row comma": `INSERT INTO bad (email) VALUES ('a'),;
+			INSERT INTO ok (email) VALUES ('ok@example.test');`,
+		"unexpected tail": `INSERT INTO bad (email) VALUES ('a') GARBAGE;
+			INSERT INTO ok (email) VALUES ('ok@example.test');`,
+	}
+	for name, sql := range tests {
+		t.Run(name, func(t *testing.T) {
+			inserts, skips := collect(t, sql)
+			if len(skips) != 1 || skips[0].Table != "bad" {
+				t.Fatalf("ожидался пропуск bad: %+v", skips)
+			}
+			if len(inserts) != 1 || inserts[0].meta.Table != "ok" {
+				t.Fatalf("следующий INSERT должен пройти: %+v", inserts)
+			}
+		})
+	}
+}
+
+func TestParseRejectsMalformedColumnListsAndContinues(t *testing.T) {
+	lists := []string{
+		"(, email)",
+		"(email,)",
+		"(email,,name)",
+		"(email name)",
+	}
+	for _, columns := range lists {
+		t.Run(columns, func(t *testing.T) {
+			sql := "INSERT INTO bad " + columns + " VALUES ('a');" +
+				"INSERT INTO ok (email) VALUES ('ok@example.test');"
+			inserts, skips := collect(t, sql)
+			if len(skips) != 1 || skips[0].Table != "bad" {
+				t.Fatalf("ожидался пропуск bad: %+v", skips)
+			}
+			if len(inserts) != 1 || inserts[0].meta.Table != "ok" {
+				t.Fatalf("следующий INSERT должен пройти: %+v", inserts)
+			}
+		})
+	}
+}
+
+func TestParseRejectsMalformedTableAndContinues(t *testing.T) {
+	sql := `INSERT INTO 00;
+		INSERT INTO ok (email) VALUES ('ok@example.test');`
+	inserts, skips := collect(t, sql)
+	if len(skips) != 1 {
+		t.Fatalf("ожидался один пропуск: %+v", skips)
+	}
+	if len(inserts) != 1 || inserts[0].meta.Table != "ok" {
+		t.Fatalf("следующий INSERT должен пройти: %+v", inserts)
+	}
+}
+
+func TestParseRejectsInvalidORModifierAndContinues(t *testing.T) {
+	sql := `INSERT OR INTO bad (email) VALUES ('bad@example.test');
+		INSERT INTO ok (email) VALUES ('ok@example.test');`
+	inserts, skips := collect(t, sql)
+	if len(skips) != 1 {
+		t.Fatalf("ожидался один пропуск: %+v", skips)
+	}
+	if len(inserts) != 1 || inserts[0].meta.Table != "ok" {
+		t.Fatalf("следующий INSERT должен пройти: %+v", inserts)
+	}
+}
+
+func TestParseRejectsUnclosedCommentAfterValues(t *testing.T) {
+	tests := []string{
+		`INSERT INTO users (email) VALUES ('a@example.test') /* unclosed`,
+		`INSERT INTO users (email) VALUES ('a@example.test') ON DUPLICATE KEY UPDATE email='b' /* unclosed`,
+	}
+	for _, sql := range tests {
+		inserts, skips := collect(t, sql)
+		if len(inserts) != 0 || len(skips) != 1 {
+			t.Fatalf("sql=%q inserts=%+v skips=%+v", sql, inserts, skips)
+		}
+	}
+}
+
+func TestParseRejectsIncompleteOnAndReturningTails(t *testing.T) {
+	tests := []string{
+		`INSERT INTO users (email) VALUES ('a@example.test') ON`,
+		`INSERT INTO users (email) VALUES ('a@example.test') RETURNING;`,
+		`INSERT INTO users (email) VALUES ('a@example.test') ON DUPLICATE KEY UPDATE email='unclosed`,
+		`INSERT INTO users (email) VALUES ('a@example.test') RETURNING (email`,
+	}
+	for _, sql := range tests {
+		inserts, skips := collect(t, sql)
+		if len(inserts) != 0 || len(skips) != 1 {
+			t.Fatalf("sql=%q inserts=%+v skips=%+v", sql, inserts, skips)
+		}
+	}
+}
+
 func TestParseUnclosedInsert(t *testing.T) {
 	sql := `INSERT INTO t (id) VALUES (1, 'no-end`
 	inserts, skips := collect(t, sql)
@@ -455,4 +554,52 @@ func TestParseTestdataFiles(t *testing.T) {
 	if len(inserts[1].rows) != 2 {
 		t.Fatalf("у beta должно быть 2 строки, получено %d", len(inserts[1].rows))
 	}
+}
+
+func FuzzParseNeverLeavesOpenInsert(f *testing.F) {
+	for _, seed := range [][]byte{
+		{},
+		[]byte("not sql"),
+		[]byte("INSERT INTO users (email) VALUES ('a@example.test');"),
+		[]byte("INSERT INTO t (a,b) VALUES ('x' 'y'),;"),
+		[]byte("\xEF\xBB\xBFINSERT INTO [用户] ([邮箱]) VALUES ('a');"),
+		{0x00, 0xFF, 'I', 'N', 'S', 'E', 'R', 'T'},
+	} {
+		f.Add(seed)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		active := false
+		err := Parse(bytes.NewReader(data), Handler{
+			Begin: func(Meta) error {
+				if active {
+					t.Fatal("повторный Begin без End/Skip")
+				}
+				active = true
+				return nil
+			},
+			Row: func([]Cell) error {
+				if !active {
+					t.Fatal("Row без Begin")
+				}
+				return nil
+			},
+			End: func() error {
+				if !active {
+					t.Fatal("End без Begin")
+				}
+				active = false
+				return nil
+			},
+			Skip: func(Skip) {
+				active = false
+			},
+		})
+		if err != nil {
+			t.Fatalf("Parse с безошибочным reader: %v", err)
+		}
+		if active {
+			t.Fatal("Parse завершился с незакрытым Begin")
+		}
+	})
 }

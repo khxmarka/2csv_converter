@@ -1,10 +1,13 @@
 package xlsconv
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 
 	"sql2csv/internal/csvout"
+
+	"github.com/xuri/excelize/v2"
 )
 
 // Result — итог записи CSV одного Excel-файла. CSV на диск — только здесь.
@@ -22,6 +25,9 @@ type Result struct {
 func File(reg *csvout.Registry, path string) Result {
 	if reg == nil {
 		return Result{OpenErr: errNeedRegistry}
+	}
+	if strings.EqualFold(filepath.Ext(path), ".xlsx") {
+		return fileXLSX(reg, path)
 	}
 	book, err := Read(path)
 	if err != nil {
@@ -52,6 +58,150 @@ func File(reg *csvout.Registry, path string) Result {
 		out.Paths = append(out.Paths, p)
 	}
 	return out
+}
+
+func fileXLSX(reg *csvout.Registry, path string) Result {
+	book, err := excelize.OpenFile(path)
+	if err != nil {
+		return Result{OpenErr: err}
+	}
+	defer func() { _ = book.Close() }()
+
+	allNames := book.GetSheetList()
+	if len(allNames) > MaxSheets {
+		return Result{SkipTooMany: true}
+	}
+	names := make([]string, 0, len(allNames))
+	for _, name := range allNames {
+		if !isWorksheet(book, name) {
+			continue
+		}
+		names = append(names, name)
+	}
+
+	dir := filepath.Dir(path)
+	stem := bookStem(path)
+	var out Result
+	for _, name := range names {
+		width, nonEmpty, err := xlsxSheetShape(book, name)
+		if err != nil {
+			if out.WriteErr == nil {
+				out.WriteErr = fmt.Errorf("лист %q: %w", name, err)
+			}
+			continue
+		}
+		if !nonEmpty {
+			continue
+		}
+		p, err := writeXLSXSheet(reg, book, dir, stem, name, width)
+		if err != nil {
+			if out.WriteErr == nil {
+				out.WriteErr = err
+			}
+			continue
+		}
+		if p != "" {
+			out.CSV++
+			out.Paths = append(out.Paths, p)
+		}
+	}
+	return out
+}
+
+func xlsxSheetShape(book *excelize.File, name string) (width int, nonEmpty bool, err error) {
+	rows, err := book.Rows(name)
+	if err != nil {
+		return 0, false, err
+	}
+	for rows.Next() {
+		cols, err := rows.Columns()
+		if err != nil {
+			_ = rows.Close()
+			return 0, false, err
+		}
+		if len(cols) > width {
+			width = len(cols)
+		}
+		if !rowEmpty(cols) {
+			nonEmpty = true
+		}
+	}
+	iterErr := rows.Error()
+	closeErr := rows.Close()
+	if iterErr != nil {
+		return 0, false, iterErr
+	}
+	if closeErr != nil {
+		return 0, false, closeErr
+	}
+	return width, nonEmpty, nil
+}
+
+func writeXLSXSheet(
+	reg *csvout.Registry,
+	book *excelize.File,
+	dir, stem, name string,
+	width int,
+) (string, error) {
+	rows, err := book.Rows(name)
+	if err != nil {
+		return "", err
+	}
+	var writer *csvout.Writer
+	first := true
+	pendingEmpty := 0
+	abort := func(err error) (string, error) {
+		_ = rows.Close()
+		if writer != nil {
+			_ = writer.Abort()
+		}
+		return "", err
+	}
+
+	for rows.Next() {
+		cols, err := rows.Columns()
+		if err != nil {
+			return abort(err)
+		}
+		if first {
+			first = false
+			writer, err = csvout.CreatePlain(reg, dir, csvBase(stem, name), padRow(cols, width))
+			if err != nil {
+				return abort(err)
+			}
+			continue
+		}
+		if rowEmpty(cols) {
+			pendingEmpty++
+			continue
+		}
+		for pendingEmpty > 0 {
+			if err := writer.Row(nil); err != nil {
+				return abort(err)
+			}
+			pendingEmpty--
+		}
+		if err := writer.Row(cols); err != nil {
+			return abort(err)
+		}
+	}
+	if err := rows.Error(); err != nil {
+		return abort(err)
+	}
+	if err := rows.Close(); err != nil {
+		if writer != nil {
+			_ = writer.Abort()
+		}
+		return "", err
+	}
+	if writer == nil {
+		return "", nil
+	}
+	res, err := writer.Commit()
+	if err != nil {
+		return "", err
+	}
+	return res.Path, nil
 }
 
 func bookStem(path string) string {

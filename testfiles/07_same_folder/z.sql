@@ -1,2 +1,2 @@
 -- Список колонок другой — в CSV не пишется, значения идут в колонки заголовка по порядку.
-INSERT INTO t (x, y) VALUES (2, 'from-z');
+INSERT INTO t (x, email) VALUES (2, 'from-z');

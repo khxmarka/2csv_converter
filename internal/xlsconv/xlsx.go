@@ -13,15 +13,16 @@ func readXLSX(path string) (Book, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	names := make([]string, 0)
-	for _, name := range f.GetSheetList() {
+	allNames := f.GetSheetList()
+	if len(allNames) > MaxSheets {
+		return Book{SkipTooMany: true}, nil
+	}
+	names := make([]string, 0, len(allNames))
+	for _, name := range allNames {
 		if !isWorksheet(f, name) {
 			continue
 		}
 		names = append(names, name)
-		if len(names) > MaxSheets {
-			return Book{SkipTooMany: true}, nil
-		}
 	}
 
 	sheets := make([]Sheet, 0, len(names))

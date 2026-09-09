@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -46,6 +48,41 @@ func TestFileBase(t *testing.T) {
 	}
 	if got := FileBaseDefault("", "sheet"); got != "sheet" {
 		t.Fatalf("FileBaseDefault empty sheet: %q", got)
+	}
+}
+
+func TestLongOutputNameIsLimitedToWindowsComponentLimit(t *testing.T) {
+	dir := t.TempDir()
+	w, err := CreatePlain(NewRegistry(), dir, strings.Repeat("a", 300), []string{"h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Row([]string{"v"}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := w.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(filepath.Base(res.Path)); got != 255 {
+		t.Fatalf("длина имени=%d, ожидалось 251 + .csv", got)
+	}
+}
+
+func TestSQLKeysDifferingAfterNameLimitStaySeparate(t *testing.T) {
+	dir := t.TempDir()
+	reg := NewRegistry()
+	prefix := strings.Repeat("a", maxCSVBaseUTF16)
+	first := commitInsert(t, reg, dir, prefix+"x", []string{"email"}, []string{"A"})
+	second := commitInsert(t, reg, dir, prefix+"y", []string{"email"}, []string{"B"})
+	if first.Path == second.Path {
+		t.Fatalf("hash-суффиксы должны различать пути: %s", first.Path)
+	}
+	if got := readCSV(t, first.Path); got != "\"email\"\n\"A\"\n" {
+		t.Fatalf("первый CSV=%q", got)
+	}
+	if got := readCSV(t, second.Path); got != "\"email\"\n\"B\"\n" {
+		t.Fatalf("второй CSV=%q", got)
 	}
 }
 
@@ -112,7 +149,7 @@ func TestCommitBytesAndNoBOM(t *testing.T) {
 	}
 }
 
-func TestExistingFileGetsIndex(t *testing.T) {
+func TestExistingFileIsOverwritten(t *testing.T) {
 	dir := t.TempDir()
 	old := filepath.Join(dir, "t.csv")
 	if err := os.WriteFile(old, []byte("KEEP"), 0o644); err != nil {
@@ -125,16 +162,56 @@ func TestExistingFileGetsIndex(t *testing.T) {
 	if err := w.Row([]string{"1"}); err != nil {
 		t.Fatal(err)
 	}
+	if got := readCSV(t, old); got != "KEEP" {
+		t.Fatalf("целевой файл изменён до Commit: %q", got)
+	}
 	res, err := w.Commit()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(res.Path) != "t(1).csv" {
-		t.Fatalf("ожидался t(1).csv, получено %s", res.Path)
+	if filepath.Base(res.Path) != "t.csv" {
+		t.Fatalf("ожидался t.csv, получено %s", res.Path)
 	}
-	keep, _ := os.ReadFile(old)
-	if string(keep) != "KEEP" {
-		t.Fatalf("существующий файл затёрт: %q", keep)
+	if got := readCSV(t, old); got != "\"a\"\n\"1\"\n" {
+		t.Fatalf("t.csv=%q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "t(1).csv")); !os.IsNotExist(err) {
+		t.Fatalf("t(1).csv не должен создаваться, err=%v", err)
+	}
+}
+
+func TestReplaceFailureKeepsExistingDestination(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "target.csv")
+	if err := os.WriteFile(dst, []byte("KEEP"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := replaceFile(filepath.Join(dir, "missing.tmp"), dst); err == nil {
+		t.Fatal("ожидалась ошибка замены отсутствующим temp")
+	}
+	if got := readCSV(t, dst); got != "KEEP" {
+		t.Fatalf("цель повреждена после неуспешной замены: %q", got)
+	}
+}
+
+func TestCleanupTempsRemovesOnlyConverterTemps(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, ".2csv-stale.tmp")
+	keep := filepath.Join(dir, "keep.tmp")
+	if err := os.WriteFile(stale, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupTemps(dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale temp не удалён, err=%v", err)
+	}
+	if got := readCSV(t, keep); got != "keep" {
+		t.Fatalf("посторонний temp изменён: %q", got)
 	}
 }
 
@@ -231,6 +308,24 @@ func TestMergeTwoInsertsSameKeyOneFile(t *testing.T) {
 	}
 }
 
+func TestMergeTableKeyIsCaseInsensitiveOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows filesystem semantics")
+	}
+	dir := t.TempDir()
+	reg := NewRegistry()
+	first := commitInsert(t, reg, dir, "Users", []string{"email"}, []string{"A"})
+	second := commitInsert(t, reg, dir, "users", []string{"email"}, []string{"B"})
+	third := commitInsert(t, reg, dir, "Users", []string{"email"}, []string{"C"})
+	if first.Path != second.Path || second.Path != third.Path {
+		t.Fatalf("пути разных slots: %s, %s, %s", first.Path, second.Path, third.Path)
+	}
+	want := "\"email\"\n\"A\"\n\"B\"\n\"C\"\n"
+	if got := readCSV(t, first.Path); got != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestMergeTwoDirsStaySeparate(t *testing.T) {
 	root := t.TempDir()
 	alpha := filepath.Join(root, "Alpha")
@@ -246,7 +341,7 @@ func TestMergeTwoDirsStaySeparate(t *testing.T) {
 	}
 }
 
-func TestMergePreexistingTakesIndexThenAppends(t *testing.T) {
+func TestMergePreexistingOverwritesThenAppends(t *testing.T) {
 	dir := t.TempDir()
 	old := filepath.Join(dir, "t.csv")
 	if err := os.WriteFile(old, []byte("KEEP"), 0o644); err != nil {
@@ -255,15 +350,11 @@ func TestMergePreexistingTakesIndexThenAppends(t *testing.T) {
 	reg := NewRegistry()
 	a := commitInsert(t, reg, dir, "t", []string{"id"}, []string{"1"})
 	b := commitInsert(t, reg, dir, "t", []string{"id"}, []string{"2"})
-	if filepath.Base(a.Path) != "t(1).csv" || a.Path != b.Path {
-		t.Fatalf("ожидалась склейка в t(1).csv, получено %s и %s", a.Path, b.Path)
+	if filepath.Base(a.Path) != "t.csv" || a.Path != b.Path {
+		t.Fatalf("ожидалась склейка в t.csv, получено %s и %s", a.Path, b.Path)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "t(2).csv")); err == nil {
-		t.Fatal("не должно быть t(2).csv")
-	}
-	keep, _ := os.ReadFile(old)
-	if string(keep) != "KEEP" {
-		t.Fatalf("чужой t.csv затёрт: %q", keep)
+	if _, err := os.Stat(filepath.Join(dir, "t(1).csv")); !os.IsNotExist(err) {
+		t.Fatalf("не должно быть t(1).csv, err=%v", err)
 	}
 	got := readCSV(t, a.Path)
 	want := "\"id\"\n\"1\"\n\"2\"\n"
@@ -407,7 +498,7 @@ func TestCreateNoHeaderFromEmptyColumns(t *testing.T) {
 	}
 }
 
-func TestCreatePlainHasHeaderAndNoMerge(t *testing.T) {
+func TestCreatePlainOverwritesSameNamedSQLWithoutAppending(t *testing.T) {
 	dir := t.TempDir()
 	reg := NewRegistry()
 	sql := commitInsert(t, reg, dir, "t", []string{"id"}, []string{"1"})
@@ -422,11 +513,8 @@ func TestCreatePlainHasHeaderAndNoMerge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(plain.Path) != "t(1).csv" {
-		t.Fatalf("Excel не должен дописывать INSERT: %s", plain.Path)
-	}
-	if readCSV(t, sql.Path) != "\"id\"\n\"1\"\n" {
-		t.Fatalf("SQL CSV испорчен: %q", readCSV(t, sql.Path))
+	if filepath.Base(plain.Path) != "t.csv" || plain.Path != sql.Path {
+		t.Fatalf("Excel должен заменить целевой t.csv: SQL=%s Excel=%s", sql.Path, plain.Path)
 	}
 	got := readCSV(t, plain.Path)
 	if got != "\"col\"\n\"excel\"\n" {
