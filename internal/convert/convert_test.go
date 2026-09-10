@@ -71,10 +71,11 @@ func TestPIIFilterMatchesColumnAndStaysSilent(t *testing.T) {
 	dir := t.TempDir()
 	sql := `
 INSERT INTO settings (id, email) VALUES (1, 'a@example.com');
+INSERT INTO settings (email, phone) VALUES ('a@example.com', '555');
 INSERT INTO audit_log (id, status) VALUES (2, 'ok');
 `
 	res, log := runFile(t, dir, "dump.sql", sql)
-	if res.Created != 1 || res.CSV != 1 || res.Skipped != 1 {
+	if res.Created != 1 || res.CSV != 1 || res.Skipped != 2 {
 		t.Fatalf("created=%d csv=%d skipped=%d", res.Created, res.CSV, res.Skipped)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "settings.csv")); err != nil {
@@ -85,6 +86,48 @@ INSERT INTO audit_log (id, status) VALUES (2, 'ok');
 	}
 	if log != "" {
 		t.Fatalf("PII-фильтр должен пропускать INSERT без лога: %q", log)
+	}
+}
+
+func TestPIIFilterRequiresTwoColumnsWithoutTableMatch(t *testing.T) {
+	dir := t.TempDir()
+	sql := `
+INSERT INTO t (email) VALUES ('a@example.test');
+INSERT INTO t (phone) VALUES ('555');
+INSERT INTO t (email, phone) VALUES ('a@example.test', '555');
+INSERT INTO t (user_id, email) VALUES (1, 'a@example.test');
+INSERT INTO t (national_id, email) VALUES ('X', 'a@example.test');
+INSERT INTO t (passport_id, ssn_id) VALUES ('P', 'S');
+INSERT INTO users (id, status) VALUES (1, 'active');
+`
+	res, log := runFile(t, dir, "dump.sql", sql)
+	if res.Created != 4 || res.CSV != 2 || res.Skipped != 3 {
+		t.Fatalf("created=%d csv=%d skipped=%d log=%q", res.Created, res.CSV, res.Skipped, log)
+	}
+	if log != "" {
+		t.Fatalf("фильтр должен молчать: %q", log)
+	}
+	tCSV, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(tCSV), `"email","phone"`) {
+		t.Fatalf("t.csv должен начаться с двух PII-колонок: %q", tCSV)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "users.csv")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPIIRejectDoesNotDoubleCountBrokenTail(t *testing.T) {
+	dir := t.TempDir()
+	sql := `
+INSERT INTO t (email) VALUES ('a@example.test'), ('b', 'c');
+INSERT INTO t SELECT 1;
+`
+	res, log := runFile(t, dir, "dump.sql", sql)
+	if res.Created != 0 || res.CSV != 0 || res.Skipped != 2 {
+		t.Fatalf("created=%d csv=%d skipped=%d log=%q", res.Created, res.CSV, res.Skipped, log)
 	}
 }
 
@@ -109,8 +152,8 @@ INSERT INTO settings VALUES (2, 'dark');
 func TestTwoInsertsSameTableMerged(t *testing.T) {
 	dir := t.TempDir()
 	sql := `
-INSERT INTO t (id, name) VALUES (1, 'first');
-INSERT INTO t (id, name) VALUES (2, 'second');
+INSERT INTO t (id, name, email) VALUES (1, 'first', 'a@example.test');
+INSERT INTO t (id, name, email) VALUES (2, 'second', 'b@example.test');
 `
 	res, log := runFile(t, dir, "dump.sql", sql)
 	if res.Created != 2 || res.CSV != 1 || res.Skipped != 0 {
@@ -125,11 +168,11 @@ INSERT INTO t (id, name) VALUES (2, 'second');
 		t.Fatal("два INSERT в t не должны давать t(1).csv")
 	}
 	got := string(raw)
-	want := "\"id\",\"name\"\n\"1\",\"first\"\n\"2\",\"second\"\n"
+	want := "\"id\",\"name\",\"email\"\n\"1\",\"first\",\"a@example.test\"\n\"2\",\"second\",\"b@example.test\"\n"
 	if got != want {
 		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
 	}
-	if strings.Count(got, `"id","name"`) != 1 {
+	if strings.Count(got, `"id","name","email"`) != 1 {
 		t.Fatalf("вторая строка заголовка:\n%s", got)
 	}
 	if strings.Contains(log, "VALUES") {
@@ -140,8 +183,8 @@ INSERT INTO t (id, name) VALUES (2, 'second');
 func TestTwoSQLFilesSameTableMerged(t *testing.T) {
 	dir := t.TempDir()
 	reg := csvout.NewRegistry()
-	res1, _ := runFileReg(t, reg, dir, "a.sql", `INSERT INTO t (email) VALUES (1);`)
-	res2, _ := runFileReg(t, reg, dir, "b.sql", `INSERT INTO t (email) VALUES (2);`)
+	res1, _ := runFileReg(t, reg, dir, "a.sql", `INSERT INTO t (email, phone) VALUES (1, 'a');`)
+	res2, _ := runFileReg(t, reg, dir, "b.sql", `INSERT INTO t (email, phone) VALUES (2, 'b');`)
 	if res1.Created != 1 || res1.CSV != 1 || res2.Created != 1 || res2.CSV != 0 {
 		t.Fatalf("created/csv %d/%d и %d/%d", res1.Created, res1.CSV, res2.Created, res2.CSV)
 	}
@@ -153,7 +196,7 @@ func TestTwoSQLFilesSameTableMerged(t *testing.T) {
 		t.Fatal("два .sql в одной папке не должны плодить t(1).csv")
 	}
 	got := string(raw)
-	want := "\"email\"\n\"1\"\n\"2\"\n"
+	want := "\"email\",\"phone\"\n\"1\",\"a\"\n\"2\",\"b\"\n"
 	if got != want {
 		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
 	}
@@ -170,8 +213,8 @@ func TestSameTableDifferentDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := csvout.NewRegistry()
-	runFileReg(t, reg, alpha, "a.sql", `INSERT INTO t (email) VALUES (1);`)
-	runFileReg(t, reg, beta, "b.sql", `INSERT INTO t (email) VALUES (2);`)
+	runFileReg(t, reg, alpha, "a.sql", `INSERT INTO t (email, phone) VALUES (1, 'a');`)
+	runFileReg(t, reg, beta, "b.sql", `INSERT INTO t (email, phone) VALUES (2, 'b');`)
 	rawA, err := os.ReadFile(filepath.Join(alpha, "t.csv"))
 	if err != nil {
 		t.Fatal(err)
@@ -180,7 +223,7 @@ func TestSameTableDifferentDirs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(rawA) != "\"email\"\n\"1\"\n" || string(rawB) != "\"email\"\n\"2\"\n" {
+	if string(rawA) != "\"email\",\"phone\"\n\"1\",\"a\"\n" || string(rawB) != "\"email\",\"phone\"\n\"2\",\"b\"\n" {
 		t.Fatalf("Alpha=%q Beta=%q", rawA, rawB)
 	}
 }
@@ -192,8 +235,8 @@ func TestPreexistingCSVOverwrittenThenMerged(t *testing.T) {
 		t.Fatal(err)
 	}
 	sql := `
-INSERT INTO t (email) VALUES (1);
-INSERT INTO t (email) VALUES (2);
+INSERT INTO t (email, phone) VALUES (1, 'a');
+INSERT INTO t (email, phone) VALUES (2, 'b');
 `
 	res, _ := runFile(t, dir, "dump.sql", sql)
 	if res.Created != 2 || res.CSV != 1 {
@@ -206,7 +249,7 @@ INSERT INTO t (email) VALUES (2);
 	if _, err := os.Stat(filepath.Join(dir, "t(1).csv")); !os.IsNotExist(err) {
 		t.Fatalf("склейка этого запуска не должна плодить t(1).csv, err=%v", err)
 	}
-	if string(got) != "\"email\"\n\"1\"\n\"2\"\n" {
+	if string(got) != "\"email\",\"phone\"\n\"1\",\"a\"\n\"2\",\"b\"\n" {
 		t.Fatalf("t.csv=%q", got)
 	}
 }
@@ -236,8 +279,8 @@ INSERT INTO users (email) VALUES ('valid@example.test'), ('unclosed);
 func TestSecondInsertTooManyDoesNotSpoilFirst(t *testing.T) {
 	dir := t.TempDir()
 	sql := `
-INSERT INTO t (id, name) VALUES (1, 'ok');
-INSERT INTO t (id, name, extra) VALUES (2, 'x', 'y');
+INSERT INTO t (id, name, email) VALUES (1, 'ok', 'a@example.test');
+INSERT INTO t (id, name, email, extra) VALUES (2, 'x', 'y', 'z');
 `
 	res, log := runFile(t, dir, "dump.sql", sql)
 	if res.Created != 1 || res.CSV != 1 || res.Skipped != 1 {
@@ -247,7 +290,7 @@ INSERT INTO t (id, name, extra) VALUES (2, 'x', 'y');
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) != "\"id\",\"name\"\n\"1\",\"ok\"\n" {
+	if string(raw) != "\"id\",\"name\",\"email\"\n\"1\",\"ok\",\"a@example.test\"\n" {
 		t.Fatalf("первый CSV испорчен: %q", raw)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "t(1).csv")); err == nil {
@@ -259,7 +302,7 @@ func TestSkipDoesNotStopNextInsert(t *testing.T) {
 	dir := t.TempDir()
 	sql := `
 INSERT INTO t SELECT * FROM u;
-INSERT INTO ok (email) VALUES (1);
+INSERT INTO ok (email, phone) VALUES (1, '555');
 INSERT INTO t SET a=1;
 `
 	res, log := runFile(t, dir, "dump.sql", sql)
@@ -292,7 +335,7 @@ func TestOpenMissingFile(t *testing.T) {
 
 func TestPaddedRowWritesWithoutLoggingValues(t *testing.T) {
 	dir := t.TempDir()
-	res, log := runFile(t, dir, "dump.sql", `INSERT INTO t (a, email, c) VALUES (1);`)
+	res, log := runFile(t, dir, "dump.sql", `INSERT INTO t (a, email, phone) VALUES (1);`)
 	if res.Created != 1 {
 		t.Fatalf("created=%d", res.Created)
 	}
@@ -300,7 +343,7 @@ func TestPaddedRowWritesWithoutLoggingValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) != "\"a\",\"email\",\"c\"\n\"1\",\"\",\"\"\n" {
+	if string(raw) != "\"a\",\"email\",\"phone\"\n\"1\",\"\",\"\"\n" {
 		t.Fatalf("CSV=%q", raw)
 	}
 	if strings.Contains(log, "VALUES (1)") {
@@ -322,7 +365,7 @@ func TestFixtureSameTableTwice(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "orders(1).csv")); err == nil {
 		t.Fatal("ожидался один orders.csv")
 	}
-	want := "\"id\",\"name\"\n\"100\",\"first\"\n\"200\",\"INSERT INTO x (id) VALUES (9)\"\n"
+	want := "\"id\",\"name\",\"email\"\n\"100\",\"first\",\"a@example.test\"\n\"200\",\"INSERT INTO x (id) VALUES (9)\",\"b@example.test\"\n"
 	if string(got) != want {
 		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
 	}
@@ -346,8 +389,8 @@ func TestFixtureInterleaveABA(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "A(1).csv")); err == nil {
 		t.Fatal("вклинивание B не должно плодить A(1).csv")
 	}
-	wantA := "\"id\",\"name\"\n\"1\",\"a1\"\n\"2\",\"a2\"\n\"3\",\"a3\"\n"
-	wantB := "\"code\",\"email\"\n\"b1\",\"10\"\n\"b2\",\"20\"\n"
+	wantA := "\"id\",\"name\",\"email\"\n\"1\",\"a1\",\"a1@example.test\"\n\"2\",\"a2\",\"a2@example.test\"\n\"3\",\"a3\",\"557\"\n"
+	wantB := "\"code\",\"email\",\"phone\"\n\"b1\",\"10\",\"555\"\n\"b2\",\"20\",\"556\"\n"
 	if string(gotA) != wantA {
 		t.Fatalf("A.csv:\n got %q\nwant %q", gotA, wantA)
 	}
@@ -366,6 +409,10 @@ func TestPIIFixtures(t *testing.T) {
 		{name: "10_pii.sql", created: 2, files: []string{"archive.csv", "user_profiles.csv"}},
 		{name: "11_no_pii.sql", skipped: 3},
 		{name: "12_mixed_pii.sql", created: 2, skipped: 2, files: []string{"audit_log.csv", "users.csv"}},
+		{name: "13_one_column_rejected.sql", skipped: 2},
+		{name: "14_two_columns_ok.sql", created: 1, files: []string{"t.csv"}},
+		{name: "15_technical_id_ignored.sql", skipped: 2},
+		{name: "16_document_id_counts.sql", created: 2, files: []string{"docs.csv", "ids.csv"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -411,7 +458,7 @@ func TestLegacyFixturesRemainCompatibleWithPIIFilter(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := "\"email\",\"label\"\n\"survived@example.test\",\"survived\"\n"
+		want := "\"email\",\"phone\"\n\"survived@example.test\",\"555\"\n"
 		if string(raw) != want {
 			t.Fatalf("ok.csv:\n got %q\nwant %q", raw, want)
 		}
@@ -427,7 +474,7 @@ func TestLegacyFixturesRemainCompatibleWithPIIFilter(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := "\"id\",\"name\"\n\"1\",\"ok\"\n"
+		want := "\"id\",\"name\",\"email\"\n\"1\",\"ok\",\"a@example.test\"\n"
 		if string(raw) != want {
 			t.Fatalf("t.csv:\n got %q\nwant %q", raw, want)
 		}

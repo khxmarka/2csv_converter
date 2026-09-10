@@ -61,6 +61,7 @@ type session struct {
 	csvNew  int
 	skipped int
 	failed  bool
+	piiSkip bool
 	paths   []string
 }
 
@@ -75,8 +76,10 @@ func (s *session) dropWriter() {
 func (s *session) begin(meta insert.Meta) error {
 	s.dropWriter()
 	s.meta = meta
-	if !pii.Match(meta.Table) && !pii.MatchAny(meta.Columns) {
+	s.piiSkip = false
+	if !pii.Match(meta.Table) && !pii.MatchColumns(meta.Columns) {
 		s.skipped++
+		s.piiSkip = true
 		return nil
 	}
 	w, err := csvout.Create(s.reg, s.dir, meta.Table, meta.Columns)
@@ -110,6 +113,7 @@ func (s *session) row(cells []insert.Cell) error {
 }
 
 func (s *session) end() error {
+	s.piiSkip = false
 	if s.writer == nil {
 		return nil
 	}
@@ -132,5 +136,9 @@ func (s *session) end() error {
 
 func (s *session) skip(_ insert.Skip) {
 	s.dropWriter()
+	if s.piiSkip {
+		s.piiSkip = false
+		return
+	}
 	s.skipped++
 }

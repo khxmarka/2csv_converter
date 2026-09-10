@@ -140,8 +140,8 @@ INSERT INTO users (id, name) VALUES (1, 'Ann');
 INSERT INTO orders (id) VALUES (9);
 `
 	sameTable := `
-INSERT INTO t (email) VALUES (1);
-INSERT INTO t (email) VALUES (2);
+INSERT INTO t (email, phone) VALUES (1, 'a');
+INSERT INTO t (email, phone) VALUES (2, 'b');
 `
 	if err := os.WriteFile(filepath.Join(alpha, "a.sql"), []byte(twoTables), 0o644); err != nil {
 		t.Fatal(err)
@@ -149,7 +149,7 @@ INSERT INTO t (email) VALUES (2);
 	if err := os.WriteFile(filepath.Join(beta, "b.sql"), []byte(sameTable), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, "root.sql"), []byte("INSERT INTO root_table (email) VALUES (1);\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "root.sql"), []byte("INSERT INTO root_table (email, phone) VALUES (1, '555');\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(gamma, "skip.sql"), []byte("INSERT INTO t SELECT 1;\n"), 0o644); err != nil {
@@ -553,7 +553,7 @@ func TestBrokenSQLDoesNotStopNextFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(a, "broken.sql"), []byte("INSERT INTO t (email) VALUES (1, 'нет конца"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(b, "ok.sql"), []byte("INSERT INTO ok (email) VALUES (2);\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(b, "ok.sql"), []byte("INSERT INTO ok (email, phone) VALUES (2, '555');\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -773,7 +773,7 @@ func TestMultiFileTreeFixturesThroughApp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantSame := "\"id\",\"name\"\n\"1\",\"from-a\"\n\"2\",\"from-z\"\n"
+	wantSame := "\"id\",\"name\",\"email\"\n\"1\",\"from-a\",\"a@example.test\"\n\"2\",\"from-z\",\"555\"\n"
 	if string(sameCSV) != wantSame {
 		t.Fatalf("Same/t.csv:\n got %q\nwant %q", sameCSV, wantSame)
 	}
@@ -798,10 +798,10 @@ func TestHeaderFromFirstFileByPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Пишем z.sql раньше a.sql, чтобы порядок создания на диске не совпал с путём.
-	if err := os.WriteFile(filepath.Join(dir, "z.sql"), []byte("INSERT INTO t (x, email) VALUES (2, 'later');\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "z.sql"), []byte("INSERT INTO t (x, email, phone) VALUES (2, 'later', '555');\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte("INSERT INTO t (id, name) VALUES (1, 'first');\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte("INSERT INTO t (id, name, email) VALUES (1, 'first', 'a@example.test');\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -817,7 +817,7 @@ func TestHeaderFromFirstFileByPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "\"id\",\"name\"\n\"1\",\"first\"\n\"2\",\"later\"\n"
+	want := "\"id\",\"name\",\"email\"\n\"1\",\"first\",\"a@example.test\"\n\"2\",\"later\",\"555\"\n"
 	if string(got) != want {
 		t.Fatalf("заголовок должен быть от a.sql, не от того кто добежал:\n got %q\nwant %q\nлог:\n%s", got, want, buf.String())
 	}
@@ -847,7 +847,7 @@ func TestRunExcelTreeConvertedTxt(t *testing.T) {
 	if err := xlsconv.WriteXLS(filepath.Join(beta, "six.xls"), six); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(alpha, "dump.sql"), []byte("INSERT INTO t (email) VALUES (1);\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(alpha, "dump.sql"), []byte("INSERT INTO t (email, phone) VALUES (1, '555');\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -949,6 +949,39 @@ func TestSQLExcelSQLSameTargetNeverMixesStreams(t *testing.T) {
 	}
 }
 
+func TestTechnicalIDsDoNotPassColumnThresholdThroughApp(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sql := `
+INSERT INTO t (user_id, email) VALUES (1, 'skip@example.test');
+INSERT INTO t (national_id, phone) VALUES ('X', '555');
+INSERT INTO users (id, status) VALUES (2, 'ok');
+`
+	if err := os.WriteFile(filepath.Join(dir, "dump.sql"), []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Run(logx.New(io.Discard), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.InsertOK != 2 || res.InsertSkip != 1 || res.CSV != 2 {
+		t.Fatalf("результат: %+v", res)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "\"national_id\",\"phone\"\n\"X\",\"555\"\n" {
+		t.Fatalf("t.csv=%q", raw)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "users.csv")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUnicodePIIFlowsThroughAppToExactCSV(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "Unicode")
@@ -995,7 +1028,7 @@ func TestRunBrokenExcelLogsAndContinues(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(a, "bad.xlsx"), []byte("not excel"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(b, "ok.sql"), []byte("INSERT INTO ok (email) VALUES (1);\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(b, "ok.sql"), []byte("INSERT INTO ok (email, phone) VALUES (1, '555');\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

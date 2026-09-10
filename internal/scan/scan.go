@@ -206,7 +206,7 @@ func (r Result) TopFolders() []string {
 	return out
 }
 
-// InRootCount — сколько .sql лежит прямо в корне.
+// InRootCount — сколько рабочих файлов лежит прямо в корне.
 func (r Result) InRootCount() int {
 	n := 0
 	for _, f := range r.Files {

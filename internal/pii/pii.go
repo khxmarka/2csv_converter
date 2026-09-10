@@ -16,7 +16,12 @@ var stopNames = map[string]struct{}{
 	"settings":    {},
 }
 
-var terms = buildTerms()
+var terms, termSet = buildTerms()
+
+// minColumns — сколько различных зачётных колонок нужно INSERT без PII-имени
+// таблицы. Одного признака мало: таблица с единственным email среди служебных
+// колонок персональных данных не несёт.
+const minColumns = 2
 
 // Match reports whether name contains an approved PII term.
 // Matching is Unicode case-insensitive and intentionally uses substrings,
@@ -34,10 +39,32 @@ func Match(name string) bool {
 	return false
 }
 
-// MatchAny reports whether at least one name matches the PII dictionary.
-func MatchAny(names []string) bool {
+// MatchColumns reports whether the column list carries personal data on its
+// own: at least minColumns distinct names are credit-worthy. A name counts
+// if it is a document identifier, or if it matches the dictionary and is not
+// a technical identifier. Names are compared case-insensitively as written,
+// so email and EMAIL are one column while email and e_mail are two.
+func MatchColumns(names []string) bool {
+	seen := make(map[string]struct{}, len(names))
+	matched := 0
 	for _, name := range names {
-		if Match(name) {
+		trimmed := strings.TrimSpace(name)
+		key := strings.ToLower(trimmed)
+		if key == "" {
+			continue
+		}
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		seen[key] = struct{}{}
+		if hasDocumentIdentifier(trimmed) {
+			matched++
+		} else if Match(trimmed) && !isTechnicalIdentifier(trimmed) {
+			matched++
+		} else {
+			continue
+		}
+		if matched >= minColumns {
 			return true
 		}
 	}
@@ -53,7 +80,152 @@ func compact(s string) string {
 	}, s)
 }
 
-func buildTerms() []string {
+// idSuffixes — окончания ссылочных колонок. Плюрал ids сюда не входит.
+var idSuffixes = []string{"identifier", "uuid", "guid", "id"}
+
+// isTechnicalIdentifier reports whether name is a reference column such as
+// user_id, customerGuid or user_id_2 rather than personal data itself.
+// A separated or camelCase suffix always counts; a compact suffix counts only
+// when the remainder is a dictionary term, so userid is a reference while
+// emailvalid is not.
+func isTechnicalIdentifier(name string) bool {
+	parts := separatorParts(name)
+	for len(parts) > 1 && isDigits(parts[len(parts)-1]) {
+		parts = parts[:len(parts)-1]
+	}
+	if len(parts) == 0 {
+		return false
+	}
+	last := parts[len(parts)-1]
+	if len(parts) > 1 && isIDKeyword(last) {
+		return true
+	}
+	return hasCamelIDSuffix(last) || hasCompactIDSuffix(last)
+}
+
+func isIDKeyword(part string) bool {
+	trimmed := trimTrailingDigits(strings.ToLower(part))
+	for _, suffix := range idSuffixes {
+		if trimmed == suffix {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCamelIDSuffix(part string) bool {
+	part = trimTrailingDigits(part)
+	runes := []rune(part)
+	lower := strings.ToLower(part)
+	for _, suffix := range idSuffixes {
+		suffixRunes := []rune(suffix)
+		if len(runes) <= len(suffixRunes) || !strings.HasSuffix(lower, suffix) {
+			continue
+		}
+		if unicode.IsUpper(runes[len(runes)-len(suffixRunes)]) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCompactIDSuffix(part string) bool {
+	lower := trimTrailingDigits(strings.ToLower(part))
+	for _, suffix := range idSuffixes {
+		if !strings.HasSuffix(lower, suffix) {
+			continue
+		}
+		rest := lower[:len(lower)-len(suffix)]
+		if _, known := termSet[rest]; known {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDocumentIdentifier reports whether name refers to a государственный or
+// document identifier, which stays personal data even with an id suffix.
+// Long terms are matched as substrings; short acronyms only as whole segments
+// or right before the identifier suffix, so company_id and settings_id stay
+// technical despite containing pan and tin.
+func hasDocumentIdentifier(name string) bool {
+	packed := compact(strings.ToLower(name))
+	for _, term := range documentIdentifiers {
+		if strings.Contains(packed, term) {
+			return true
+		}
+	}
+	for _, token := range identifierTokens(name) {
+		if _, ok := documentAcronyms[token]; ok {
+			return true
+		}
+	}
+	stem := trimTrailingDigits(packed)
+	for _, suffix := range idSuffixes {
+		if !strings.HasSuffix(stem, suffix) {
+			continue
+		}
+		rest := stem[:len(stem)-len(suffix)]
+		for acronym := range documentAcronyms {
+			if strings.HasSuffix(rest, acronym) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// identifierTokens splits name on separators and camelCase boundaries and
+// returns the lower-case parts without their trailing digits.
+func identifierTokens(name string) []string {
+	var out []string
+	for _, part := range separatorParts(name) {
+		for _, word := range camelParts(part) {
+			word = trimTrailingDigits(strings.ToLower(word))
+			if word != "" {
+				out = append(out, word)
+			}
+		}
+	}
+	return out
+}
+
+func separatorParts(name string) []string {
+	return strings.FieldsFunc(name, func(r rune) bool {
+		return r == '_' || r == '-' || r == '.' || unicode.IsSpace(r)
+	})
+}
+
+func camelParts(part string) []string {
+	runes := []rune(part)
+	var out []string
+	start := 0
+	for i := 1; i < len(runes); i++ {
+		if !unicode.IsUpper(runes[i]) {
+			continue
+		}
+		prevLower := !unicode.IsUpper(runes[i-1])
+		nextLower := i+1 < len(runes) && !unicode.IsUpper(runes[i+1])
+		if prevLower || nextLower {
+			out = append(out, string(runes[start:i]))
+			start = i
+		}
+	}
+	return append(out, string(runes[start:]))
+}
+
+func trimTrailingDigits(s string) string {
+	return strings.TrimRightFunc(s, unicode.IsDigit)
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	return trimTrailingDigits(s) == ""
+}
+
+func buildTerms() ([]string, map[string]struct{}) {
 	set := make(map[string]struct{})
 	addWords := func(raw string) {
 		for _, term := range strings.Fields(raw) {
@@ -87,13 +259,34 @@ func buildTerms() []string {
 		}
 	}
 
+	delete(set, "")
 	out := make([]string, 0, len(set))
 	for term := range set {
-		if term != "" {
-			out = append(out, term)
-		}
+		out = append(out, term)
 	}
-	return out
+	return out, set
+}
+
+// documentIdentifiers — документные и государственные идентификаторы,
+// достаточно длинные, чтобы искать их подстрокой в слитной форме имени.
+var documentIdentifiers = []string{
+	"passport", "pasaporte", "passaporte", "passeport", "passaporto",
+	"reisepass", "paspor", "pasport", "паспорт", "护照", "護照", "huzhao",
+	"nationalid", "natid", "idcard", "identitycard",
+	"driverlicense", "driverlicence", "drivinglicense", "drivinglicence",
+	"dlnumber", "licenceno",
+	"aadhaar", "aadhar", "pesel", "cnic", "curp", "cedula", "cédula",
+	"снилс", "огрн", "рнокпп", "rnokpp",
+}
+
+// documentAcronyms — короткие аббревиатуры документов. Их ищут только целым
+// сегментом имени или прямо перед идентификаторным окончанием, иначе
+// company_id и settings_id перестали бы считаться техническими.
+var documentAcronyms = map[string]struct{}{
+	"ssn": {}, "tin": {}, "itin": {}, "ein": {}, "nino": {}, "nhs": {},
+	"pan": {}, "nik": {}, "ktp": {}, "npwp": {}, "sim": {}, "visa": {},
+	"dni": {}, "nie": {}, "cif": {}, "rfc": {}, "iin": {}, "inn": {},
+	"инн": {}, "іпн": {}, "ипн": {},
 }
 
 var compoundParts = [][]string{

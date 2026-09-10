@@ -2,5 +2,5 @@
 INSERT INTO t SELECT id FROM users;
 INSERT INTO t SET name = 'nope';
 
--- Этот должен пройти → ok.csv
-INSERT INTO ok (email, label) VALUES ('survived@example.test', 'survived');
+-- Этот должен пройти → ok.csv (две PII-колонки)
+INSERT INTO ok (email, phone) VALUES ('survived@example.test', '555');
