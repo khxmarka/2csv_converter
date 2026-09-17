@@ -1,11 +1,13 @@
 package app
 
 import (
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"sql2csv/internal/convert"
 	"sql2csv/internal/converted"
@@ -60,6 +62,19 @@ type accumulator struct {
 	blocked    map[string]struct{}
 	log        *logx.Logger
 	root       string
+	hangStart  time.Time
+	byTop      map[string]*topAcc
+}
+
+type topAcc struct {
+	csv         int
+	created     int
+	openErr     int
+	writeErr    int
+	failed      int
+	skipTooMany int
+	piiSkip     int
+	unitFail    int
 }
 
 func newAccumulator(log *logx.Logger, root string, files []scan.SQLFile, blocked map[string]struct{}) *accumulator {
@@ -74,57 +89,107 @@ func newAccumulator(log *logx.Logger, root string, files []scan.SQLFile, blocked
 		blocked: blocked,
 		log:     log,
 		root:    root,
+		byTop:   make(map[string]*topAcc),
 	}
+}
+
+func (a *accumulator) ensureTop(key string) *topAcc {
+	st := a.byTop[key]
+	if st == nil {
+		st = &topAcc{}
+		a.byTop[key] = st
+	}
+	return st
+}
+
+func (st *topAcc) failReason() string {
+	var parts []string
+	if st.piiSkip > 0 {
+		parts = append(parts, "всё отсеял фильтр")
+	}
+	if st.openErr > 0 || st.failed > 0 || st.unitFail > 0 {
+		parts = append(parts, "не разобрать")
+	}
+	if st.writeErr > 0 {
+		parts = append(parts, "не записать")
+	}
+	if len(parts) == 0 {
+		return "нечего конвертировать"
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (a *accumulator) start(file scan.SQLFile) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	key := folderKey(file)
-	name := folderName(file)
+	a.setActiveLocked(folderKey(file), folderName(file))
+}
+
+func (a *accumulator) setActiveLocked(key, name string) {
 	if _, ok := a.active[key]; ok {
 		return
 	}
 	a.active[key] = name
+	a.hangStart = time.Now()
 	a.refreshHang()
 }
 
 func (a *accumulator) add(file scan.SQLFile, out fileOutcome) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	key := folderKey(file)
+	name := folderName(file)
+	st := a.ensureTop(key)
 	if out.openErr != nil {
 		a.filesFail++
+		st.openErr++
 		a.log.Errorf("%s: не удалось открыть: %v", file.Path, out.openErr)
-	} else if !out.skipTooMany {
+	} else if out.skipTooMany {
+		st.skipTooMany++
+	} else {
 		if out.failed {
 			a.filesFail++
+			st.failed++
 		}
 		if out.writeErr != nil {
 			a.filesFail++
+			st.writeErr++
 			a.log.Errorf("%s: не удалось создать CSV: %v", file.Path, out.writeErr)
 		}
 		a.insertOK += out.created
 		a.insertSkip += out.skipped
 		a.csv += out.csv
+		st.csv += out.csv
+		st.created += out.created
+		st.piiSkip += out.piiSkip
+		st.unitFail += out.unitFail
 	}
-	key := folderKey(file)
-	name := folderName(file)
 	a.left[key]--
 	if a.left[key] == 0 {
-		_, cannotComplete := a.blocked[file.TopFolder]
-		if file.TopFolder != "" && !cannotComplete {
-			if err := converted.Append(a.root, file.TopFolder); err != nil {
+		a.finishTopLocked(key, name, file.TopFolder)
+	}
+}
+
+func (a *accumulator) finishTopLocked(key, name, topFolder string) {
+	_, cannotComplete := a.blocked[topFolder]
+	st := a.ensureTop(key)
+	delete(a.active, key)
+	a.refreshHang()
+	if cannotComplete {
+		return
+	}
+	if st.csv > 0 {
+		if topFolder != "" {
+			if err := converted.Append(a.root, topFolder); err != nil {
 				a.log.Errorf("не удалось дописать %s: %v", converted.Path(a.root), err)
 			} else {
-				a.tops[file.TopFolder] = struct{}{}
+				a.tops[topFolder] = struct{}{}
 			}
 		}
-		delete(a.active, key)
-		a.refreshHang()
-		if !cannotComplete {
-			a.log.Linef("папка полностью завершена: %s", name)
-		}
+		a.log.Linef("папка обработана: %s", name)
+		return
 	}
+	a.log.Errorf("папка %s: не создано ни одного CSV: %s", name, st.failReason())
 }
 
 func (a *accumulator) refreshHang() {
@@ -137,7 +202,42 @@ func (a *accumulator) refreshHang() {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	a.log.Hang("папка в обработке: " + strings.Join(names, ", "))
+	sec := int(time.Since(a.hangStart) / time.Second)
+	if sec < 0 {
+		sec = 0
+	}
+	a.log.Hang(fmt.Sprintf("папка в обработке: %s (%d с)", names[0], sec))
+}
+
+func (a *accumulator) tickHang() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.active) == 0 {
+		return
+	}
+	a.refreshHang()
+}
+
+func (a *accumulator) startHangTicker() func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				a.tickHang()
+			}
+		}
+	}()
+	return func() {
+		close(stop)
+		<-done
+	}
 }
 
 func (a *accumulator) snapshot() (insertOK, insertSkip, csv, filesFail int, tops map[string]struct{}) {
@@ -160,19 +260,10 @@ func (a *accumulator) completeEmptyTops(topDirs []string) {
 			continue
 		}
 
-		a.active[name] = name
-		a.refreshHang()
-		err := converted.Append(a.root, name)
-		if err != nil {
-			a.log.Errorf("не удалось дописать %s: %v", converted.Path(a.root), err)
-		} else {
-			a.tops[name] = struct{}{}
-		}
+		a.setActiveLocked(name, name)
 		delete(a.active, name)
 		a.refreshHang()
-		if err == nil {
-			a.log.Linef("папка полностью завершена: %s", name)
-		}
+		a.log.Linef("папка %s: нет файлов", name)
 		a.mu.Unlock()
 	}
 }
@@ -191,6 +282,13 @@ func processFiles(log *logx.Logger, root string, files []scan.SQLFile, blocked m
 }
 
 func processTopFiles(acc *accumulator, log *logx.Logger, reg *csvout.Registry, files []scan.SQLFile) {
+	if len(files) == 0 {
+		return
+	}
+	acc.start(files[0])
+	stopTick := acc.startHangTicker()
+	defer stopTick()
+
 	groups := groupByDir(files)
 	for _, group := range groups {
 		if len(group) == 0 {
@@ -278,6 +376,8 @@ type fileOutcome struct {
 	csv         int
 	skipTooMany bool
 	failed      bool
+	piiSkip     int
+	unitFail    int
 }
 
 func convertOne(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (out fileOutcome) {
@@ -298,10 +398,12 @@ func convertOne(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (out 
 	}
 	fr := convert.File(log, reg, file)
 	return fileOutcome{
-		openErr: fr.OpenErr,
-		created: fr.Created,
-		skipped: fr.Skipped,
-		csv:     fr.CSV,
-		failed:  fr.Failed,
+		openErr:  fr.OpenErr,
+		created:  fr.Created,
+		skipped:  fr.Skipped,
+		csv:      fr.CSV,
+		failed:   fr.Failed,
+		piiSkip:  fr.PIISkip,
+		unitFail: fr.UnitFail,
 	}
 }

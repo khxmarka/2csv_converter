@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"sql2csv/internal/converted"
 	"sql2csv/internal/logx"
@@ -183,19 +184,25 @@ INSERT INTO t (email, phone) VALUES (2, 'b');
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"OLD", "Alpha", "Beta", "Gamma"} {
+	for _, name := range []string{"OLD", "Alpha", "Beta"} {
 		if _, ok := done[name]; !ok {
 			t.Fatalf("в converted.txt нет %s: %q", name, raw)
 		}
 	}
-	if len(done) != 4 {
+	if _, ok := done["Gamma"]; ok {
+		t.Fatalf("папка без CSV не должна быть в converted.txt: %q", raw)
+	}
+	if len(done) != 3 {
 		t.Fatalf("converted.txt содержит лишние имена: %q", raw)
 	}
-	if strings.Join(res.SuccessTops, ",") != "Alpha,Beta,Gamma" {
+	if strings.Join(res.SuccessTops, ",") != "Alpha,Beta" {
 		t.Fatalf("верхние папки: %v", res.SuccessTops)
 	}
 	if res.CSV != 3 {
 		t.Fatalf("CSV=%d, ожидалось 3 файла (orders отфильтрован, Beta.t склеен)", res.CSV)
+	}
+	if !strings.Contains(buf.String(), "error: папка Gamma: не создано ни одного CSV: нечего конвертировать") {
+		t.Fatalf("Gamma без CSV должна дать причину:\n%s", buf.String())
 	}
 	if res.InsertOK != 4 {
 		t.Fatalf("INSERT=%d", res.InsertOK)
@@ -374,7 +381,7 @@ func TestUnfinishedFolderOverwritesStaleCSV(t *testing.T) {
 	}
 }
 
-func TestFolderWithNoCSVIsStillCompleted(t *testing.T) {
+func TestFolderWithNoCSVIsNotInConverted(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "Filtered")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -383,29 +390,33 @@ func TestFolderWithNoCSVIsStillCompleted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "dump.sql"), []byte("INSERT INTO settings VALUES (1, 'dark');\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res, err := Run(logx.New(io.Discard), root)
+	var buf bytes.Buffer
+	res, err := Run(logx.New(&buf), root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.CSV != 0 || res.InsertOK != 0 || res.InsertSkip != 1 {
 		t.Fatalf("результат: %+v", res)
 	}
-	if strings.Join(res.SuccessTops, ",") != "Filtered" {
-		t.Fatalf("завершённые папки: %v", res.SuccessTops)
+	if len(res.SuccessTops) != 0 {
+		t.Fatalf("папка без CSV не завершена: %v", res.SuccessTops)
 	}
-	raw, err := os.ReadFile(converted.Path(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(raw) != "Filtered\n" {
-		t.Fatalf("converted.txt=%q", raw)
+	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+		t.Fatalf("converted.txt не должен создаваться, err=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "settings.csv")); !os.IsNotExist(err) {
 		t.Fatalf("settings.csv не должен создаваться, err=%v", err)
 	}
+	log := buf.String()
+	if !strings.Contains(log, "error: папка Filtered: не создано ни одного CSV: всё отсеял фильтр") {
+		t.Fatalf("нужна причина 0 CSV:\n%s", log)
+	}
+	if strings.Contains(log, "dark") || strings.Contains(log, "VALUES") {
+		t.Fatal("тело VALUES не должно попадать в лог")
+	}
 }
 
-func TestEmptyAndUnsupportedOnlyFoldersAreCompleted(t *testing.T) {
+func TestEmptyAndUnsupportedOnlyFoldersAreNotCompleted(t *testing.T) {
 	root := t.TempDir()
 	empty := filepath.Join(root, "Empty")
 	unsupported := filepath.Join(root, "Unsupported")
@@ -419,23 +430,22 @@ func TestEmptyAndUnsupportedOnlyFoldersAreCompleted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := Run(logx.New(io.Discard), root)
+	var buf bytes.Buffer
+	first, err := Run(logx.New(&buf), root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(first.SuccessTops, ",") != "Empty,Unsupported" {
-		t.Fatalf("завершённые папки: %v", first.SuccessTops)
+	if len(first.SuccessTops) != 0 {
+		t.Fatalf("пустые папки не завершены: %v", first.SuccessTops)
 	}
-	done, err := converted.Read(root)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+		t.Fatalf("converted.txt не должен создаваться, err=%v", err)
 	}
-	if len(done) != 2 {
-		t.Fatalf("converted.txt: %v", done)
+	log := buf.String()
+	if !strings.Contains(log, "папка Empty: нет файлов") || !strings.Contains(log, "папка Unsupported: нет файлов") {
+		t.Fatalf("нужна строка «нет файлов»:\n%s", log)
 	}
 
-	// После фиксации папка считается завершённой целиком; новые файлы требуют
-	// ручного сброса converted.txt и не должны открываться автоматически.
 	if err := os.WriteFile(filepath.Join(empty, "later.sql"), []byte(
 		"INSERT INTO users (email) VALUES ('later@example.test');\n",
 	), 0o644); err != nil {
@@ -445,11 +455,11 @@ func TestEmptyAndUnsupportedOnlyFoldersAreCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.CSV != 0 {
-		t.Fatalf("готовая пустая папка была обработана повторно: %+v", second)
+	if second.CSV != 1 {
+		t.Fatalf("пустая папка без converted.txt должна обработаться: %+v", second)
 	}
-	if _, err := os.Stat(filepath.Join(empty, "users.csv")); !os.IsNotExist(err) {
-		t.Fatalf("users.csv не должен создаваться, err=%v", err)
+	if _, err := os.Stat(filepath.Join(empty, "users.csv")); err != nil {
+		t.Fatalf("users.csv должен появиться: %v", err)
 	}
 }
 
@@ -571,18 +581,63 @@ func TestBrokenSQLDoesNotStopNextFile(t *testing.T) {
 	if res.InsertOK != 1 || res.InsertSkip < 1 {
 		t.Fatalf("ok=%d skip=%d", res.InsertOK, res.InsertSkip)
 	}
-	if strings.Join(res.SuccessTops, ",") != "A,B" {
+	if strings.Join(res.SuccessTops, ",") != "B" {
 		t.Fatalf("tops=%v", res.SuccessTops)
 	}
 	log := buf.String()
 	if strings.Contains(log, "нет конца") {
 		t.Fatal("в лог нельзя писать содержимое VALUES")
 	}
-	if strings.Count(log, "папка полностью завершена: A") != 1 || strings.Count(log, "папка полностью завершена: B") != 1 {
-		t.Fatalf("ожидалось по одному завершению A и B:\n%s", log)
+	if strings.Count(log, "папка обработана: B") != 1 {
+		t.Fatalf("ожидалось завершение B:\n%s", log)
+	}
+	if strings.Contains(log, "папка обработана: A") {
+		t.Fatalf("A без CSV не обработана:\n%s", log)
+	}
+	if !strings.Contains(log, "error: папка A: не создано ни одного CSV:") {
+		t.Fatalf("нужна причина 0 CSV у A:\n%s", log)
 	}
 	if strings.Contains(log, "воркеров:") || strings.Contains(log, "прогресс:") || strings.Contains(log, "сводка:") {
 		t.Fatalf("служебный шум в логе:\n%s", log)
+	}
+}
+
+func TestSecondInsertTooManyKeepsCSVAndLogsReason(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	copySQLFixture(t, "06_second_too_many.sql", filepath.Join(dir, "dump.sql"))
+
+	var buf bytes.Buffer
+	res, err := Run(logx.New(&buf), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\"id\",\"name\",\"email\"\n\"1\",\"ok\",\"a@example.test\"\n"
+	if string(raw) != want {
+		t.Fatalf("CSV первого INSERT испорчен: %q", raw)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "t(1).csv")); !os.IsNotExist(err) {
+		t.Fatalf("t(1).csv не должен создаваться, err=%v", err)
+	}
+	if strings.Join(res.SuccessTops, ",") != "Alpha" {
+		t.Fatalf("папка с CSV должна быть в списке: %v", res.SuccessTops)
+	}
+	log := buf.String()
+	if !strings.Contains(log, "таблица t") || !strings.Contains(log, "значений больше, чем колонок") {
+		t.Fatalf("нужны таблица и причина:\n%s", log)
+	}
+	if strings.Contains(log, "VALUES") || strings.Contains(log, "'x'") {
+		t.Fatal("тело VALUES не должно попадать в лог")
+	}
+	if strings.Count(log, "папка обработана: Alpha") != 1 {
+		t.Fatalf("папка с CSV обработана:\n%s", log)
 	}
 }
 
@@ -614,7 +669,7 @@ func TestBlockedScanPreventsFolderCompletion(t *testing.T) {
 	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
 		t.Fatalf("заблокированную папку нельзя записывать в converted.txt, err=%v", err)
 	}
-	if strings.Contains(buf.String(), "папка полностью завершена: Alpha") {
+	if strings.Contains(buf.String(), "папка обработана: Alpha") {
 		t.Fatalf("нельзя объявлять папку полностью завершённой:\n%s", buf.String())
 	}
 	_, _, _, _, tops := acc.snapshot()
@@ -633,8 +688,8 @@ func TestAccumulatorCountsCriticalConversionFailure(t *testing.T) {
 	if skipped != 1 || filesFail != 1 {
 		t.Fatalf("skipped=%d filesFail=%d", skipped, filesFail)
 	}
-	if _, ok := tops["Alpha"]; !ok {
-		t.Fatalf("обработанная с ошибкой папка должна завершиться: %v", tops)
+	if _, ok := tops["Alpha"]; ok {
+		t.Fatalf("папка без CSV не должна попадать в converted.txt: %v", tops)
 	}
 }
 
@@ -644,7 +699,7 @@ func TestFolderStatusOncePerTopFolder(t *testing.T) {
 	if err := os.MkdirAll(alpha, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	sql := "INSERT INTO t (id) VALUES (1);\n"
+	sql := "INSERT INTO t (email, phone) VALUES ('a@example.test', '555');\n"
 	if err := os.WriteFile(filepath.Join(alpha, "a.sql"), []byte(sql), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -657,10 +712,10 @@ func TestFolderStatusOncePerTopFolder(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := buf.String()
-	if strings.Count(log, "папка в обработке: Alpha") != 1 {
+	if strings.Count(log, "папка в обработке: Alpha (0 с)") != 1 {
 		t.Fatalf("статус должен висеть один раз:\n%s", log)
 	}
-	if strings.Count(log, "папка полностью завершена: Alpha") != 1 {
+	if strings.Count(log, "папка обработана: Alpha") != 1 {
 		t.Fatalf("завершение один раз:\n%s", log)
 	}
 	if strings.Contains(log, "записан") || strings.Contains(log, "дописаны") || strings.Contains(log, "INSERT успешно") {
@@ -688,13 +743,57 @@ func TestFolderStatusesNeverCombineDifferentTopFolders(t *testing.T) {
 	}
 	log := buf.String()
 	for _, name := range []string{"Alpha", "Beta"} {
-		if strings.Count(log, "папка в обработке: "+name) != 1 {
+		if strings.Count(log, "папка в обработке: "+name+" (0 с)") != 1 {
 			t.Fatalf("статус %s должен появиться один раз:\n%s", name, log)
 		}
 	}
 	if strings.Contains(log, "Alpha, Beta") || strings.Contains(log, "Beta, Alpha") {
 		t.Fatalf("статусы разных верхних папок нельзя объединять:\n%s", log)
 	}
+}
+
+func TestHangLineHasNameAndChangingSeconds(t *testing.T) {
+	var buf bytes.Buffer
+	log := logx.New(&buf)
+	file := scan.SQLFile{Path: "a.sql", TopFolder: "Alpha"}
+	acc := newAccumulator(log, t.TempDir(), []scan.SQLFile{file}, nil)
+	acc.start(file)
+	got := buf.String()
+	if !strings.Contains(got, "папка в обработке: Alpha (0 с)") {
+		t.Fatalf("старт: %q", got)
+	}
+
+	acc.mu.Lock()
+	acc.hangStart = time.Now().Add(-2 * time.Second)
+	acc.mu.Unlock()
+	acc.tickHang()
+	got = buf.String()
+	if !strings.Contains(got, "папка в обработке: Alpha (2 с)") {
+		t.Fatalf("тик: %q", got)
+	}
+
+	acc.mu.Lock()
+	delete(acc.active, "Alpha")
+	acc.refreshHang()
+	acc.mu.Unlock()
+	log.Linef("after")
+	got = buf.String()
+	tail := got[strings.LastIndex(got, "after"):]
+	if strings.Contains(tail, "папка в обработке") {
+		t.Fatalf("Hang(\"\") должен снять строку: %q", got)
+	}
+}
+
+func TestHangTickerStopsWhenTopFolderEnds(t *testing.T) {
+	file := scan.SQLFile{Path: "a.sql", TopFolder: "Alpha"}
+	acc := newAccumulator(logx.New(io.Discard), t.TempDir(), []scan.SQLFile{file}, nil)
+	acc.start(file)
+	stop := acc.startHangTicker()
+	stop()
+	acc.mu.Lock()
+	delete(acc.active, "Alpha")
+	acc.refreshHang()
+	acc.mu.Unlock()
 }
 
 func TestGroupByDirSerializesSameFolder(t *testing.T) {
@@ -885,25 +984,29 @@ func TestRunExcelTreeConvertedTxt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(done) != 2 {
-		t.Fatalf("converted.txt=%q, ожидались Alpha и Beta", raw)
+	if len(done) != 1 {
+		t.Fatalf("converted.txt=%q, ожидалась только Alpha", raw)
 	}
-	for _, name := range []string{"Alpha", "Beta"} {
-		if _, ok := done[name]; !ok {
-			t.Fatalf("converted.txt=%q, нет %s", raw, name)
-		}
+	if _, ok := done["Alpha"]; !ok {
+		t.Fatalf("converted.txt=%q, нет Alpha", raw)
 	}
-	if strings.Join(res.SuccessTops, ",") != "Alpha,Beta" {
+	if _, ok := done["Beta"]; ok {
+		t.Fatalf("Beta без CSV не должна быть в converted.txt: %q", raw)
+	}
+	if strings.Join(res.SuccessTops, ",") != "Alpha" {
 		t.Fatalf("tops=%v", res.SuccessTops)
 	}
-	if strings.Contains(log, "six.xls") || strings.Contains(strings.ToLower(log), "лист") {
-		t.Fatalf("пропуск >5 листов не логировать:\n%s", log)
+	if strings.Contains(log, "six.xls") {
+		t.Fatalf("пропуск >5 листов не логировать по файлу:\n%s", log)
 	}
-	if strings.Count(log, "папка полностью завершена: Alpha") != 1 || strings.Count(log, "папка полностью завершена: Beta") != 1 {
-		t.Fatalf("завершение папок:\n%s", log)
+	if strings.Count(log, "папка обработана: Alpha") != 1 {
+		t.Fatalf("завершение Alpha:\n%s", log)
 	}
-	if strings.Contains(log, "error:") {
-		t.Fatalf("критических ошибок не ожидалось:\n%s", log)
+	if strings.Contains(log, "папка обработана: Beta") {
+		t.Fatalf("Beta без CSV не обработана:\n%s", log)
+	}
+	if !strings.Contains(log, "error: папка Beta: не создано ни одного CSV: нечего конвертировать") {
+		t.Fatalf("нужна причина 0 CSV у Beta:\n%s", log)
 	}
 }
 
@@ -1040,11 +1143,74 @@ func TestRunBrokenExcelLogsAndContinues(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(b, "ok.csv")); err != nil {
 		t.Fatalf("SQL после битого Excel: %v", err)
 	}
-	if strings.Join(res.SuccessTops, ",") != "A,B" {
+	if strings.Join(res.SuccessTops, ",") != "B" {
 		t.Fatalf("tops=%v", res.SuccessTops)
 	}
 	log := buf.String()
 	if !strings.Contains(log, "не удалось открыть") {
 		t.Fatalf("ожидалась критическая ошибка открытия xlsx:\n%s", log)
+	}
+	if !strings.Contains(log, "error: папка A: не создано ни одного CSV:") {
+		t.Fatalf("нужна причина 0 CSV у A:\n%s", log)
+	}
+}
+
+func TestTabularSQLWithInsertAndExcelSameRun(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	copySQLFixture(t, "17_table_csv.sql", filepath.Join(dir, "GameSalad.sql"))
+	if err := os.WriteFile(filepath.Join(dir, "dump.sql"), []byte(
+		"INSERT INTO t (email, phone) VALUES (1, '555');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := xlsconv.WriteXLSX(filepath.Join(dir, "a.xlsx"), []xlsconv.Sheet{{
+		Name: "One",
+		Rows: [][]string{{"h1"}, {"v1"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, "GameSalad.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	res, err := Run(logx.New(&buf), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := buf.String()
+	for _, p := range []string{
+		filepath.Join(dir, "GameSalad.csv"),
+		filepath.Join(dir, "t.csv"),
+		filepath.Join(dir, "a_One.csv"),
+	} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("нет %s: %v\nлог:\n%s", p, err, log)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "GameSalad.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "\"email\",\"phone\"\n\"a@example.test\",\"555\"\n\"b@example.test\",\"777\"\n" {
+		t.Fatalf("табличный CSV: %q", got)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "GameSalad.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("исходный табличный .sql изменён")
+	}
+	if strings.Count(log, "не INSERT, а таблица") != 1 {
+		t.Fatalf("warn табличного .sql:\n%s", log)
+	}
+	if res.CSV != 3 || strings.Join(res.SuccessTops, ",") != "Alpha" {
+		t.Fatalf("результат: %+v", res)
 	}
 }

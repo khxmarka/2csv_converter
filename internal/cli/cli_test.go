@@ -24,7 +24,10 @@ func TestRunHelp(t *testing.T) {
 	if !strings.Contains(stdout.String(), "2csv") {
 		t.Fatalf("справка должна печататься в stdout, получено: %q", stdout.String())
 	}
-	for _, want := range []string{"PII", "двух колонках", "converted.txt", "не обходятся", "варианты (n) не создаются"} {
+	for _, want := range []string{
+		"PII", "двух колонках", "converted.txt", "не обходятся", "варианты (n) не создаются",
+		"табличный дамп", "{stem}.csv", "папка в обработке", "хотя бы один CSV",
+	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("в справке нет %q: %q", want, stdout.String())
 		}

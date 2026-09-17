@@ -17,6 +17,27 @@ func TestHangDoesNotReprint(t *testing.T) {
 	}
 }
 
+func TestHangUpdatesWhenSecondsChange(t *testing.T) {
+	var buf bytes.Buffer
+	log := New(&buf)
+	log.Hang("папка в обработке: Alpha (0 с)")
+	log.Hang("папка в обработке: Alpha (1 с)")
+	got := buf.String()
+	if !strings.Contains(got, "папка в обработке: Alpha (0 с)") {
+		t.Fatalf("нет 0 с: %q", got)
+	}
+	if !strings.Contains(got, "папка в обработке: Alpha (1 с)") {
+		t.Fatalf("нет 1 с: %q", got)
+	}
+	log.Hang("")
+	log.Linef("done")
+	got = buf.String()
+	tail := got[strings.LastIndex(got, "done"):]
+	if strings.Contains(tail, "папка в обработке") {
+		t.Fatalf("Hang(\"\") должен снять строку: %q", got)
+	}
+}
+
 func TestHangThenLineKeepsOneStatus(t *testing.T) {
 	var buf bytes.Buffer
 	log := New(&buf)
