@@ -296,6 +296,12 @@ INSERT INTO t (id, name, email, extra) VALUES (2, 'x', 'y', 'z');
 	if _, err := os.Stat(filepath.Join(dir, "t(1).csv")); err == nil {
 		t.Fatal("пропущенный INSERT не должен открывать новый файл")
 	}
+	if !strings.Contains(log, "таблица t") || !strings.Contains(log, "значений больше, чем колонок") {
+		t.Fatalf("нужна причина провала INSERT:\n%s", log)
+	}
+	if strings.Contains(log, "VALUES") || strings.Contains(log, "'x'") {
+		t.Fatal("тело VALUES не должно попадать в лог")
+	}
 }
 
 func TestSkipDoesNotStopNextInsert(t *testing.T) {
@@ -466,7 +472,7 @@ func TestLegacyFixturesRemainCompatibleWithPIIFilter(t *testing.T) {
 
 	t.Run("second row wider than established header", func(t *testing.T) {
 		dir := t.TempDir()
-		res, _ := runFile(t, dir, "06.sql", testfilesSQL(t, "06_second_too_many.sql"))
+		res, log := runFile(t, dir, "06.sql", testfilesSQL(t, "06_second_too_many.sql"))
 		if res.Created != 1 || res.CSV != 1 || res.Skipped != 1 {
 			t.Fatalf("результат: %+v", res)
 		}
@@ -477,6 +483,9 @@ func TestLegacyFixturesRemainCompatibleWithPIIFilter(t *testing.T) {
 		want := "\"id\",\"name\",\"email\"\n\"1\",\"ok\",\"a@example.test\"\n"
 		if string(raw) != want {
 			t.Fatalf("t.csv:\n got %q\nwant %q", raw, want)
+		}
+		if !strings.Contains(log, "таблица t") || !strings.Contains(log, "значений больше, чем колонок") {
+			t.Fatalf("нужна причина провала INSERT:\n%s", log)
 		}
 	})
 }
@@ -544,5 +553,160 @@ func TestLargeInsertThroughFilePipeline(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), ".2csv-") {
 			t.Fatalf("после Commit остался temp: %s", entry.Name())
 		}
+	}
+}
+
+func TestTabularCSVSQLWritesOurFormatAndKeepsSource(t *testing.T) {
+	raw := testfilesSQL(t, "17_table_csv.sql")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "GameSalad.sql")
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res := File(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"})
+	if res.OpenErr != nil || res.Failed || res.CSV != 1 || res.PIISkip != 0 {
+		t.Fatalf("результат=%+v log=%q", res, buf.String())
+	}
+	log := buf.String()
+	if strings.Count(log, "warn:") != 1 || !strings.Contains(log, "не INSERT, а таблица") {
+		t.Fatalf("нужен один warn:\n%s", log)
+	}
+	if strings.Contains(log, "a@example.test") || strings.Contains(log, "VALUES") {
+		t.Fatal("строки таблицы нельзя дампить в лог")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "GameSalad.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\"email\",\"phone\"\n\"a@example.test\",\"555\"\n\"b@example.test\",\"777\"\n"
+	if string(got) != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != raw {
+		t.Fatalf("исходник изменён")
+	}
+}
+
+func TestTabularTSVSQLWritesOurFormat(t *testing.T) {
+	dir := t.TempDir()
+	res, log := runFile(t, dir, "18_table_tsv.sql", testfilesSQL(t, "18_table_tsv.sql"))
+	if res.CSV != 1 {
+		t.Fatalf("результат=%+v", res)
+	}
+	if strings.Count(log, "warn:") != 1 {
+		t.Fatalf("warn:\n%s", log)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "18_table_tsv.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\"email\",\"phone\"\n\"a@example.test\",\"555\"\n\"b@example.test\",\"777\"\n"
+	if string(got) != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+}
+
+func TestTabularSQLPIIRejectsWithoutCSV(t *testing.T) {
+	dir := t.TempDir()
+	raw := testfilesSQL(t, "19_table_no_pii.sql")
+	path := filepath.Join(dir, "19_table_no_pii.sql")
+	if err := os.WriteFile(path, []byte(raw), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res := File(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"})
+	if res.CSV != 0 || res.PIISkip != 1 {
+		t.Fatalf("результат=%+v log=%q", res, buf.String())
+	}
+	if strings.Count(buf.String(), "warn:") != 1 {
+		t.Fatalf("warn после PII всё равно нужен:\n%s", buf.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "19_table_no_pii.csv")); !os.IsNotExist(err) {
+		t.Fatalf("CSV не должен создаваться, err=%v", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != raw {
+		t.Fatal("исходник изменён")
+	}
+}
+
+func TestTabularSQLStemPIIAllowsCSV(t *testing.T) {
+	dir := t.TempDir()
+	res, log := runFile(t, dir, "users.sql", "id,status\n1,ok\n")
+	if res.CSV != 1 || res.PIISkip != 0 {
+		t.Fatalf("результат=%+v log=%q", res, log)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "users.csv")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTabularSQLSemicolonDelimiter(t *testing.T) {
+	dir := t.TempDir()
+	res, _ := runFile(t, dir, "users.sql", "email;phone\na@example.test;555\n")
+	if res.CSV != 1 {
+		t.Fatalf("результат=%+v", res)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "users.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "\"email\",\"phone\"\n\"a@example.test\",\"555\"\n" {
+		t.Fatalf("CSV=%q", got)
+	}
+}
+
+func TestInsertSQLStillParsedNotAsTable(t *testing.T) {
+	dir := t.TempDir()
+	res, log := runFile(t, dir, "dump.sql", "INSERT INTO t (email, phone) VALUES (1, '555');\n")
+	if res.Created != 1 || res.CSV != 1 {
+		t.Fatalf("результат=%+v", res)
+	}
+	if strings.Contains(log, "не INSERT, а таблица") {
+		t.Fatalf("INSERT не должен идти как таблица:\n%s", log)
+	}
+}
+
+func TestSelectThenInsertIsNotTabularDump(t *testing.T) {
+	dir := t.TempDir()
+	sql := "SELECT email, phone FROM users;\nINSERT INTO t (email, phone) VALUES ('a@example.test', '555');\n"
+	res, log := runFile(t, dir, "dump.sql", sql)
+	if strings.Contains(log, "не INSERT, а таблица") {
+		t.Fatalf("SELECT не должен становиться шапкой:\n%s", log)
+	}
+	if res.Created != 1 || res.CSV != 1 {
+		t.Fatalf("INSERT после SELECT потерян: %+v log=%q", res, log)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "a@example.test") {
+		t.Fatalf("CSV=%q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dump.csv")); !os.IsNotExist(err) {
+		t.Fatalf("ложный dump.csv, err=%v", err)
+	}
+}
+
+func TestTabularAllRowsTooWideDoesNotKeepHeaderOnlyCSV(t *testing.T) {
+	dir := t.TempDir()
+	res, log := runFile(t, dir, "users.sql", "email,phone\na,b,c,d\ne,f,g,h\n")
+	if res.CSV != 0 {
+		t.Fatalf("нельзя оставлять CSV из одной шапки: %+v log=%q", res, log)
+	}
+	if res.UnitFail < 1 {
+		t.Fatalf("нужна ошибка лишних значений: %+v log=%q", res, log)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "users.csv")); !os.IsNotExist(err) {
+		t.Fatalf("users.csv не должен остаться, err=%v", err)
 	}
 }

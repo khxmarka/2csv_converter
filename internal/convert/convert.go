@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 
@@ -13,12 +14,14 @@ import (
 
 // Result — итог одного файла: ошибки открытия не роняют процесс, их видит вызывающий.
 type Result struct {
-	Created int // успешные INSERT
-	CSV     int // новые CSV-файлы (дописывания не считаются)
-	Skipped int
-	Paths   []string
-	OpenErr error
-	Failed  bool // в файле была критическая ошибка чтения/записи CSV
+	Created  int // успешные INSERT
+	CSV      int // новые CSV-файлы (дописывания не считаются)
+	Skipped  int
+	PIISkip  int
+	UnitFail int
+	Paths    []string
+	OpenErr  error
+	Failed   bool // в файле была критическая ошибка чтения/записи CSV
 }
 
 // File разбирает sql-файл и пишет CSV в ту же директорию.
@@ -36,6 +39,18 @@ func File(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile) Result {
 		sql: sql,
 		dir: filepath.Dir(sql.Path),
 	}
+	tab, rest, err := sniffTable(f)
+	if err != nil {
+		log.Errorf("%s: %v", sql.Path, err)
+		return Result{Skipped: 1, Failed: true}
+	}
+	if tab != nil {
+		return convertTable(log, reg, sql, tab, rest)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		log.Errorf("%s: %v", sql.Path, err)
+		return Result{Skipped: 1, Failed: true}
+	}
 	if err := insert.Parse(f, insert.Handler{
 		Begin: s.begin,
 		Row:   s.row,
@@ -47,22 +62,32 @@ func File(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile) Result {
 		s.failed = true
 		log.Errorf("%s: %v", sql.Path, err)
 	}
-	return Result{Created: s.created, CSV: s.csvNew, Skipped: s.skipped, Paths: s.paths, Failed: s.failed}
+	return Result{
+		Created:  s.created,
+		CSV:      s.csvNew,
+		Skipped:  s.skipped,
+		PIISkip:  s.piiN,
+		UnitFail: s.unitFail,
+		Paths:    s.paths,
+		Failed:   s.failed,
+	}
 }
 
 type session struct {
-	log     *logx.Logger
-	reg     *csvout.Registry
-	sql     scan.SQLFile
-	dir     string
-	writer  *csvout.Writer
-	meta    insert.Meta
-	created int
-	csvNew  int
-	skipped int
-	failed  bool
-	piiSkip bool
-	paths   []string
+	log      *logx.Logger
+	reg      *csvout.Registry
+	sql      scan.SQLFile
+	dir      string
+	writer   *csvout.Writer
+	meta     insert.Meta
+	created  int
+	csvNew   int
+	skipped  int
+	piiN     int
+	unitFail int
+	failed   bool
+	piiSkip  bool
+	paths    []string
 }
 
 func (s *session) dropWriter() {
@@ -79,6 +104,7 @@ func (s *session) begin(meta insert.Meta) error {
 	s.piiSkip = false
 	if !pii.Match(meta.Table) && !pii.MatchColumns(meta.Columns) {
 		s.skipped++
+		s.piiN++
 		s.piiSkip = true
 		return nil
 	}
@@ -101,6 +127,8 @@ func (s *session) row(cells []insert.Cell) error {
 	if err != nil {
 		s.dropWriter()
 		s.skipped++
+		s.unitFail++
+		s.log.Errorf("%s таблица %s: %v", s.sql.Path, s.meta.Table, err)
 		return nil
 	}
 	if err := s.writer.Row(values); err != nil {
@@ -134,11 +162,30 @@ func (s *session) end() error {
 	return nil
 }
 
-func (s *session) skip(_ insert.Skip) {
+func skipQuiet(reason string) bool {
+	switch reason {
+	case "INSERT ... SELECT", "INSERT ... SET", "нет VALUES", "пустой список колонок", "нет строк VALUES":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *session) skip(sk insert.Skip) {
+	hadWriter := s.writer != nil
 	s.dropWriter()
 	if s.piiSkip {
 		s.piiSkip = false
 		return
 	}
 	s.skipped++
+	if skipQuiet(sk.Reason) && !hadWriter {
+		return
+	}
+	s.unitFail++
+	if sk.Table != "" {
+		s.log.Errorf("%s таблица %s: %s", s.sql.Path, sk.Table, sk.Reason)
+		return
+	}
+	s.log.Errorf("%s: %s", s.sql.Path, sk.Reason)
 }
