@@ -204,6 +204,46 @@ func parseInsert(s *src, h Handler) error {
 	}
 
 	meta := Meta{Table: table, Columns: cols, Offset: start.Offset, Line: start.Line}
+	if h.BeforeValues != nil {
+		skipBody, err := h.BeforeValues(meta)
+		if err != nil {
+			return err
+		}
+		if skipBody {
+			return s.skipUntilSemicolon(true, false)
+		}
+	}
+	if h.ValuesFile != nil {
+		path, err := s.spillUntilSemicolon(h.SpillDir)
+		if err != nil {
+			return err
+		}
+		return h.ValuesFile(meta, path)
+	}
+	if h.Values != nil {
+		body, err := s.captureUntilSemicolon()
+		if err != nil {
+			return err
+		}
+		return h.Values(meta, body)
+	}
+	return parseValueRows(s, h, meta)
+}
+
+// ParseValues разбирает уже вырезанный хвост одного INSERT ... VALUES.
+func ParseValues(r io.Reader, meta Meta, h Handler) error {
+	return parseValueRows(newSrc(r), h, meta)
+}
+
+func parseValueRows(s *src, h Handler, meta Meta) error {
+	table := meta.Table
+	cols := meta.Columns
+	skip := func(reason, table string) error {
+		if h.Skip != nil {
+			h.Skip(Skip{Offset: meta.Offset, Line: meta.Line, Table: table, Reason: reason})
+		}
+		return s.skipUntilSemicolon(true, false)
+	}
 	began := false
 	surplus := false
 	rows := 0

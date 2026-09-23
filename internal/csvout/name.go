@@ -52,15 +52,7 @@ func FileBaseDefault(name, empty string) string {
 }
 
 func limitCSVBase(base string) string {
-	total := 0
-	for _, r := range base {
-		if r > 0xFFFF {
-			total += 2
-		} else {
-			total++
-		}
-	}
-	if total <= maxCSVBaseUTF16 {
+	if utf16Units(base) <= maxCSVBaseUTF16 {
 		return base
 	}
 
@@ -82,6 +74,47 @@ func limitCSVBase(base string) string {
 	}
 	b.WriteString(suffix)
 	return b.String()
+}
+
+// limitCSVBaseSuffix ограничивает основу вместе с суффиксом вроде «_2».
+// Суффикс сохраняется; при усечении к префиксу добавляется тот же hash, что у limitCSVBase.
+func limitCSVBaseSuffix(base, suffix string) string {
+	if utf16Units(base)+utf16Units(suffix) <= maxCSVBaseUTF16 {
+		return base + suffix
+	}
+	sum := sha256.Sum256([]byte(base))
+	tail := "~" + hex.EncodeToString(sum[:8]) + suffix
+	prefixLimit := maxCSVBaseUTF16 - utf16Units(tail)
+	if prefixLimit < 0 {
+		prefixLimit = 0
+	}
+	var b strings.Builder
+	units := 0
+	for _, r := range base {
+		n := 1
+		if r > 0xFFFF {
+			n = 2
+		}
+		if units+n > prefixLimit {
+			break
+		}
+		b.WriteRune(r)
+		units += n
+	}
+	b.WriteString(tail)
+	return b.String()
+}
+
+func utf16Units(s string) int {
+	n := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
 }
 
 func csvName(base string, n int) string {

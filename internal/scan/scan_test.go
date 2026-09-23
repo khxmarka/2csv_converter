@@ -273,6 +273,45 @@ func TestFindLeavesUnreadableSQLForConverterToReport(t *testing.T) {
 	}
 }
 
+func TestFindCollectsCSVSkipsTempsAndConverted(t *testing.T) {
+	root := t.TempDir()
+	alpha := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(alpha, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keep := []string{"rows.csv", "DATA.CSV"}
+	for _, name := range keep {
+		if err := os.WriteFile(filepath.Join(alpha, name), []byte("h\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{"converted.txt", ".2csv-left.tmp", "notes.txt"} {
+		if err := os.WriteFile(filepath.Join(alpha, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "converted.txt"), []byte("Old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := Find(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Files) != 2 {
+		t.Fatalf("файлы: %#v", result.Files)
+	}
+	for _, f := range result.Files {
+		if f.Kind != KindCSV || f.TopFolder != "Alpha" {
+			t.Fatalf("csv: %+v", f)
+		}
+		base := filepath.Base(f.Path)
+		if base == "converted.txt" || strings.Contains(base, ".2csv-") {
+			t.Fatalf("служебный файл попал в обход: %s", f.Path)
+		}
+	}
+}
+
 func TestFindOnEmptyDir(t *testing.T) {
 	result, err := Find(t.TempDir())
 	if err != nil {

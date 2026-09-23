@@ -31,16 +31,17 @@ func CleanupTemps(dir string) error {
 // ещё нет — заменяет целевой {table}.csv содержимым temp;
 // если ключ уже открыт в этом запуске — дописывает только строки данных.
 type Writer struct {
-	reg       *Registry
-	slot      *slot
-	dir       string
-	base      string
-	nCol      int
-	tmp       *os.File
-	buf       *bufio.Writer
-	padded    int
-	closed    bool
-	appending bool
+	reg         *Registry
+	slot        *slot
+	dir         string
+	base        string
+	nCol        int
+	tmp         *os.File
+	buf         *bufio.Writer
+	padded      int
+	closed      bool
+	appending   bool
+	wroteHeader bool
 }
 
 // Result — итог успешного Commit.
@@ -86,6 +87,7 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 		return w, nil
 	}
 	w.nCol = len(columns)
+	w.wroteHeader = true
 	if _, err := io.WriteString(w.buf, encodeRow(columns)); err != nil {
 		_ = w.Abort()
 		return nil, err
@@ -116,13 +118,14 @@ func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, er
 		return nil, fmt.Errorf("временный CSV: %w", err)
 	}
 	w := &Writer{
-		reg:  reg,
-		slot: s,
-		dir:  dir,
-		base: base,
-		nCol: len(columns),
-		tmp:  tmp,
-		buf:  bufio.NewWriterSize(tmp, 64*1024),
+		reg:         reg,
+		slot:        s,
+		dir:         dir,
+		base:        base,
+		nCol:        len(columns),
+		tmp:         tmp,
+		buf:         bufio.NewWriterSize(tmp, 64*1024),
+		wroteHeader: true,
 	}
 	if _, err := io.WriteString(w.buf, encodeRow(columns)); err != nil {
 		_ = w.Abort()
@@ -201,6 +204,8 @@ func (w *Writer) Commit() (Result, error) {
 	}
 	w.slot.path = final
 	w.slot.nCol = w.nCol
+	w.slot.hasHeader = w.wroteHeader
+	w.reg.addOutput(w.dir, final, w.wroteHeader)
 	return Result{Path: final, PaddedRows: w.padded}, nil
 }
 

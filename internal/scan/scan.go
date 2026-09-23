@@ -18,9 +18,10 @@ const (
 	KindSQL Kind = iota
 	KindXLSX
 	KindXLS
+	KindCSV
 )
 
-// SQLFile — найденный .sql / .xlsx / .xls и его место в дереве относительно корня.
+// SQLFile — найденный .sql / .xlsx / .xls / .csv и его место в дереве относительно корня.
 type SQLFile struct {
 	Path string
 	Kind Kind
@@ -36,6 +37,9 @@ func (f SQLFile) InRoot() bool { return f.TopFolder == "" }
 
 // IsExcel — книга .xlsx или .xls.
 func (f SQLFile) IsExcel() bool { return f.Kind == KindXLSX || f.Kind == KindXLS }
+
+// IsCSV — файл .csv для нарезки.
+func (f SQLFile) IsCSV() bool { return f.Kind == KindCSV }
 
 // Skip — единица, пропущенная при обходе: symlink или недоступный каталог.
 type Skip struct {
@@ -67,7 +71,7 @@ func ValidateRoot(path string) error {
 	return nil
 }
 
-// Find рекурсивно обходит root и собирает пути *.sql, *.xlsx и *.xls без учёта регистра.
+// Find рекурсивно обходит root и собирает пути *.sql, *.xlsx, *.xls и *.csv без учёта регистра.
 // Symlink-и не раскрываются: и ссылки на каталоги, и ссылки на файлы попадают в Skips.
 // Ошибки чтения каталогов возвращаются как блокирующие Skips и не роняют обход.
 func Find(root string) (Result, error) {
@@ -223,6 +227,14 @@ func isLink(mode fs.FileMode) bool {
 }
 
 func workKind(path string) (Kind, bool) {
+	base := filepath.Base(path)
+	if strings.EqualFold(base, "converted.txt") {
+		return 0, false
+	}
+	lower := strings.ToLower(base)
+	if strings.HasPrefix(lower, ".2csv-") && strings.HasSuffix(lower, ".tmp") {
+		return 0, false
+	}
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".sql":
 		return KindSQL, true
@@ -230,6 +242,8 @@ func workKind(path string) (Kind, bool) {
 		return KindXLSX, true
 	case ".xls":
 		return KindXLS, true
+	case ".csv":
+		return KindCSV, true
 	default:
 		return 0, false
 	}

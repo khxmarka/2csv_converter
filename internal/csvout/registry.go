@@ -13,12 +13,26 @@ type Registry struct {
 	mu    sync.Mutex
 	byKey map[string]*slot
 	byDir map[string]*sync.Mutex
+	outs  []output
 }
 
 type slot struct {
-	mu   sync.Mutex
-	path string
-	nCol int
+	mu        sync.Mutex
+	path      string
+	nCol      int
+	hasHeader bool
+}
+
+type output struct {
+	dir       string
+	path      string
+	hasHeader bool
+}
+
+// Output — CSV, записанный в этом запуске.
+type Output struct {
+	Path      string
+	HasHeader bool
 }
 
 func NewRegistry() *Registry {
@@ -65,6 +79,40 @@ func (r *Registry) acquireUnique() *slot {
 	s := new(slot)
 	s.mu.Lock()
 	return s
+}
+
+func (r *Registry) addOutput(dir, path string, hasHeader bool) {
+	if r == nil || path == "" {
+		return
+	}
+	dir = canonicalPath(dir)
+	pathKey := canonicalPath(path)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, o := range r.outs {
+		if o.dir == dir && canonicalPath(o.path) == pathKey {
+			r.outs[i] = output{dir: dir, path: path, hasHeader: hasHeader}
+			return
+		}
+	}
+	r.outs = append(r.outs, output{dir: dir, path: path, hasHeader: hasHeader})
+}
+
+// OutputsIn возвращает CSV, которые этот запуск записал в dir.
+func (r *Registry) OutputsIn(dir string) []Output {
+	if r == nil {
+		return nil
+	}
+	dir = canonicalPath(dir)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []Output
+	for _, o := range r.outs {
+		if o.dir == dir {
+			out = append(out, Output{Path: o.path, HasHeader: o.hasHeader})
+		}
+	}
+	return out
 }
 
 func (r *Registry) lockDir(dir string) *sync.Mutex {

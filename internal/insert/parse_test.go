@@ -603,3 +603,86 @@ func FuzzParseNeverLeavesOpenInsert(f *testing.F) {
 		}
 	})
 }
+
+func TestBeforeValuesSkipsCells(t *testing.T) {
+	var rows int
+	err := Parse(strings.NewReader("INSERT INTO t (email) VALUES ('a@example.test'), ('b');"), Handler{
+		BeforeValues: func(Meta) (bool, error) { return true, nil },
+		Begin: func(Meta) error {
+			t.Fatal("Begin после отказа")
+			return nil
+		},
+		Row: func([]Cell) error {
+			rows++
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("ячеек: %d", rows)
+	}
+}
+
+func TestValuesHandlerReceivesTail(t *testing.T) {
+	var got []byte
+	err := Parse(strings.NewReader("INSERT INTO users (email) VALUES ('a@example.test'); INSERT INTO t SELECT 1;"), Handler{
+		Values: func(m Meta, body []byte) error {
+			if m.Table != "users" {
+				t.Fatalf("таблица %s", m.Table)
+			}
+			got = append([]byte(nil), body...)
+			return nil
+		},
+		Row: func([]Cell) error {
+			t.Fatal("сканер не должен разбирать ячейки")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "'a@example.test'") {
+		t.Fatalf("хвост: %q", got)
+	}
+	res := 0
+	if err := ParseValues(bytes.NewReader(got), Meta{Table: "users", Columns: []string{"email"}}, Handler{
+		Row: func(cells []Cell) error {
+			res += len(cells)
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if res != 1 {
+		t.Fatalf("ячеек в хвосте: %d", res)
+	}
+}
+
+func TestValuesFileDoesNotKeepTailInMemory(t *testing.T) {
+	dir := t.TempDir()
+	var path string
+	err := Parse(strings.NewReader("INSERT INTO users (email) VALUES ('a@example.test');"), Handler{
+		SpillDir: dir,
+		ValuesFile: func(m Meta, p string) error {
+			path = p
+			return nil
+		},
+		Row: func([]Cell) error {
+			t.Fatal("сканер не должен разбирать ячейки")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "'a@example.test'") {
+		t.Fatalf("хвост: %q", raw)
+	}
+	_ = os.Remove(path)
+}

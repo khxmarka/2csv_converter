@@ -39,6 +39,7 @@ func File(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile) Result {
 		sql: sql,
 		dir: filepath.Dir(sql.Path),
 	}
+	defer s.dropWriter()
 	tab, rest, err := sniffTable(f)
 	if err != nil {
 		log.Errorf("%s: %v", sql.Path, err)
@@ -52,10 +53,11 @@ func File(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile) Result {
 		return Result{Skipped: 1, Failed: true}
 	}
 	if err := insert.Parse(f, insert.Handler{
-		Begin: s.begin,
-		Row:   s.row,
-		End:   s.end,
-		Skip:  s.skip,
+		BeforeValues: s.beforeValues,
+		Begin:        s.begin,
+		Row:          s.row,
+		End:          s.end,
+		Skip:         s.skip,
 	}); err != nil {
 		s.dropWriter()
 		s.skipped++
@@ -98,16 +100,19 @@ func (s *session) dropWriter() {
 	s.writer = nil
 }
 
+func (s *session) beforeValues(meta insert.Meta) (bool, error) {
+	if pii.Match(meta.Table) || pii.MatchColumns(meta.Columns) {
+		return false, nil
+	}
+	s.skipped++
+	s.piiN++
+	return true, nil
+}
+
 func (s *session) begin(meta insert.Meta) error {
 	s.dropWriter()
 	s.meta = meta
 	s.piiSkip = false
-	if !pii.Match(meta.Table) && !pii.MatchColumns(meta.Columns) {
-		s.skipped++
-		s.piiN++
-		s.piiSkip = true
-		return nil
-	}
 	w, err := csvout.Create(s.reg, s.dir, meta.Table, meta.Columns)
 	if err != nil {
 		s.skipped++

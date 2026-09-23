@@ -2,8 +2,10 @@ package insert
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"io"
+	"os"
 	"strings"
 )
 
@@ -13,10 +15,13 @@ var errUnclosedBlockComment = errors.New("незакрытый блочный к
 var errIncompleteInsertTail = errors.New("незавершённый хвост INSERT")
 
 type src struct {
-	br   *bufio.Reader
-	pos  int64
-	line int
-	col  int
+	br      *bufio.Reader
+	pos     int64
+	line    int
+	col     int
+	grab    io.Writer
+	grabErr error
+	wbyte   [1]byte
 }
 
 func newSrc(r io.Reader) *src {
@@ -51,7 +56,70 @@ func (s *src) next() (byte, error) {
 	} else {
 		s.col++
 	}
+	if s.grab != nil && s.grabErr == nil {
+		s.wbyte[0] = b
+		_, s.grabErr = s.grab.Write(s.wbyte[:])
+	}
+	if s.grabErr != nil {
+		return 0, s.grabErr
+	}
 	return b, nil
+}
+
+func (s *src) captureUntilSemicolon() ([]byte, error) {
+	var buf bytes.Buffer
+	s.grab = &buf
+	s.grabErr = nil
+	err := s.skipUntilSemicolon(true, false)
+	s.grab = nil
+	if err == nil {
+		err = s.grabErr
+	}
+	s.grabErr = nil
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+const spillPattern = ".2csv-*.tmp"
+
+func (s *src) spillUntilSemicolon(dir string) (string, error) {
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	f, err := os.CreateTemp(dir, spillPattern)
+	if err != nil {
+		return "", err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+		}
+	}()
+	w := bufio.NewWriterSize(f, 256*1024)
+	s.grab = w
+	s.grabErr = nil
+	err = s.skipUntilSemicolon(true, false)
+	s.grab = nil
+	if err == nil {
+		err = s.grabErr
+	}
+	s.grabErr = nil
+	if err != nil {
+		return "", err
+	}
+	if err := w.Flush(); err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return name, nil
 }
 
 func (s *src) peek() (byte, error) {

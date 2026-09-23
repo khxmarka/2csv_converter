@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"io"
@@ -8,10 +9,13 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"sql2csv/internal/converted"
+	"sql2csv/internal/csvout"
 	"sql2csv/internal/logx"
 	"sql2csv/internal/scan"
 	"sql2csv/internal/xlsconv"
@@ -743,12 +747,12 @@ func TestFolderStatusesNeverCombineDifferentTopFolders(t *testing.T) {
 	}
 	log := buf.String()
 	for _, name := range []string{"Alpha", "Beta"} {
-		if strings.Count(log, "папка в обработке: "+name+" (0 с)") != 1 {
-			t.Fatalf("статус %s должен появиться один раз:\n%s", name, log)
+		if !strings.Contains(log, name+" (") {
+			t.Fatalf("в списке активных нет %s:\n%s", name, log)
 		}
-	}
-	if strings.Contains(log, "Alpha, Beta") || strings.Contains(log, "Beta, Alpha") {
-		t.Fatalf("статусы разных верхних папок нельзя объединять:\n%s", log)
+		if strings.Count(log, "папка обработана: "+name) != 1 {
+			t.Fatalf("завершение %s один раз:\n%s", name, log)
+		}
 	}
 }
 
@@ -764,7 +768,9 @@ func TestHangLineHasNameAndChangingSeconds(t *testing.T) {
 	}
 
 	acc.mu.Lock()
-	acc.hangStart = time.Now().Add(-2 * time.Second)
+	af := acc.active[folderKey(file)]
+	af.start = time.Now().Add(-2 * time.Second)
+	acc.active[folderKey(file)] = af
 	acc.mu.Unlock()
 	acc.tickHang()
 	got = buf.String()
@@ -781,6 +787,143 @@ func TestHangLineHasNameAndChangingSeconds(t *testing.T) {
 	tail := got[strings.LastIndex(got, "after"):]
 	if strings.Contains(tail, "папка в обработке") {
 		t.Fatalf("Hang(\"\") должен снять строку: %q", got)
+	}
+}
+
+func TestHangListsEachActiveTopWithOwnSeconds(t *testing.T) {
+	var buf bytes.Buffer
+	log := logx.New(&buf)
+	alpha := scan.SQLFile{Path: "a.sql", TopFolder: "Alpha"}
+	beta := scan.SQLFile{Path: "b.sql", TopFolder: "Beta"}
+	acc := newAccumulator(log, t.TempDir(), []scan.SQLFile{alpha, beta}, nil)
+	acc.start(beta)
+	acc.start(alpha)
+	acc.mu.Lock()
+	aa := acc.active[folderKey(alpha)]
+	aa.start = time.Now().Add(-3 * time.Second)
+	acc.active[folderKey(alpha)] = aa
+	bb := acc.active[folderKey(beta)]
+	bb.start = time.Now().Add(-1 * time.Second)
+	acc.active[folderKey(beta)] = bb
+	acc.refreshHang()
+	acc.mu.Unlock()
+	got := buf.String()
+	if !strings.Contains(got, "папка в обработке: Alpha (3 с), Beta (1 с)") {
+		t.Fatalf("список: %q", got)
+	}
+}
+
+func TestTwoTopsSeveralDirsKeepSeparateCSV(t *testing.T) {
+	root := t.TempDir()
+	for _, top := range []string{"Alpha", "Beta"} {
+		for _, sub := range []string{"one", "two"} {
+			dir := filepath.Join(root, top, sub)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			body := "INSERT INTO users (email) VALUES ('" + top + "-" + sub + "@example.test');\n"
+			if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	res, err := Run(logx.New(io.Discard), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.CSV != 4 || res.InsertOK != 4 {
+		t.Fatalf("результат: %+v", res)
+	}
+	for _, top := range []string{"Alpha", "Beta"} {
+		for _, sub := range []string{"one", "two"} {
+			raw, err := os.ReadFile(filepath.Join(root, top, sub, "users.csv"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := top + "-" + sub + "@example.test"
+			if !strings.Contains(string(raw), want) {
+				t.Fatalf("%s/%s: %q", top, sub, raw)
+			}
+		}
+	}
+	if strings.Join(res.SuccessTops, ",") != "Alpha,Beta" {
+		t.Fatalf("папки: %v", res.SuccessTops)
+	}
+}
+
+func TestSecondTopStartsBeforeFirstFinishes(t *testing.T) {
+	if poolSize() < 2 {
+		t.Skip("при одном воркере вторую папку нечем открыть")
+	}
+	root := t.TempDir()
+	for _, top := range []string{"Alpha", "Beta"} {
+		dir := filepath.Join(root, top)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body := "INSERT INTO users (email) VALUES ('" + top + "@example.test');\n"
+		if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var alphaState atomic.Int32
+	var betaWhileHeld atomic.Bool
+	releaseCh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	defer release()
+	betaEntered := make(chan struct{})
+	var betaOnce sync.Once
+
+	testDirEnter = func(f scan.SQLFile) {
+		switch f.TopFolder {
+		case "Alpha":
+			alphaState.Store(1)
+			<-releaseCh
+			alphaState.Store(2)
+		case "Beta":
+			deadline := time.Now().Add(3 * time.Second)
+			for time.Now().Before(deadline) {
+				if alphaState.Load() == 1 {
+					betaWhileHeld.Store(true)
+					break
+				}
+				runtime.Gosched()
+			}
+			betaOnce.Do(func() { close(betaEntered) })
+		}
+	}
+	t.Cleanup(func() { testDirEnter = nil })
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := Run(logx.New(io.Discard), root)
+		errc <- err
+	}()
+
+	select {
+	case <-betaEntered:
+	case err := <-errc:
+		t.Fatalf("прогон закончился до старта Beta: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Beta не стартовала, пока Alpha ещё идёт")
+	}
+	if !betaWhileHeld.Load() {
+		t.Fatal("Beta стартовала не во время незавершённой Alpha")
+	}
+	release()
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	for _, top := range []string{"Alpha", "Beta"} {
+		raw, err := os.ReadFile(filepath.Join(root, top, "users.csv"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(raw), top+"@example.test") {
+			t.Fatalf("%s: %q", top, raw)
+		}
 	}
 }
 
@@ -830,14 +973,16 @@ func TestGroupByDirKeepsSQLStreamBeforeExcel(t *testing.T) {
 	groups := groupByDir([]scan.SQLFile{
 		{Path: filepath.Join(dir, "m.xlsx"), Kind: scan.KindXLSX},
 		{Path: filepath.Join(dir, "z.sql"), Kind: scan.KindSQL},
+		{Path: filepath.Join(dir, "c.csv"), Kind: scan.KindCSV},
 		{Path: filepath.Join(dir, "a.sql"), Kind: scan.KindSQL},
+		{Path: filepath.Join(dir, "a.csv"), Kind: scan.KindCSV},
 		{Path: filepath.Join(dir, "b.xls"), Kind: scan.KindXLS},
 	})
 	if len(groups) != 1 {
 		t.Fatalf("групп=%d", len(groups))
 	}
 	got := groups[0]
-	want := []string{"a.sql", "z.sql", "b.xls", "m.xlsx"}
+	want := []string{"a.sql", "z.sql", "b.xls", "m.xlsx", "a.csv", "c.csv"}
 	if len(got) != len(want) {
 		t.Fatalf("файлы=%v", got)
 	}
@@ -999,6 +1144,14 @@ func TestRunExcelTreeConvertedTxt(t *testing.T) {
 	if strings.Contains(log, "six.xls") {
 		t.Fatalf("пропуск >5 листов не логировать по файлу:\n%s", log)
 	}
+	if _, err := os.Stat(filepath.Join(beta, "six.xls")); err != nil {
+		t.Fatalf("книга >5 листов должна остаться: %v", err)
+	}
+	for _, name := range []string{"a.xlsx", "dump.sql"} {
+		if _, err := os.Stat(filepath.Join(alpha, name)); !os.IsNotExist(err) {
+			t.Fatalf("исходник %s должен быть удалён, err=%v", name, err)
+		}
+	}
 	if strings.Count(log, "папка обработана: Alpha") != 1 {
 		t.Fatalf("завершение Alpha:\n%s", log)
 	}
@@ -1007,6 +1160,74 @@ func TestRunExcelTreeConvertedTxt(t *testing.T) {
 	}
 	if !strings.Contains(log, "error: папка Beta: не создано ни одного CSV: нечего конвертировать") {
 		t.Fatalf("нужна причина 0 CSV у Beta:\n%s", log)
+	}
+}
+
+func TestDeleteSourceOnlyAfterCSV(t *testing.T) {
+	root := t.TempDir()
+	okDir := filepath.Join(root, "Ok")
+	piiDir := filepath.Join(root, "PII")
+	colDir := filepath.Join(root, "Col")
+	if err := os.MkdirAll(okDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(piiDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(colDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(okDir, "a.sql"), []byte(
+		"INSERT INTO users (email) VALUES ('a@example.test');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(okDir, "z.sql"), []byte(
+		"INSERT INTO users (email) VALUES ('z@example.test');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := xlsconv.WriteXLSX(filepath.Join(okDir, "book.xlsx"), []xlsconv.Sheet{{
+		Name: "Data",
+		Rows: [][]string{{"email"}, {"a@example.test"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	copySQLFixture(t, "11_no_pii.sql", filepath.Join(piiDir, "11_no_pii.sql"))
+	if err := os.WriteFile(filepath.Join(colDir, "one.sql"), []byte(
+		"INSERT INTO t (email) VALUES ('a@example.test');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	kept := filepath.Join(okDir, "notes.csv")
+	if err := os.WriteFile(kept, []byte("\"h\"\n\"x\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(okDir, "users.csv")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(okDir, "book_Data.csv")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"a.sql", "z.sql", "book.xlsx"} {
+		if _, err := os.Stat(filepath.Join(okDir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s должен быть удалён, err=%v", name, err)
+		}
+	}
+	if _, err := os.Stat(kept); err != nil {
+		t.Fatalf("чужой csv удалять нельзя: %v", err)
+	}
+	for _, path := range []string{
+		filepath.Join(piiDir, "11_no_pii.sql"),
+		filepath.Join(colDir, "one.sql"),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("файл без CSV должен остаться %s: %v", path, err)
+		}
 	}
 }
 
@@ -1200,17 +1421,378 @@ func TestTabularSQLWithInsertAndExcelSameRun(t *testing.T) {
 	if string(got) != "\"email\",\"phone\"\n\"a@example.test\",\"555\"\n\"b@example.test\",\"777\"\n" {
 		t.Fatalf("табличный CSV: %q", got)
 	}
-	after, err := os.ReadFile(filepath.Join(dir, "GameSalad.sql"))
-	if err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"GameSalad.sql", "dump.sql", "a.xlsx"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("исходник %s должен быть удалён, err=%v", name, err)
+		}
 	}
-	if !bytes.Equal(before, after) {
-		t.Fatal("исходный табличный .sql изменён")
+	if string(before) == "" {
+		t.Fatal("фикстура табличного .sql пустая")
 	}
 	if strings.Count(log, "не INSERT, а таблица") != 1 {
 		t.Fatalf("warn табличного .sql:\n%s", log)
 	}
 	if res.CSV != 3 || strings.Join(res.SuccessTops, ",") != "Alpha" {
 		t.Fatalf("результат: %+v", res)
+	}
+}
+
+func TestForeignCSVSplitLeavesSmallFileAndMarksFolder(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	big := filepath.Join(dir, "big.csv")
+	writeRepeatedRows(t, big, "\"h\"\n", "\"a\"\n", csvout.SplitThreshold+1)
+	small := filepath.Join(dir, "small.csv")
+	const smallBody = "\"h\"\n\"b\"\n"
+	if err := os.WriteFile(small, []byte(smallBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	res, err := Run(logx.New(&buf), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(res.SuccessTops, ",") != "Alpha" {
+		t.Fatalf("вершины: %+v\n%s", res.SuccessTops, buf.String())
+	}
+	raw, err := os.ReadFile(converted.Path(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != "Alpha\n" {
+		t.Fatalf("converted.txt: %q", raw)
+	}
+	for _, name := range []string{"big.csv", "big_2.csv", "big_3.csv"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("нет %s: %v", name, err)
+		}
+	}
+	got, err := os.ReadFile(small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != smallBody {
+		t.Fatalf("маленький CSV изменён: %q", got)
+	}
+	if strings.Contains(buf.String(), "не удалось нарезать") {
+		t.Fatalf("успешная нарезка попала в лог:\n%s", buf.String())
+	}
+}
+
+func TestFolderWithOnlySmallCSVHasNoFiles(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("\"h\"\n\"a\"\n")
+	path := filepath.Join(dir, "small.csv")
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	res, err := Run(logx.New(&buf), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.SuccessTops) != 0 {
+		t.Fatalf("папка попала в список: %v", res.SuccessTops)
+	}
+	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+		t.Fatalf("converted.txt: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("CSV изменён: %q", got)
+	}
+	if !strings.Contains(buf.String(), "папка Alpha: нет файлов") {
+		t.Fatalf("лог:\n%s", buf.String())
+	}
+}
+
+func TestSQLKeyIsMergedBeforeSplit(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sql := "" +
+		"INSERT INTO users (email) VALUES ('a'),('a'),('a');\n" +
+		"INSERT INTO users (email) VALUES ('b');\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "users.csv"), "\"email\"\n\"a\"\n\"a\"\n")
+	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"email\"\n\"a\"\n\"b\"\n")
+}
+
+func TestHeaderlessSQLSplitDoesNotInventHeader(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sql := "INSERT INTO users VALUES ('a'),('a'),('b');\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "users.csv"), "\"a\"\n\"a\"\n")
+	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"b\"\n")
+}
+
+func TestCompletedTopIsNotSplit(t *testing.T) {
+	restore := csvout.SetSplitLimits(1, 1)
+	defer restore()
+
+	root := t.TempDir()
+	alpha := filepath.Join(root, "Alpha")
+	beta := filepath.Join(root, "Beta")
+	if err := os.MkdirAll(alpha, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(beta, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte("\"h\"\n\"a\"\n\"b\"\n")
+	if err := os.WriteFile(filepath.Join(alpha, "big.csv"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(converted.Path(root), []byte("Alpha\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beta, "dump.sql"), []byte(
+		"INSERT INTO users (email) VALUES ('a@example.test');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if _, err := Run(logx.New(&buf), root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(alpha, "big_2.csv")); !os.IsNotExist(err) {
+		t.Fatalf("завершённая папка нарезана: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(alpha, "big.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("CSV завершённой папки изменён: %q", got)
+	}
+	if strings.Contains(buf.String(), "папка Alpha:") || strings.Contains(buf.String(), "папка обработана: Alpha") {
+		t.Fatalf("Alpha снова в логе:\n%s", buf.String())
+	}
+}
+
+func TestQuotedNewlineAndSpecialCellsConvertAndSplit(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sql := "" +
+		"INSERT INTO users (email, note) VALUES ('a@example.test', 'line1\nline2');\n" +
+		"INSERT INTO users (email, note) VALUES ('b@example.test', 'say \"hi\"');\n" +
+		"INSERT INTO users (email, note) VALUES ('c@example.test', 'comma, here');\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	want1 := "\"email\",\"note\"\n\"a@example.test\",\"line1\nline2\"\n\"b@example.test\",\"say \"\"hi\"\"\"\n"
+	want2 := "\"email\",\"note\"\n\"c@example.test\",\"comma, here\"\n"
+	assertFile(t, filepath.Join(dir, "users.csv"), want1)
+	assertFile(t, filepath.Join(dir, "users_2.csv"), want2)
+	if _, err := os.Stat(filepath.Join(dir, "a.sql")); !os.IsNotExist(err) {
+		t.Fatalf("исходник должен быть удалён: %v", err)
+	}
+}
+
+func TestTwoTablesStayCorrectWhenLaterFinishesFirst(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sql := "" +
+		"INSERT INTO users (email) VALUES ('first@example.test');\n" +
+		"INSERT INTO user_profiles (email) VALUES ('arch@example.test');\n" +
+		"INSERT INTO users (email) VALUES ('second@example.test');\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "users.csv"), "\"email\"\n\"first@example.test\"\n\"second@example.test\"\n")
+	assertFile(t, filepath.Join(dir, "user_profiles.csv"), "\"email\"\n\"arch@example.test\"\n")
+}
+
+func TestXLSDeletedAfterOneSheetCSV(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	book := filepath.Join(dir, "book.xls")
+	if err := xlsconv.WriteXLS(book, []xlsconv.Sheet{{
+		Name: "Data",
+		Rows: [][]string{{"email"}, {"a@example.test"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "book_Data.csv")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(book); !os.IsNotExist(err) {
+		t.Fatalf(".xls должен быть удалён: %v", err)
+	}
+}
+
+func TestPIISkipKeepsSourceWhileNeighborIsDeleted(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ok.sql"), []byte(
+		"INSERT INTO users (email) VALUES ('a@example.test');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	copySQLFixture(t, "11_no_pii.sql", filepath.Join(dir, "11_no_pii.sql"))
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "ok.sql")); !os.IsNotExist(err) {
+		t.Fatalf("успешный .sql должен быть удалён: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "11_no_pii.sql")); err != nil {
+		t.Fatalf("PII-файл должен остаться: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "users.csv")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSameTableTwoDirsIndependent(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "Alpha", "one")
+	b := filepath.Join(root, "Alpha", "two")
+	if err := os.MkdirAll(a, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(a, "a.sql"), []byte(
+		"INSERT INTO users (email) VALUES ('one@example.test');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b, "a.sql"), []byte(
+		"INSERT INTO users (email) VALUES ('two@example.test');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(a, "users.csv"), "\"email\"\n\"one@example.test\"\n")
+	assertFile(t, filepath.Join(b, "users.csv"), "\"email\"\n\"two@example.test\"\n")
+}
+
+func TestRootSQLDeletedAndNotListed(t *testing.T) {
+	root := t.TempDir()
+	sqlPath := filepath.Join(root, "dump.sql")
+	if err := os.WriteFile(sqlPath, []byte(
+		"INSERT INTO users (email) VALUES ('root@example.test');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Run(logx.New(io.Discard), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sqlPath); !os.IsNotExist(err) {
+		t.Fatalf("корневой .sql должен быть удалён: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "users.csv")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+		t.Fatalf("корень не пишется в converted.txt: %v", err)
+	}
+	if len(res.SuccessTops) != 0 {
+		t.Fatalf("tops=%v", res.SuccessTops)
+	}
+}
+
+func writeRepeatedRows(t *testing.T, path, header, line string, rows int) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	w := bufio.NewWriterSize(f, 1<<20)
+	if _, err := w.WriteString(header); err != nil {
+		t.Fatal(err)
+	}
+	b := []byte(line)
+	for i := 0; i < rows; i++ {
+		if _, err := w.Write(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertFile(t *testing.T, path, want string) {
+	t.Helper()
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("%s:\n got %q\nwant %q", path, got, want)
 	}
 }
