@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -99,6 +100,20 @@ func TestScheduleRowWidthFollowsKeyWidth(t *testing.T) {
 				t.Fatalf("CSV:\n got %q\nwant %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestScheduleGrantInsertIsQuiet(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.sql")
+	sql := "GRANT INSERT, UPDATE ON users TO app;\nINSERT INTO users (email) VALUES ('a');\n"
+	if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path}, nil)
+	if res.Created != 1 || res.UnitFail != 0 || buf.Len() != 0 {
+		t.Fatalf("GRANT INSERT не ошибка: %+v log=%q", res, buf.String())
 	}
 }
 

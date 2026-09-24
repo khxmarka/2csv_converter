@@ -686,3 +686,118 @@ func TestValuesFileDoesNotKeepTailInMemory(t *testing.T) {
 	}
 	_ = os.Remove(path)
 }
+
+// parsed — INSERT в виде, удобном для сравнения: «таблица(колонки)» и строки
+// ячеек через «|». NULL/Missing — «∅».
+type parsed struct {
+	head string
+	rows []string
+}
+
+func flatten(meta Meta, rows [][]Cell) parsed {
+	p := parsed{head: meta.Table + "(" + strings.Join(meta.Columns, ",") + ")"}
+	for _, row := range rows {
+		cells := make([]string, len(row))
+		for i, c := range row {
+			if c.Kind == Text {
+				cells[i] = c.Text
+			} else {
+				cells[i] = "∅"
+			}
+		}
+		p.rows = append(p.rows, strings.Join(cells, "|"))
+	}
+	return p
+}
+
+// collectSpill идёт продакшен-путём: сканер режет хвост statement в файл
+// (ValuesFile), ячейки разбирает ParseValues.
+func collectSpill(t *testing.T, sql string) []parsed {
+	t.Helper()
+	var out []parsed
+	dir := t.TempDir()
+	err := Parse(strings.NewReader(sql), Handler{
+		SpillDir: dir,
+		ValuesFile: func(meta Meta, path string) error {
+			defer os.Remove(path)
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			var rows [][]Cell
+			ok := false
+			err = ParseValues(f, meta, Handler{
+				Row: func(cells []Cell) error {
+					rows = append(rows, append([]Cell(nil), cells...))
+					return nil
+				},
+				End: func() error { ok = true; return nil },
+			})
+			if err != nil {
+				return err
+			}
+			if ok {
+				out = append(out, flatten(meta, rows))
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	return out
+}
+
+// parseBoth проверяет, что последовательный разбор и путь через spill дают
+// одно и то же, и возвращает результат.
+func parseBoth(t *testing.T, sql string) []parsed {
+	t.Helper()
+	inserts, _ := collect(t, sql)
+	var direct []parsed
+	for _, in := range inserts {
+		direct = append(direct, flatten(in.meta, in.rows))
+	}
+	spilled := collectSpill(t, sql)
+	if fmt.Sprint(direct) != fmt.Sprint(spilled) {
+		t.Fatalf("разбор расходится:\n Parse: %v\n spill: %v", direct, spilled)
+	}
+	return direct
+}
+
+func TestParseDialects(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want []parsed
+	}{
+		{
+			name: "MSSQL: имя из трёх частей",
+			sql:  "INSERT INTO [shop].[dbo].[users] ([email], [phone]) VALUES ('a@example.test', '555');",
+			want: []parsed{{"users(email,phone)", []string{"a@example.test|555"}}},
+		},
+		{
+			name: "MySQL/MSSQL: INSERT без INTO",
+			sql: "INSERT users (email) VALUES ('a');\n" +
+				"INSERT [dbo].[users] ([email]) VALUES ('b');",
+			want: []parsed{
+				{"users(email)", []string{"a"}},
+				{"users(email)", []string{"b"}},
+			},
+		},
+		{
+			name: "GRANT/TRIGGER с INSERT не дают таблицу",
+			sql: "GRANT INSERT, UPDATE ON users TO app;\n" +
+				"INSERT INTO users (email) VALUES ('a');",
+			want: []parsed{{"users(email)", []string{"a"}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseBoth(t, tt.sql)
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Fatalf("\n got %v\nwant %v", got, tt.want)
+			}
+		})
+	}
+}

@@ -169,7 +169,8 @@ func (s *session) end() error {
 
 func skipQuiet(reason string) bool {
 	switch reason {
-	case "INSERT ... SELECT", "INSERT ... SET", "нет VALUES", "пустой список колонок", "нет строк VALUES":
+	// «нет INTO» — INSERT как слово в GRANT/TRIGGER, а не оператор данных.
+	case "INSERT ... SELECT", "INSERT ... SET", "нет VALUES", "пустой список колонок", "нет строк VALUES", "нет INTO":
 		return true
 	default:
 		return false

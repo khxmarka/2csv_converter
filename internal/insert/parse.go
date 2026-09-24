@@ -99,10 +99,17 @@ func parseInsert(s *src, h Handler) error {
 		}
 		return err
 	}
+	// INTO необязателен в MySQL и MSSQL (INSERT users VALUES …). Без INTO и без
+	// идентификатора дальше (GRANT INSERT, UPDATE …) это не оператор данных.
 	if ok, err := s.tryKeyword("INTO"); err != nil {
 		return err
 	} else if !ok {
-		return skip("нет INTO", "")
+		if err := s.skipSpaceAndComments(); err != nil {
+			return err
+		}
+		if b, err := s.peek(); err != nil || !startsIdent(b) {
+			return skip("нет INTO", "")
+		}
 	}
 
 	table, err := parseTableName(s)
@@ -421,27 +428,34 @@ func skipModifiers(s *src) error {
 	}
 }
 
+// parseTableName берёт последний сегмент имени: table, schema.table и
+// db.schema.table (MSSQL [shop].[dbo].[users]) дают одно имя таблицы.
 func parseTableName(s *src) (string, error) {
 	part, err := parseIdent(s)
 	if err != nil {
 		return "", err
 	}
-	if err := s.skipSpaceAndComments(); err != nil {
-		return "", err
-	}
-	b, err := s.peek()
-	if err != nil && err != io.EOF {
-		return "", err
-	}
-	if err == nil && b == '.' {
-		_, _ = s.next()
-		next, err := parseIdent(s)
+	for {
+		if err := s.skipSpaceAndComments(); err != nil {
+			return "", err
+		}
+		b, err := s.peek()
+		if err == io.EOF || (err == nil && b != '.') {
+			return cleanIdent(part), nil
+		}
 		if err != nil {
 			return "", err
 		}
-		part = next
+		_, _ = s.next()
+		if part, err = parseIdent(s); err != nil {
+			return "", err
+		}
 	}
-	return cleanIdent(part), nil
+}
+
+// startsIdent — байт может начинать имя таблицы: слово или обрамление.
+func startsIdent(b byte) bool {
+	return identStart(b) || b == '`' || b == '"' || b == '[' || b == '\''
 }
 
 func parseIdent(s *src) (string, error) {
