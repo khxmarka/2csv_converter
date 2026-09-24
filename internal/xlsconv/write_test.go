@@ -138,6 +138,28 @@ func TestWriteTwoSheetsTwoFiles(t *testing.T) {
 	}
 }
 
+// §13: скрытые и очень скрытые листы тоже дают CSV; 5 листов — ещё в scope.
+func TestWriteHiddenAndFiveSheetsXLSX(t *testing.T) {
+	src := writeXLSX(t, []specSheet{
+		{Name: "Visible", Rows: [][]string{{"v"}}},
+		{Name: "Hidden", Rows: [][]string{{"h"}}, Hidden: true},
+		{Name: "Very", Rows: [][]string{{"w"}}, VeryHidden: true},
+		{Name: "Four", Rows: [][]string{{"4"}}},
+		{Name: "Five", Rows: [][]string{{"5"}}},
+	})
+	res := File(csvout.NewRegistry(), src)
+	if res.OpenErr != nil || res.WriteErr != nil || res.SkipTooMany || res.CSV != 5 {
+		t.Fatalf("результат: %+v", res)
+	}
+	dir := filepath.Dir(src)
+	if got := readFile(t, filepath.Join(dir, "book_Hidden.csv")); got != "\"h\"\n" {
+		t.Fatalf("скрытый лист: %q", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "book_Very.csv")); got != "\"w\"\n" {
+		t.Fatalf("очень скрытый лист: %q", got)
+	}
+}
+
 func TestWriteSixSheetsNoCSV(t *testing.T) {
 	sheets := make([]specSheet, 6)
 	for i := range sheets {
