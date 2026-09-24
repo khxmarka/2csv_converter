@@ -253,9 +253,9 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		return s.skipUntilSemicolon(true, false)
 	}
 	began := false
-	surplus := false
-	rows := 0
+	accepted := 0
 	expectRow := false
+	maxCells := len(cols)
 
 	begin := func() error {
 		if began {
@@ -266,6 +266,12 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 			return h.Begin(meta)
 		}
 		return nil
+	}
+
+	noteSurplus := func() {
+		if h.RowSurplus != nil {
+			h.RowSurplus()
+		}
 	}
 
 	for {
@@ -288,28 +294,41 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 			}
 			break
 		}
-		cells, err := parseRow(s)
-		if err != nil {
+		if h.StreamRow != nil {
+			if err := begin(); err != nil {
+				return err
+			}
+			err = h.StreamRow(func(cw CellWriter) error {
+				return emitRow(s, cw, maxCells)
+			})
+		} else {
+			var cells []Cell
+			cells, err = parseRow(s, maxCells)
+			if err == nil {
+				if err := begin(); err != nil {
+					return err
+				}
+				if h.Row != nil {
+					// Ошибка Row, кроме ErrRowSurplus, — I/O потребителя: стоп разбора.
+					if err = h.Row(cells); err != nil && !errors.Is(err, ErrRowSurplus) {
+						return err
+					}
+				}
+			}
+		}
+		switch {
+		case errors.Is(err, ErrRowSurplus):
+			noteSurplus()
+		case err != nil:
 			if began {
 				_ = skip("битый INSERT: "+err.Error(), table)
 				return nil
 			}
 			return skip("битый INSERT: "+err.Error(), table)
+		default:
+			accepted++
 		}
-		if len(cols) > 0 && len(cells) > len(cols) {
-			surplus = true
-		}
-		if !surplus {
-			if err := begin(); err != nil {
-				return err
-			}
-			if h.Row != nil {
-				if err := h.Row(cells); err != nil {
-					return err
-				}
-			}
-		}
-		rows++
+
 		if err := s.skipTailSpaceAndComments(); err != nil {
 			if errors.Is(err, errUnclosedBlockComment) {
 				return skip(err.Error(), table)
@@ -331,10 +350,8 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		break
 	}
 
-	if surplus {
-		return skip("значений больше, чем колонок", table)
-	}
-	if rows == 0 {
+	if accepted == 0 {
+		// Все строки отброшены по ширине: Skip сбросит начатый temp.
 		return skip("нет строк VALUES", table)
 	}
 	validTail, err := consumeTail(s)
@@ -619,141 +636,37 @@ func skipParenGroup(s *src) error {
 	}
 }
 
-func parseRow(s *src) ([]Cell, error) {
-	if err := s.skipSpaceAndComments(); err != nil {
-		return nil, err
-	}
-	b, err := s.peek()
-	if err != nil {
-		return nil, err
-	}
-	if b != '(' {
-		return nil, fmt.Errorf("ожидалась '(' строки VALUES")
-	}
-	_, _ = s.next()
-
-	var cells []Cell
-	expectValue := true
-	for {
-		if err := s.skipSpaceAndComments(); err != nil {
-			return nil, err
-		}
-		b, err := s.peek()
-		if err != nil {
-			return nil, err
-		}
-		if b == ')' {
-			if expectValue && len(cells) > 0 {
-				cells = append(cells, Cell{Kind: Missing})
-			}
-			_, _ = s.next()
-			return cells, nil
-		}
-		if b == ',' {
-			if expectValue {
-				cells = append(cells, Cell{Kind: Missing})
-			}
-			_, _ = s.next()
-			expectValue = true
-			continue
-		}
-		if !expectValue {
-			return nil, fmt.Errorf("между значениями нет запятой")
-		}
-		cell, err := parseValue(s)
-		if err != nil {
-			return nil, err
-		}
-		cells = append(cells, cell)
-		expectValue = false
-	}
+// parseRow собирает одну строку VALUES в []Cell для обработчика Row.
+// Разбор тот же, что у потокового StreamRow: один код для обоих путей.
+func parseRow(s *src, maxCells int) ([]Cell, error) {
+	var c cellCollector
+	err := emitRow(s, &c, maxCells)
+	return c.cells, err
 }
 
-func parseValue(s *src) (Cell, error) {
-	if err := s.skipSpaceAndComments(); err != nil {
-		return Cell{}, err
-	}
-	b, err := s.peek()
-	if err != nil {
-		return Cell{}, err
-	}
-	switch b {
-	case '\'':
-		text, err := readString(s, '\'')
-		return Cell{Kind: Text, Text: text}, err
-	case '"':
-		text, err := readString(s, '"')
-		return Cell{Kind: Text, Text: text}, err
-	case 'N', 'n', 'E', 'e':
-		// N'…' (MSSQL, Unicode) и E'…' (Postgres) — тот же строковый литерал,
-		// префикс в ячейку не идёт. NOW(), NULL и прочие слова — не литерал.
-		if q, ok := s.peekByte(1); ok && q == '\'' {
-			_, _ = s.next()
-			text, err := readString(s, '\'')
-			return Cell{Kind: Text, Text: text}, err
-		}
-	}
-
-	word, ok, err := s.peekUnquotedWord()
-	if err != nil {
-		return Cell{}, err
-	}
-	if ok && strings.EqualFold(word, "NULL") {
-		for range word {
-			_, _ = s.next()
-		}
-		return Cell{Kind: Null}, nil
-	}
-
-	text, err := readRawValue(s)
-	if err != nil {
-		return Cell{}, err
-	}
-	if text == "" {
-		return Cell{Kind: Missing}, nil
-	}
-	return Cell{Kind: Text, Text: text}, nil
+// cellCollector — CellWriter, который копит ячейки строки в память.
+type cellCollector struct {
+	cells []Cell
+	b     strings.Builder
 }
 
-func readString(s *src, quote byte) (string, error) {
-	if _, err := s.next(); err != nil {
-		return "", err
+func (c *cellCollector) Null() error {
+	c.cells = append(c.cells, Cell{Kind: Null})
+	return nil
+}
+
+func (c *cellCollector) Missing() error {
+	c.cells = append(c.cells, Cell{Kind: Missing})
+	return nil
+}
+
+func (c *cellCollector) Text(write func(io.Writer) error) error {
+	c.b.Reset()
+	if err := write(&c.b); err != nil {
+		return err
 	}
-	var b strings.Builder
-	for {
-		c, err := s.next()
-		if err != nil {
-			return "", err
-		}
-		if c == '\\' {
-			n, err := s.peek()
-			if err == io.EOF {
-				b.WriteByte('\\')
-				return b.String(), nil
-			}
-			if err != nil {
-				return "", err
-			}
-			_, _ = s.next()
-			if n == quote || n == '\\' {
-				b.WriteByte(n)
-				continue
-			}
-			b.WriteByte('\\')
-			b.WriteByte(n)
-			continue
-		}
-		if c == quote {
-			n, err := s.peek()
-			if err == nil && n == quote {
-				_, _ = s.next()
-				b.WriteByte(quote)
-				continue
-			}
-			return b.String(), nil
-		}
-		b.WriteByte(c)
-	}
+	c.cells = append(c.cells, Cell{Kind: Text, Text: c.b.String()})
+	return nil
 }
 
 func readRawValue(s *src) (string, error) {

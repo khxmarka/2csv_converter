@@ -2,6 +2,7 @@ package insert
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"io"
 	"strings"
@@ -51,6 +52,32 @@ func (s *src) next() (byte, error) {
 		s.line++
 	}
 	return b, nil
+}
+
+// plainRun — уже прочитанные в буфер байты до первого quote или '\\'.
+// Срез действителен до следующего чтения; сдвиг — через advance.
+func (s *src) plainRun(quote byte) []byte {
+	if s.br.Buffered() == 0 {
+		if _, err := s.br.Peek(1); err != nil {
+			return nil
+		}
+	}
+	buf, _ := s.br.Peek(s.br.Buffered())
+	end := len(buf)
+	if i := bytes.IndexByte(buf, quote); i >= 0 {
+		end = i
+	}
+	if i := bytes.IndexByte(buf[:end], '\\'); i >= 0 {
+		end = i
+	}
+	return buf[:end]
+}
+
+// advance пропускает chunk, только что полученный из plainRun.
+func (s *src) advance(chunk []byte) {
+	s.pos += int64(len(chunk))
+	s.line += bytes.Count(chunk, []byte{'\n'})
+	_, _ = s.br.Discard(len(chunk))
 }
 
 func (s *src) peek() (byte, error) {

@@ -588,3 +588,49 @@ func TestSlotAppendRollsBackAndContinues(t *testing.T) {
 		t.Fatalf("CSV после отката: %q", got)
 	}
 }
+
+// Строку с лишними значениями откатывают уже после выгрузки во временный
+// файл (ячейка больше dataMemLimit): в данных остаются только прежние строки.
+func TestDataFileRollbackAfterSpill(t *testing.T) {
+	d := CreateData(t.TempDir())
+	defer d.Abort()
+	if err := d.Row([]string{"keep"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.BeginRow(); err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("x", dataMemLimit+10)
+	if err := d.WriteTextCellStream(func(w io.Writer) error {
+		_, err := io.WriteString(w, big)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if d.f == nil {
+		t.Fatal("ожидалась выгрузка во временный файл")
+	}
+	if err := d.RollbackRow(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Row([]string{`a"b`, "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	src, err := d.open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "\"keep\"\n\"a\"\"b\",\"c\"\n"; string(got) != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	if d.rows != 2 || d.minCells != 1 || d.maxCells != 2 {
+		t.Fatalf("rows=%d min=%d max=%d", d.rows, d.minCells, d.maxCells)
+	}
+}

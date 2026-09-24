@@ -46,9 +46,10 @@ type Writer struct {
 
 // Result — итог успешного Commit.
 type Result struct {
-	Path       string
-	PaddedRows int
-	Appended   bool
+	Path        string
+	PaddedRows  int
+	Appended    bool
+	SkippedRows int // строки шире ключа, пропущенные при влитии
 }
 
 // Create открывает временный файл в dir. Заголовок пишется только если это

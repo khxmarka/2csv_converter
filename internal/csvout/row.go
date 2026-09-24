@@ -7,10 +7,11 @@ import (
 )
 
 // ErrTooManyValues — в строке VALUES больше ячеек, чем колонок в заголовке.
+// Означает пропуск этой строки, не всего INSERT.
 var ErrTooManyValues = errors.New("значений больше, чем колонок")
 
 // NormalizeRow приводит строку INSERT к ширине заголовка: NULL/дыры → "",
-// недостающие ячейки дополняются. Лишние значения — ошибка на весь INSERT.
+// недостающие ячейки дополняются. Лишние значения — ErrTooManyValues (строка).
 func NormalizeRow(cells []insert.Cell, nCol int) (row []string, padded bool, err error) {
 	if nCol < 0 {
 		nCol = 0

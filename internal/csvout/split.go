@@ -16,7 +16,12 @@ const (
 	SplitThreshold = 1_000_000
 	// SplitChunkRows — максимум строк данных в одном куске после нарезки.
 	SplitChunkRows = 500_000
+	// MaxRecordBytes — потолок одной CSV-записи при нарезке (защита от OOM).
+	MaxRecordBytes = 64 << 20
 )
+
+// ErrRecordTooLarge — одна запись CSV длиннее MaxRecordBytes.
+var ErrRecordTooLarge = errors.New("запись CSV длиннее допустимого")
 
 // HeaderMode задаёт, есть ли в CSV строка заголовка.
 type HeaderMode int
@@ -40,6 +45,7 @@ type SplitResult struct {
 var (
 	splitLimitThreshold = SplitThreshold
 	splitLimitChunk     = SplitChunkRows
+	splitLimitRecord    = MaxRecordBytes
 )
 
 // SetSplitLimits подменяет порог и размер куска до вызова restore.
@@ -49,6 +55,13 @@ func SetSplitLimits(threshold, chunkRows int) (restore func()) {
 	return func() {
 		splitLimitThreshold, splitLimitChunk = prevT, prevC
 	}
+}
+
+// SetMaxRecordBytes подменяет потолок записи для тестов.
+func SetMaxRecordBytes(n int) (restore func()) {
+	prev := splitLimitRecord
+	splitLimitRecord = n
+	return func() { splitLimitRecord = prev }
 }
 
 // SplitIfNeeded режет path, если строк данных больше SplitThreshold.
@@ -173,10 +186,6 @@ func walkRecords(path string, mode HeaderMode, fn func(rec []byte, header bool) 
 	}
 }
 
-// splitMaxRecord — предел одной записи CSV. Незакрытая кавычка в чужом файле
-// иначе делает весь остаток одной записью в памяти. Тесты его понижают.
-var splitMaxRecord = 64 << 20
-
 type recordReader struct {
 	br  *bufio.Reader
 	buf []byte
@@ -185,7 +194,14 @@ type recordReader struct {
 func (r *recordReader) next() ([]byte, error) {
 	r.buf = r.buf[:0]
 	inQuotes := false
+	limit := splitLimitRecord
+	if limit < 1 {
+		limit = MaxRecordBytes
+	}
 	for {
+		if len(r.buf) > limit {
+			return nil, fmt.Errorf("%w: %d байт", ErrRecordTooLarge, len(r.buf))
+		}
 		b, err := r.br.ReadByte()
 		if err == io.EOF {
 			if len(r.buf) == 0 {
@@ -195,9 +211,6 @@ func (r *recordReader) next() ([]byte, error) {
 		}
 		if err != nil {
 			return nil, err
-		}
-		if len(r.buf) >= splitMaxRecord {
-			return nil, fmt.Errorf("csvout: запись длиннее %d байт (незакрытая кавычка?)", splitMaxRecord)
 		}
 		r.buf = append(r.buf, b)
 		if inQuotes {

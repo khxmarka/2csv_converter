@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -223,9 +224,7 @@ func TestSplitFailureKeepsMonolithAndPreexistingParts(t *testing.T) {
 // Незакрытая кавычка в чужом CSV превращала остаток файла в одну запись
 // в памяти. Запись длиннее предела — ошибка нарезки, файл не тронут.
 func TestSplitRejectsOverlongRecord(t *testing.T) {
-	prev := splitMaxRecord
-	splitMaxRecord = 64
-	defer func() { splitMaxRecord = prev }()
+	defer SetMaxRecordBytes(64)()
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.csv")
@@ -300,6 +299,31 @@ func TestSplitRejectsConvertedAndNonCSV(t *testing.T) {
 	}
 	if res.Split || res.DataRows != 1 || fileSHA(t, csvPath) != before {
 		t.Fatalf("DATA.CSV: %+v", res)
+	}
+}
+
+func TestSplitRecordTooLargeKeepsOriginal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rows.csv")
+	restore := SetSplitLimits(2, 2)
+	defer restore()
+	restoreRec := SetMaxRecordBytes(64)
+	defer restoreRec()
+
+	var b strings.Builder
+	b.WriteString("\"h\"\n\"")
+	for range 200 {
+		b.WriteByte('x')
+	}
+	b.WriteString("\"\n\"a\"\n\"b\"\n\"c\"\n")
+	writeRaw(t, path, b.String())
+	before := fileSHA(t, path)
+	_, err := SplitIfNeeded(path, SplitWithHeader)
+	if err == nil || !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("ожидался ErrRecordTooLarge, got %v", err)
+	}
+	if fileSHA(t, path) != before {
+		t.Fatal("при ошибке нарезки монолит должен остаться")
 	}
 }
 

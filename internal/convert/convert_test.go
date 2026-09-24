@@ -3,6 +3,7 @@ package convert
 import (
 	"bufio"
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -301,6 +302,82 @@ INSERT INTO t (id, name, email, extra) VALUES (2, 'x', 'y', 'z');
 	}
 	if strings.Contains(log, "VALUES") || strings.Contains(log, "'x'") {
 		t.Fatal("тело VALUES не должно попадать в лог")
+	}
+}
+
+func TestSurplusRowKeepsValidRowsInSameInsert(t *testing.T) {
+	dir := t.TempDir()
+	sql := `INSERT INTO t (email, phone) VALUES ('a@example.test', '1'), ('b', '2', 'extra'), ('c@example.test', '3');`
+	res, log := runFile(t, dir, "dump.sql", sql)
+	if res.Created != 1 || res.CSV != 1 {
+		t.Fatalf("created=%d csv=%d log:\n%s", res.Created, res.CSV, log)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\"email\",\"phone\"\n\"a@example.test\",\"1\"\n\"c@example.test\",\"3\"\n"
+	if string(raw) != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", raw, want)
+	}
+	if !strings.Contains(log, "1 строк пропущено") {
+		t.Fatalf("нужен счётчик surplus:\n%s", log)
+	}
+	if strings.Contains(log, "extra") || strings.Contains(log, "VALUES") {
+		t.Fatal("тело VALUES не должно попадать в лог")
+	}
+}
+
+func TestLargeCellStreamsWithoutFullBuffer(t *testing.T) {
+	dir := t.TempDir()
+	const n = 2_000_000
+	path := filepath.Join(dir, "big.sql")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(f, "INSERT INTO t (email, phone) VALUES ('"); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64*1024)
+	for i := range buf {
+		buf[i] = 'x'
+	}
+	left := n
+	for left > 0 {
+		chunk := buf
+		if left < len(chunk) {
+			chunk = buf[:left]
+		}
+		if _, err := f.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		left -= len(chunk)
+	}
+	if _, err := io.WriteString(f, "', '555');"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf bytes.Buffer
+	res := Schedule(logx.New(&logBuf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"}, nil)
+	if res.Created != 1 || res.CSV != 1 {
+		t.Fatalf("created=%d csv=%d log:\n%s", res.Created, res.CSV, logBuf.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := "\"email\",\"phone\"\n\""
+	wantSuffix := "\",\"555\"\n"
+	if !strings.HasPrefix(string(raw), wantPrefix) || !strings.HasSuffix(string(raw), wantSuffix) {
+		t.Fatalf("обёртка CSV сломана, len=%d", len(raw))
+	}
+	body := string(raw[len(wantPrefix) : len(raw)-len(wantSuffix)])
+	if len(body) != n {
+		t.Fatalf("тело ячейки: len=%d want %d", len(body), n)
 	}
 }
 

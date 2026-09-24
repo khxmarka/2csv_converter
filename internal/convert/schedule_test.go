@@ -69,11 +69,11 @@ func TestScheduleRowWidthFollowsKeyWidth(t *testing.T) {
 			wantCreated: 1,
 		},
 		{
-			name: "без колонок: строка длиннее первой отбрасывает INSERT",
+			name: "без колонок: строка шире ключа пропускается одна (PR #6)",
 			sql: "INSERT INTO users VALUES ('a','b');\n" +
 				"INSERT INTO users VALUES ('c','d'),('e','f','g');\n",
-			want:        "\"a\",\"b\"\n",
-			wantCreated: 1,
+			want:        "\"a\",\"b\"\n\"c\",\"d\"\n",
+			wantCreated: 2,
 		},
 		{
 			name: "значений больше ширины ключа",
@@ -160,6 +160,38 @@ func TestScheduleGrantInsertIsQuiet(t *testing.T) {
 	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path}, nil)
 	if res.Created != 1 || res.UnitFail != 0 || buf.Len() != 0 {
 		t.Fatalf("GRANT INSERT не ошибка: %+v log=%q", res, buf.String())
+	}
+}
+
+// Файл со скриншота: одна строка INSERT шире списка колонок. Раньше весь
+// INSERT на ~190 строк отбрасывался и CSV не было. Теперь пропадает одна
+// строка (error со счётчиком), остальные в CSV; исходник удалять нельзя —
+// пропущенная строка есть только в нём (проверяет app).
+func TestScheduleOneWideRowKeepsRestOfInsert(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "interestedtoparticipate.sql")
+	sql := "INSERT INTO `interestedtoparticipate` (`id`, `email`, `mobile`) VALUES\n" +
+		"(1, 'a@example.test', '1'),\n" +
+		"(2, 'b@example.test', '2', 'EXTRA'),\n" +
+		"(3, 'c@example.test', '3');\n"
+	if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path}, nil)
+	if res.Created != 1 || res.CSV != 1 || res.UnitFail != 1 {
+		t.Fatalf("%+v log=%q", res, buf.String())
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "interestedtoparticipate.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\"id\",\"email\",\"mobile\"\n\"1\",\"a@example.test\",\"1\"\n\"3\",\"c@example.test\",\"3\"\n"
+	if string(got) != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+	if !strings.Contains(buf.String(), "1 строк пропущено") || strings.Contains(buf.String(), "EXTRA") {
+		t.Fatalf("лог: %q", buf.String())
 	}
 }
 
