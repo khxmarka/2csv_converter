@@ -44,6 +44,14 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 		log.Errorf("%s: %v", sql.Path, err)
 		return Result{Skipped: 1, Failed: true}
 	}
+	// Воркеры читают хвосты INSERT через ReadAt по своему дескриптору: сканер
+	// идёт по f последовательно, а временных файлов на INSERT больше нет.
+	// Закрывается после q (defer ниже выполняется раньше).
+	body, err := os.Open(sql.Path)
+	if err != nil {
+		return Result{OpenErr: err}
+	}
+	defer body.Close()
 
 	q := newCommitQ()
 	done := q.start(func(rec any) {
@@ -76,14 +84,12 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 			})
 			return true, nil
 		},
-		SpillDir: st.dir,
-		ValuesFile: func(meta insert.Meta, path string) error {
+		ValuesAt: func(meta insert.Meta, off, n int64) error {
 			meta.Columns = append([]string(nil), meta.Columns...)
 			fill := q.reserve()
 			submit(func() {
 				var apply func()
 				defer func() {
-					_ = os.Remove(path)
 					if rec := recover(); rec != nil {
 						apply = func() {
 							st.skipped++
@@ -96,17 +102,7 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 					}
 					fill(apply)
 				}()
-				src, err := os.Open(path)
-				if err != nil {
-					apply = func() {
-						st.skipped++
-						st.failed = true
-						st.log.Errorf("%s таблица %s: %v", st.sql.Path, meta.Table, err)
-					}
-					return
-				}
-				prep := prepareInsert(st.dir, meta, src)
-				_ = src.Close()
+				prep := prepareInsert(st.dir, meta, io.NewSectionReader(body, off, n))
 				apply = func() { st.apply(meta, prep) }
 			})
 			return nil
@@ -141,11 +137,7 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 	}()
 	err := insert.ParseValues(body, meta, insert.Handler{
 		Begin: func(insert.Meta) error {
-			d, err := csvout.CreateData(dir)
-			if err != nil {
-				return err
-			}
-			data = d
+			data = csvout.CreateData(dir)
 			return nil
 		},
 		// Строка не дополняется до списка колонок этого INSERT: арность
@@ -206,7 +198,7 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 		return
 	}
 	defer prep.data.Abort()
-	res, err := csvout.CommitPrepared(s.reg, s.dir, meta.Table, meta.Columns, prep.data.Path())
+	res, err := csvout.CommitPrepared(s.reg, s.dir, meta.Table, meta.Columns, prep.data)
 	if err != nil {
 		if errors.Is(err, csvout.ErrTooManyValues) {
 			s.skipped++

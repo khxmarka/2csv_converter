@@ -227,26 +227,25 @@ func parseInsert(s *src, h Handler) error {
 			return s.skipUntilSemicolon(true, false)
 		}
 	}
-	if h.ValuesFile != nil {
-		path, err := s.spillUntilSemicolon(h.SpillDir)
-		if err != nil {
+	if h.ValuesAt != nil {
+		off := s.pos
+		if err := s.skipUntilSemicolon(true, false); err != nil {
 			return err
 		}
-		return h.ValuesFile(meta, path)
-	}
-	if h.Values != nil {
-		body, err := s.captureUntilSemicolon()
-		if err != nil {
-			return err
-		}
-		return h.Values(meta, body)
+		return h.ValuesAt(meta, off, s.pos-off)
 	}
 	return parseValueRows(s, h, meta)
 }
 
 // ParseValues разбирает уже вырезанный хвост одного INSERT ... VALUES.
+// Для io.SectionReader буфер не больше самого хвоста: однострочный INSERT
+// не должен выделять полный буфер чтения.
 func ParseValues(r io.Reader, meta Meta, h Handler) error {
-	return parseValueRows(newSrc(r), h, meta)
+	size := readBuf
+	if sized, ok := r.(interface{ Size() int64 }); ok && sized.Size() < int64(size) {
+		size = int(sized.Size())
+	}
+	return parseValueRows(newSrcSize(r, size), h, meta)
 }
 
 func parseValueRows(s *src, h Handler, meta Meta) error {

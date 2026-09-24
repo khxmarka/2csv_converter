@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,6 +102,50 @@ func TestScheduleRowWidthFollowsKeyWidth(t *testing.T) {
 				t.Fatalf("CSV:\n got %q\nwant %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// INSERT больше лимита памяти DataFile уходит во временный файл; строки
+// короче шапки дополняются при повторном чтении. Temp-файлов не остаётся.
+func TestScheduleLargeInsertSpillsAndPads(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.sql")
+	const rows = 40_000 // ≈ 2 МБ строк: больше dataMemLimit
+	var sql strings.Builder
+	sql.WriteString("INSERT INTO users (id, email, name) VALUES ")
+	for i := range rows {
+		if i > 0 {
+			sql.WriteByte(',')
+		}
+		n := strconv.Itoa(i)
+		sql.WriteString("(" + n + ",'user" + n + "@example.test')")
+	}
+	sql.WriteString(";\n")
+	if err := os.WriteFile(path, []byte(sql.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := Schedule(logx.New(&discardLog{}), csvout.NewRegistry(), scan.SQLFile{Path: path}, nil)
+	if res.Failed || res.Created != 1 {
+		t.Fatalf("%+v", res)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "users.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+	if len(lines) != rows+1 {
+		t.Fatalf("строк %d, ожидалось %d", len(lines), rows+1)
+	}
+	if lines[rows] != "\"39999\",\"user39999@example.test\",\"\"" {
+		t.Fatalf("последняя строка: %q", lines[rows])
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ".2csv-*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("временные файлы: %v", matches)
 	}
 }
 

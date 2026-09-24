@@ -625,14 +625,19 @@ func TestBeforeValuesSkipsCells(t *testing.T) {
 	}
 }
 
-func TestValuesHandlerReceivesTail(t *testing.T) {
-	var got []byte
-	err := Parse(strings.NewReader("INSERT INTO users (email) VALUES ('a@example.test'); INSERT INTO t SELECT 1;"), Handler{
-		Values: func(m Meta, body []byte) error {
+// ValuesAt отдаёт смещения хвоста от начала потока (с BOM): вызывающий
+// читает диапазон из того же файла и разбирает его ParseValues.
+func TestValuesAtReportsStreamOffsets(t *testing.T) {
+	sql := "\xEF\xBB\xBFINSERT INTO users (email) VALUES ('a@example.test');\n" +
+		"INSERT INTO t SELECT 1;\n" +
+		"INSERT INTO users (email) VALUES ('b@example.test'), ('c');"
+	var tails []string
+	err := Parse(strings.NewReader(sql), Handler{
+		ValuesAt: func(m Meta, off, n int64) error {
 			if m.Table != "users" {
 				t.Fatalf("таблица %s", m.Table)
 			}
-			got = append([]byte(nil), body...)
+			tails = append(tails, sql[off:off+n])
 			return nil
 		},
 		Row: func([]Cell) error {
@@ -643,48 +648,21 @@ func TestValuesHandlerReceivesTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(got), "'a@example.test'") {
-		t.Fatalf("хвост: %q", got)
+	want := []int{1, 2}
+	if len(tails) != len(want) {
+		t.Fatalf("хвосты: %q", tails)
 	}
-	res := 0
-	if err := ParseValues(bytes.NewReader(got), Meta{Table: "users", Columns: []string{"email"}}, Handler{
-		Row: func(cells []Cell) error {
-			res += len(cells)
-			return nil
-		},
-	}); err != nil {
-		t.Fatal(err)
+	for i, tail := range tails {
+		rows := 0
+		if err := ParseValues(strings.NewReader(tail), Meta{Table: "users", Columns: []string{"email"}}, Handler{
+			Row: func([]Cell) error { rows++; return nil },
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if rows != want[i] {
+			t.Fatalf("хвост %q: строк %d, ожидалось %d", tail, rows, want[i])
+		}
 	}
-	if res != 1 {
-		t.Fatalf("ячеек в хвосте: %d", res)
-	}
-}
-
-func TestValuesFileDoesNotKeepTailInMemory(t *testing.T) {
-	dir := t.TempDir()
-	var path string
-	err := Parse(strings.NewReader("INSERT INTO users (email) VALUES ('a@example.test');"), Handler{
-		SpillDir: dir,
-		ValuesFile: func(m Meta, p string) error {
-			path = p
-			return nil
-		},
-		Row: func([]Cell) error {
-			t.Fatal("сканер не должен разбирать ячейки")
-			return nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(raw), "'a@example.test'") {
-		t.Fatalf("хвост: %q", raw)
-	}
-	_ = os.Remove(path)
 }
 
 // parsed — INSERT в виде, удобном для сравнения: «таблица(колонки)» и строки
@@ -710,24 +688,16 @@ func flatten(meta Meta, rows [][]Cell) parsed {
 	return p
 }
 
-// collectSpill идёт продакшен-путём: сканер режет хвост statement в файл
-// (ValuesFile), ячейки разбирает ParseValues.
+// collectSpill идёт продакшен-путём: сканер отдаёт границы хвоста statement
+// (ValuesAt), ячейки из этого диапазона разбирает ParseValues.
 func collectSpill(t *testing.T, sql string) []parsed {
 	t.Helper()
 	var out []parsed
-	dir := t.TempDir()
 	err := Parse(strings.NewReader(sql), Handler{
-		SpillDir: dir,
-		ValuesFile: func(meta Meta, path string) error {
-			defer os.Remove(path)
-			f, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
+		ValuesAt: func(meta Meta, off, n int64) error {
 			var rows [][]Cell
 			ok := false
-			err = ParseValues(f, meta, Handler{
+			err := ParseValues(io.NewSectionReader(strings.NewReader(sql), off, n), meta, Handler{
 				Row: func(cells []Cell) error {
 					rows = append(rows, append([]Cell(nil), cells...))
 					return nil

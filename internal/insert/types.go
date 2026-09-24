@@ -39,14 +39,11 @@ type Handler struct {
 	// BeforeValues вызывается после списка колонок и до разбора ячеек VALUES.
 	// skip=true — хвост statement пропускается без Cell.
 	BeforeValues func(Meta) (skip bool, err error)
-	// Values забирает сырой хвост statement в память.
-	// Для больших INSERT задайте ValuesFile: хвост пишется во временный файл.
-	Values func(Meta, []byte) error
-	// ValuesFile получает путь к файлу с хвостом statement. Файл уже закрыт.
-	// Вызывающий удаляет его. Если задан, Values игнорируется.
-	ValuesFile func(Meta, string) error
-	// SpillDir — каталог временного файла для ValuesFile. Пусто — TempDir.
-	SpillDir string
+	// ValuesAt получает границы хвоста statement (после VALUES, до ';'
+	// включительно) как смещение и длину от начала потока. Сканер ячейки не
+	// разбирает и хвост не копирует: вызывающий читает диапазон сам
+	// (io.SectionReader по тому же файлу) и разбирает его ParseValues.
+	ValuesAt func(meta Meta, off, n int64) error
 	Begin    func(Meta) error
 	Row      func([]Cell) error
 	End      func() error
