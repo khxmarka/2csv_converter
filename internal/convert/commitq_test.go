@@ -8,7 +8,7 @@ import (
 
 func TestCommitQueueKeepsReserveOrder(t *testing.T) {
 	q := newCommitQ()
-	done := q.start()
+	done := q.start(nil)
 	fill1 := q.reserve()
 	fill2 := q.reserve()
 
@@ -39,7 +39,8 @@ func TestCommitQueueKeepsReserveOrder(t *testing.T) {
 
 func TestCommitQueueSurvivesApplyPanic(t *testing.T) {
 	q := newCommitQ()
-	done := q.start()
+	var recovered any
+	done := q.start(func(rec any) { recovered = rec })
 	fill1 := q.reserve()
 	fill2 := q.reserve()
 	var got int
@@ -50,12 +51,15 @@ func TestCommitQueueSurvivesApplyPanic(t *testing.T) {
 	if got != 2 {
 		t.Fatal("после паники в одном INSERT остальные должны записаться")
 	}
+	if recovered != "boom" {
+		t.Fatalf("паника не передана обработчику: %v", recovered)
+	}
 }
 
 func TestCommitQueueBoundsInFlight(t *testing.T) {
 	q := newCommitQ()
 	q.limit = 1
-	done := q.start()
+	done := q.start(nil)
 	fill1 := q.reserve()
 
 	second := make(chan struct{})

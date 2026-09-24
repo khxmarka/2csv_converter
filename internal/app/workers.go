@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -20,21 +21,10 @@ import (
 
 const maxWorkers = 16
 
-func workerCount(files int) int {
-	if files <= 0 {
-		return 0
-	}
-	n := runtime.GOMAXPROCS(0)
-	if n < 1 {
-		n = 1
-	}
-	if n > maxWorkers {
-		n = maxWorkers
-	}
-	if n > files {
-		n = files
-	}
-	return n
+// poolSize — N воркеров на весь запуск: min(GOMAXPROCS, 16), не меньше 1 (§9).
+// Числом файлов не ограничивается: INSERT одного файла тоже идут в этот пул.
+func poolSize() int {
+	return min(max(runtime.GOMAXPROCS(0), 1), maxWorkers)
 }
 
 func folderName(f scan.SQLFile) string {
@@ -260,15 +250,40 @@ func (a *accumulator) refreshHang() {
 	}
 	sort.Slice(folders, func(i, j int) bool { return folders[i].name < folders[j].name })
 	now := time.Now()
+	label := func(f activeFolder) string {
+		return fmt.Sprintf("%s (%d с)", f.name, max(int(now.Sub(f.start)/time.Second), 0))
+	}
 	parts := make([]string, len(folders))
 	for i, folder := range folders {
-		sec := int(now.Sub(folder.start) / time.Second)
-		if sec < 0 {
-			sec = 0
-		}
-		parts[i] = fmt.Sprintf("%s (%d с)", folder.name, sec)
+		parts[i] = label(folder)
 	}
-	a.log.Hang("папка в обработке: " + strings.Join(parts, ", "))
+	const prefix = "папка в обработке: "
+	line := prefix + strings.Join(parts, ", ")
+	if logx.DisplayWidth(line) > logx.HangWidth {
+		// §8: все не влезают — самая давняя. Строка длиннее экрана переносится,
+		// и \r затирает только её хвост: каждую секунду в консоли мусор.
+		oldest := slices.MinFunc(folders, func(x, y activeFolder) int { return x.start.Compare(y.start) })
+		line = truncateWidth(prefix+label(oldest), logx.HangWidth)
+	}
+	a.log.Hang(line)
+}
+
+// truncateWidth обрезает s до width колонок, заменяя хвост на «…».
+func truncateWidth(s string, width int) string {
+	if logx.DisplayWidth(s) <= width {
+		return s
+	}
+	var b strings.Builder
+	w := 0
+	for _, r := range s {
+		rw := logx.DisplayWidth(string(r))
+		if w+rw > width-1 {
+			break
+		}
+		b.WriteRune(r)
+		w += rw
+	}
+	return b.String() + "…"
 }
 
 func (a *accumulator) tickHang() {
@@ -414,31 +429,19 @@ func outcomeFromConvert(fr convert.Result) fileOutcome {
 	}
 }
 
-func convertOne(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (out fileOutcome) {
+func convertExcel(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (out fileOutcome) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Errorf("%s: сбой обработки (%v), файл пропущен", file.Path, rec)
 			out = fileOutcome{skipped: 1, failed: true}
 		}
 	}()
-	if file.IsExcel() {
-		xr := xlsconv.File(reg, file.Path)
-		return fileOutcome{
-			openErr:     xr.OpenErr,
-			writeErr:    xr.WriteErr,
-			csv:         xr.CSV,
-			skipTooMany: xr.SkipTooMany,
-		}
-	}
-	fr := convert.File(log, reg, file)
+	xr := xlsconv.File(reg, file.Path)
 	return fileOutcome{
-		openErr:  fr.OpenErr,
-		created:  fr.Created,
-		skipped:  fr.Skipped,
-		csv:      fr.CSV,
-		failed:   fr.Failed,
-		piiSkip:  fr.PIISkip,
-		unitFail: fr.UnitFail,
+		openErr:     xr.OpenErr,
+		writeErr:    xr.WriteErr,
+		csv:         xr.CSV,
+		skipTooMany: xr.SkipTooMany,
 	}
 }
 
@@ -484,7 +487,7 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 	}
 	for _, file := range excels {
 		acc.start(file)
-		out := convertOne(log, reg, file)
+		out := convertExcel(log, reg, file)
 		acc.record(file, out)
 		if producedCSV(out) {
 			produced = append(produced, file)
@@ -500,14 +503,20 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 			acc.record(file, fileOutcome{})
 			continue
 		}
-		acc.record(file, splitForeignCSV(log, file.Path))
+		acc.record(file, splitForeignCSV(log, reg, file))
 	}
 	for _, file := range produced {
 		removeSource(log, file.Path)
 	}
 }
 
+// producedCSV — исходник можно удалить (§15): CSV получен и ни одна единица
+// файла не провалилась. Иначе удаление унесло бы INSERT или лист, которые
+// в CSV не попали (ошибка записи, лишние значения, занятое имя).
 func producedCSV(out fileOutcome) bool {
+	if out.writeErr != nil || out.failed || out.unitFail > 0 {
+		return false
+	}
 	return out.created > 0 || out.csv > 0
 }
 

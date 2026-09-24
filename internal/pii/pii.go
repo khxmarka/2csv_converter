@@ -3,6 +3,7 @@
 package pii
 
 import (
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -57,11 +58,12 @@ func MatchColumns(names []string) bool {
 			continue
 		}
 		seen[key] = struct{}{}
-		if hasDocumentIdentifier(trimmed) {
+		switch {
+		case hasDocumentIdentifier(trimmed):
 			matched++
-		} else if Match(trimmed) && !isTechnicalIdentifier(trimmed) {
+		case Match(trimmed) && !isTechnicalIdentifier(trimmed):
 			matched++
-		} else {
+		default:
 			continue
 		}
 		if matched >= minColumns {
@@ -105,12 +107,7 @@ func isTechnicalIdentifier(name string) bool {
 
 func isIDKeyword(part string) bool {
 	trimmed := trimTrailingDigits(strings.ToLower(part))
-	for _, suffix := range idSuffixes {
-		if trimmed == suffix {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(idSuffixes, trimmed)
 }
 
 func hasCamelIDSuffix(part string) bool {
@@ -228,7 +225,7 @@ func isDigits(s string) bool {
 func buildTerms() ([]string, map[string]struct{}) {
 	set := make(map[string]struct{})
 	addWords := func(raw string) {
-		for _, term := range strings.Fields(raw) {
+		for term := range strings.FieldsSeq(raw) {
 			set[strings.ToLower(term)] = struct{}{}
 		}
 	}

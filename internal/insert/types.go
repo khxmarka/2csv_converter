@@ -1,12 +1,23 @@
 // Package insert — потоковый разбор INSERT ... VALUES из io.Reader (§4 политики).
 package insert
 
+import (
+	"errors"
+	"io"
+)
+
 // Meta — заголовок одного оператора INSERT.
 type Meta struct {
 	Table   string
 	Columns []string
 	Offset  int64
 	Line    int
+	// ValuesLine — строка файла, с которой начинается хвост после VALUES.
+	// ParseValues по ней считает абсолютные номера строк (Handler.Cut).
+	ValuesLine int
+	// ValuesOffset — байт файла, с которого начинается хвост после VALUES:
+	// ParseValues по нему считает абсолютный байт места ошибки.
+	ValuesOffset int64
 }
 
 // Kind — тип ячейки VALUES.
@@ -33,22 +44,42 @@ type Skip struct {
 	Reason string
 }
 
+// ErrRowSurplus — строка VALUES шире допустимой; INSERT не отменяется.
+var ErrRowSurplus = errors.New("значений больше, чем колонок")
+
+// CellWriter принимает ячейки одной строки VALUES без хранения всего текста в слайсе.
+type CellWriter interface {
+	Null() error
+	Missing() error
+	// Text копирует декодированный SQL-текст значения в w (без SQL-кавычек).
+	Text(write func(w io.Writer) error) error
+}
+
 // Handler принимает события разбора. Нил-колбэки пропускаются.
 // Ошибка из Begin/Row/End останавливает разбор (это I/O потребителя, не SQL).
 type Handler struct {
 	// BeforeValues вызывается после списка колонок и до разбора ячеек VALUES.
 	// skip=true — хвост statement пропускается без Cell.
 	BeforeValues func(Meta) (skip bool, err error)
-	// Values забирает сырой хвост statement в память.
-	// Для больших INSERT задайте ValuesFile: хвост пишется во временный файл.
-	Values func(Meta, []byte) error
-	// ValuesFile получает путь к файлу с хвостом statement. Файл уже закрыт.
-	// Вызывающий удаляет его. Если задан, Values игнорируется.
-	ValuesFile func(Meta, string) error
-	// SpillDir — каталог временного файла для ValuesFile. Пусто — TempDir.
-	SpillDir string
+	// ValuesAt получает границы хвоста statement (после VALUES, до ';'
+	// включительно) как смещение и длину от начала потока. Сканер ячейки не
+	// разбирает и хвост не копирует: вызывающий читает диапазон сам
+	// (io.SectionReader по тому же файлу) и разбирает его ParseValues.
+	ValuesAt func(meta Meta, off, n int64) error
 	Begin    func(Meta) error
-	Row      func([]Cell) error
-	End      func() error
-	Skip     func(Skip)
+	// Row получает одну разобранную строку VALUES.
+	// Вернуть ErrRowSurplus — пропустить только эту строку.
+	Row func([]Cell) error
+	// StreamRow, если задан, используется вместо Row: пишет строку без []Cell.
+	// emit заполняет ячейки текущей tuple; потребитель пишет CSV сам.
+	// Вернуть ErrRowSurplus — пропустить строку; остальные строки INSERT продолжаются.
+	StreamRow func(emit func(CellWriter) error) error
+	// RowSurplus вызывается один раз на каждую пропущенную из‑за ширины строку.
+	RowSurplus func()
+	// Cut — INSERT оборван после принятых строк (обрезанный дамп, битая
+	// последняя строка): принятые строки остаются, дальше вызывается End.
+	// line — строка файла, где оборвалось.
+	Cut  func(reason string, line int)
+	End  func() error
+	Skip func(Skip)
 }

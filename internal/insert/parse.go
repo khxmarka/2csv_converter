@@ -68,6 +68,13 @@ func seekInsert(s *src) (bool, error) {
 				}
 				return false, err
 			}
+		case b == '$':
+			if err := s.skipDollarQuoted(); err != nil {
+				if err == io.EOF {
+					return false, nil
+				}
+				return false, err
+			}
 		case identStart(b):
 			word, err := s.consumeUnquotedWord()
 			if err != nil {
@@ -99,10 +106,17 @@ func parseInsert(s *src, h Handler) error {
 		}
 		return err
 	}
+	// INTO необязателен в MySQL и MSSQL (INSERT users VALUES …). Без INTO и без
+	// идентификатора дальше (GRANT INSERT, UPDATE …) это не оператор данных.
 	if ok, err := s.tryKeyword("INTO"); err != nil {
 		return err
 	} else if !ok {
-		return skip("нет INTO", "")
+		if err := s.skipSpaceAndComments(); err != nil {
+			return err
+		}
+		if b, err := s.peek(); err != nil || !startsIdent(b) {
+			return skip("нет INTO", "")
+		}
 	}
 
 	table, err := parseTableName(s)
@@ -110,7 +124,8 @@ func parseInsert(s *src, h Handler) error {
 		if err == io.EOF {
 			return skip("незакрытый INSERT", "")
 		}
-		return skip(err.Error(), "")
+		// Обычно это склеенная/повреждённая строка дампа: «INSERT INTO pre_ucente119.220…».
+		return skip("битое имя таблицы после INSERT INTO: "+err.Error(), "")
 	}
 	if table == "" {
 		return skip("пустое имя таблицы", "")
@@ -142,8 +157,8 @@ func parseInsert(s *src, h Handler) error {
 	var cols []string
 	valuesSeen := false
 
-	switch {
-	case b == '(':
+	switch b {
+	case '(':
 		cols, err = parseColumnList(s)
 		if err != nil {
 			if err == io.EOF {
@@ -194,11 +209,6 @@ func parseInsert(s *src, h Handler) error {
 			} else if ok {
 				return skip("INSERT ... SET", table)
 			}
-			if ok, err := s.tryKeyword("SELECT"); err != nil {
-				return err
-			} else if ok {
-				return skip("INSERT ... SELECT", table)
-			}
 			return skip("нет VALUES", table)
 		}
 	}
@@ -213,26 +223,31 @@ func parseInsert(s *src, h Handler) error {
 			return s.skipUntilSemicolon(true, false)
 		}
 	}
-	if h.ValuesFile != nil {
-		path, err := s.spillUntilSemicolon(h.SpillDir)
-		if err != nil {
+	if h.ValuesAt != nil {
+		meta.ValuesLine = s.line
+		off := s.pos
+		meta.ValuesOffset = off
+		if err := s.skipUntilSemicolon(true, false); err != nil {
 			return err
 		}
-		return h.ValuesFile(meta, path)
-	}
-	if h.Values != nil {
-		body, err := s.captureUntilSemicolon()
-		if err != nil {
-			return err
-		}
-		return h.Values(meta, body)
+		return h.ValuesAt(meta, off, s.pos-off)
 	}
 	return parseValueRows(s, h, meta)
 }
 
 // ParseValues разбирает уже вырезанный хвост одного INSERT ... VALUES.
+// Для io.SectionReader буфер не больше самого хвоста: однострочный INSERT
+// не должен выделять полный буфер чтения.
 func ParseValues(r io.Reader, meta Meta, h Handler) error {
-	return parseValueRows(newSrc(r), h, meta)
+	size := readBuf
+	if sized, ok := r.(interface{ Size() int64 }); ok && sized.Size() < int64(size) {
+		size = int(sized.Size())
+	}
+	s := newSrcSize(r, size)
+	if meta.ValuesLine > 0 {
+		s.line = meta.ValuesLine
+	}
+	return parseValueRows(s, h, meta)
 }
 
 func parseValueRows(s *src, h Handler, meta Meta) error {
@@ -245,9 +260,13 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		return s.skipUntilSemicolon(true, false)
 	}
 	began := false
-	surplus := false
-	rows := 0
+	accepted := 0
+	// cut — INSERT оборван после принятых строк (обрезанный дамп): строки
+	// выше сохраняются, причина и строка файла уходят в Handler.Cut.
+	var cut string
+	cutLine := 0
 	expectRow := false
+	maxCells := len(cols)
 
 	begin := func() error {
 		if began {
@@ -260,6 +279,12 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		return nil
 	}
 
+	noteSurplus := func() {
+		if h.RowSurplus != nil {
+			h.RowSurplus()
+		}
+	}
+
 	for {
 		if err := s.skipSpaceAndComments(); err != nil {
 			return err
@@ -267,7 +292,11 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		b, err := s.peek()
 		if err == io.EOF {
 			if expectRow {
-				return skip("после запятой нет строки VALUES", table)
+				if accepted > 0 {
+					cut = "после запятой нет строки VALUES"
+				} else {
+					return skip("после запятой нет строки VALUES", table)
+				}
 			}
 			break
 		}
@@ -276,33 +305,67 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		}
 		if b != '(' {
 			if expectRow {
-				return skip("после запятой нет строки VALUES", table)
+				if accepted > 0 {
+					cut = "после запятой нет строки VALUES"
+				} else {
+					return skip("после запятой нет строки VALUES", table)
+				}
 			}
 			break
 		}
-		expectRow = false
-		cells, err := parseRow(s)
-		if err != nil {
-			if began {
-				_ = skip("битый INSERT: "+err.Error(), table)
-				return nil
-			}
-			return skip("битый INSERT: "+err.Error(), table)
-		}
-		if len(cols) > 0 && len(cells) > len(cols) {
-			surplus = true
-		}
-		if !surplus {
+		if h.StreamRow != nil {
 			if err := begin(); err != nil {
 				return err
 			}
-			if h.Row != nil {
-				if err := h.Row(cells); err != nil {
+			err = h.StreamRow(func(cw CellWriter) error {
+				return emitRow(s, cw, maxCells)
+			})
+		} else {
+			var cells []Cell
+			cells, err = parseRow(s, maxCells)
+			if err == nil {
+				if err := begin(); err != nil {
 					return err
+				}
+				if h.Row != nil {
+					// Ошибка Row, кроме ErrRowSurplus, — I/O потребителя: стоп разбора.
+					if err = h.Row(cells); err != nil && !errors.Is(err, ErrRowSurplus) {
+						return err
+					}
 				}
 			}
 		}
-		rows++
+		switch {
+		case errors.Is(err, ErrRowSurplus):
+			noteSurplus()
+		case err != nil && accepted > 0 && errors.Is(err, io.EOF):
+			// Дамп оборван посреди строки (кончился файл/хвост): целые строки
+			// выше сохраняем. Синтаксический мусор посреди файла — как раньше,
+			// весь INSERT в пропуск.
+			cut = "битая строка VALUES: " + err.Error()
+			cutLine = s.line
+			if err := s.skipUntilSemicolon(true, false); err != nil {
+				return err
+			}
+		case err != nil:
+			// Место ошибки — строка и байт файла: по ним видно, что в дампе
+			// (дамп INSERT часто одна строка на мегабайты).
+			reason := fmt.Sprintf("битый INSERT: %v (строка %d, байт %d)", err, s.line, meta.ValuesOffset+s.pos)
+			if errors.Is(err, io.EOF) {
+				reason = fmt.Sprintf("INSERT оборван концом файла, целых строк нет (строка %d)", s.line)
+			}
+			if began {
+				_ = skip(reason, table)
+				return nil
+			}
+			return skip(reason, table)
+		default:
+			accepted++
+		}
+		if cut != "" {
+			break
+		}
+
 		if err := s.skipTailSpaceAndComments(); err != nil {
 			if errors.Is(err, errUnclosedBlockComment) {
 				return skip(err.Error(), table)
@@ -324,10 +387,20 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		break
 	}
 
-	if surplus {
-		return skip("значений больше, чем колонок", table)
+	if cut != "" {
+		if cutLine == 0 {
+			cutLine = s.line
+		}
+		if h.Cut != nil {
+			h.Cut(cut, cutLine)
+		}
+		if h.End != nil {
+			return h.End()
+		}
+		return nil
 	}
-	if rows == 0 {
+	if accepted == 0 {
+		// Все строки отброшены по ширине: Skip сбросит начатый temp.
 		return skip("нет строк VALUES", table)
 	}
 	validTail, err := consumeTail(s)
@@ -421,27 +494,34 @@ func skipModifiers(s *src) error {
 	}
 }
 
+// parseTableName берёт последний сегмент имени: table, schema.table и
+// db.schema.table (MSSQL [shop].[dbo].[users]) дают одно имя таблицы.
 func parseTableName(s *src) (string, error) {
 	part, err := parseIdent(s)
 	if err != nil {
 		return "", err
 	}
-	if err := s.skipSpaceAndComments(); err != nil {
-		return "", err
-	}
-	b, err := s.peek()
-	if err != nil && err != io.EOF {
-		return "", err
-	}
-	if err == nil && b == '.' {
-		_, _ = s.next()
-		next, err := parseIdent(s)
+	for {
+		if err := s.skipSpaceAndComments(); err != nil {
+			return "", err
+		}
+		b, err := s.peek()
+		if err == io.EOF || (err == nil && b != '.') {
+			return cleanIdent(part), nil
+		}
 		if err != nil {
 			return "", err
 		}
-		part = next
+		_, _ = s.next()
+		if part, err = parseIdent(s); err != nil {
+			return "", err
+		}
 	}
-	return cleanIdent(part), nil
+}
+
+// startsIdent — байт может начинать имя таблицы: слово или обрамление.
+func startsIdent(b byte) bool {
+	return identStart(b) || b == '`' || b == '"' || b == '[' || b == '\''
 }
 
 func parseIdent(s *src) (string, error) {
@@ -605,133 +685,37 @@ func skipParenGroup(s *src) error {
 	}
 }
 
-func parseRow(s *src) ([]Cell, error) {
-	if err := s.skipSpaceAndComments(); err != nil {
-		return nil, err
-	}
-	b, err := s.peek()
-	if err != nil {
-		return nil, err
-	}
-	if b != '(' {
-		return nil, fmt.Errorf("ожидалась '(' строки VALUES")
-	}
-	_, _ = s.next()
-
-	var cells []Cell
-	expectValue := true
-	for {
-		if err := s.skipSpaceAndComments(); err != nil {
-			return nil, err
-		}
-		b, err := s.peek()
-		if err != nil {
-			return nil, err
-		}
-		if b == ')' {
-			if expectValue && len(cells) > 0 {
-				cells = append(cells, Cell{Kind: Missing})
-			}
-			_, _ = s.next()
-			return cells, nil
-		}
-		if b == ',' {
-			if expectValue {
-				cells = append(cells, Cell{Kind: Missing})
-			}
-			_, _ = s.next()
-			expectValue = true
-			continue
-		}
-		if !expectValue {
-			return nil, fmt.Errorf("между значениями нет запятой")
-		}
-		cell, err := parseValue(s)
-		if err != nil {
-			return nil, err
-		}
-		cells = append(cells, cell)
-		expectValue = false
-	}
+// parseRow собирает одну строку VALUES в []Cell для обработчика Row.
+// Разбор тот же, что у потокового StreamRow: один код для обоих путей.
+func parseRow(s *src, maxCells int) ([]Cell, error) {
+	var c cellCollector
+	err := emitRow(s, &c, maxCells)
+	return c.cells, err
 }
 
-func parseValue(s *src) (Cell, error) {
-	if err := s.skipSpaceAndComments(); err != nil {
-		return Cell{}, err
-	}
-	b, err := s.peek()
-	if err != nil {
-		return Cell{}, err
-	}
-	switch b {
-	case '\'':
-		text, err := readString(s, '\'')
-		return Cell{Kind: Text, Text: text}, err
-	case '"':
-		text, err := readString(s, '"')
-		return Cell{Kind: Text, Text: text}, err
-	}
-
-	word, ok, err := s.peekUnquotedWord()
-	if err != nil {
-		return Cell{}, err
-	}
-	if ok && strings.EqualFold(word, "NULL") {
-		for range word {
-			_, _ = s.next()
-		}
-		return Cell{Kind: Null}, nil
-	}
-
-	text, err := readRawValue(s)
-	if err != nil {
-		return Cell{}, err
-	}
-	if text == "" {
-		return Cell{Kind: Missing}, nil
-	}
-	return Cell{Kind: Text, Text: text}, nil
+// cellCollector — CellWriter, который копит ячейки строки в память.
+type cellCollector struct {
+	cells []Cell
+	b     strings.Builder
 }
 
-func readString(s *src, quote byte) (string, error) {
-	if _, err := s.next(); err != nil {
-		return "", err
+func (c *cellCollector) Null() error {
+	c.cells = append(c.cells, Cell{Kind: Null})
+	return nil
+}
+
+func (c *cellCollector) Missing() error {
+	c.cells = append(c.cells, Cell{Kind: Missing})
+	return nil
+}
+
+func (c *cellCollector) Text(write func(io.Writer) error) error {
+	c.b.Reset()
+	if err := write(&c.b); err != nil {
+		return err
 	}
-	var b strings.Builder
-	for {
-		c, err := s.next()
-		if err != nil {
-			return "", err
-		}
-		if c == '\\' {
-			n, err := s.peek()
-			if err == io.EOF {
-				b.WriteByte('\\')
-				return b.String(), nil
-			}
-			if err != nil {
-				return "", err
-			}
-			_, _ = s.next()
-			if n == quote || n == '\\' {
-				b.WriteByte(n)
-				continue
-			}
-			b.WriteByte('\\')
-			b.WriteByte(n)
-			continue
-		}
-		if c == quote {
-			n, err := s.peek()
-			if err == nil && n == quote {
-				_, _ = s.next()
-				b.WriteByte(quote)
-				continue
-			}
-			return b.String(), nil
-		}
-		b.WriteByte(c)
-	}
+	c.cells = append(c.cells, Cell{Kind: Text, Text: c.b.String()})
+	return nil
 }
 
 func readRawValue(s *src) (string, error) {
@@ -796,7 +780,7 @@ func readQuotedRaw(s *src, quote byte) (string, error) {
 			return "", err
 		}
 		b.WriteByte(c)
-		if quote == '\'' && c == '\\' {
+		if quote != '`' && c == '\\' {
 			n, err := s.next()
 			if err != nil {
 				return b.String(), err

@@ -276,8 +276,6 @@ func TestParseRejectsMalformedSeparatorsAndContinues(t *testing.T) {
 			INSERT INTO ok (email) VALUES ('ok@example.test');`,
 		"rows without comma": `INSERT INTO bad (email) VALUES ('a') ('b');
 			INSERT INTO ok (email) VALUES ('ok@example.test');`,
-		"trailing row comma": `INSERT INTO bad (email) VALUES ('a'),;
-			INSERT INTO ok (email) VALUES ('ok@example.test');`,
 		"unexpected tail": `INSERT INTO bad (email) VALUES ('a') GARBAGE;
 			INSERT INTO ok (email) VALUES ('ok@example.test');`,
 	}
@@ -394,17 +392,69 @@ func TestParseMissingValuesPaddedAsMissing(t *testing.T) {
 	}
 }
 
-func TestParseSurplusValuesSkipsWholeInsert(t *testing.T) {
-	sql := `INSERT INTO t (a, b) VALUES (1, 2), (3, 4, 5); INSERT INTO u (a) VALUES (9);`
+func TestParseSurplusValuesKeepsValidRows(t *testing.T) {
+	sql := `INSERT INTO t (a, b) VALUES (1, 2), (3, 4, 5), (6, 7); INSERT INTO u (a) VALUES (9);`
+	var surplus int
+	var inserts []collected
+	var skips []Skip
+	var cur *collected
+	err := Parse(strings.NewReader(sql), Handler{
+		Begin: func(m Meta) error {
+			c := collected{meta: m}
+			cur = &c
+			return nil
+		},
+		Row: func(cells []Cell) error {
+			if cur == nil {
+				t.Fatal("Row без Begin")
+			}
+			cloned := make([]Cell, len(cells))
+			copy(cloned, cells)
+			cur.rows = append(cur.rows, cloned)
+			return nil
+		},
+		RowSurplus: func() { surplus++ },
+		End: func() error {
+			inserts = append(inserts, *cur)
+			cur = nil
+			return nil
+		},
+		Skip: func(sk Skip) {
+			cur = nil
+			skips = append(skips, sk)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if surplus != 1 {
+		t.Fatalf("surplus=%d", surplus)
+	}
+	if len(skips) != 0 {
+		t.Fatalf("surplus не должен отменять INSERT: %+v", skips)
+	}
+	if len(inserts) != 2 || len(inserts[0].rows) != 2 {
+		t.Fatalf("ожидались 2 валидные строки у t: %+v", inserts)
+	}
+	if inserts[0].rows[0][0].Text != "1" || inserts[0].rows[1][0].Text != "6" {
+		t.Fatalf("строки: %+v", inserts[0].rows)
+	}
+	if inserts[1].meta.Table != "u" {
+		t.Fatalf("второй INSERT: %+v", inserts[1])
+	}
+}
+
+func TestParseAllSurplusSkipsInsert(t *testing.T) {
+	sql := `INSERT INTO t (a, b) VALUES (1, 2, 3), (4, 5, 6); INSERT INTO u (a) VALUES (9);`
 	inserts, skips := collect(t, sql)
-	if len(skips) != 1 || skips[0].Table != "t" {
-		t.Fatalf("лишние значения должны отменить весь INSERT t: %+v", skips)
-	}
-	if !strings.Contains(skips[0].Reason, "больше") {
-		t.Fatalf("причина: %q", skips[0].Reason)
-	}
 	if len(inserts) != 1 || inserts[0].meta.Table != "u" {
-		t.Fatalf("следующий INSERT должен выжить: %+v", inserts)
+		t.Fatalf("inserts=%+v", inserts)
+	}
+	if len(skips) != 1 || skips[0].Table != "t" {
+		t.Fatalf("весь INSERT без валидных строк: %+v", skips)
+	}
+	if !strings.Contains(skips[0].Reason, "нет строк") {
+		t.Fatalf("причина: %q", skips[0].Reason)
 	}
 }
 
@@ -456,7 +506,7 @@ func TestParseLargeMultilineInsert(t *testing.T) {
 	const n = 8000
 	var b strings.Builder
 	b.WriteString("INSERT INTO t (id, name) VALUES\n")
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if i > 0 {
 			b.WriteString(",\n")
 		}
@@ -536,7 +586,7 @@ func TestParseDoesNotReadAllIntoOneBuffer(t *testing.T) {
 }
 
 func TestParseTestdataFiles(t *testing.T) {
-	root := filepath.Join("testdata")
+	root := "testdata"
 	sql, err := os.ReadFile(filepath.Join(root, "several.sql"))
 	if err != nil {
 		t.Fatal(err)
@@ -625,14 +675,19 @@ func TestBeforeValuesSkipsCells(t *testing.T) {
 	}
 }
 
-func TestValuesHandlerReceivesTail(t *testing.T) {
-	var got []byte
-	err := Parse(strings.NewReader("INSERT INTO users (email) VALUES ('a@example.test'); INSERT INTO t SELECT 1;"), Handler{
-		Values: func(m Meta, body []byte) error {
+// ValuesAt отдаёт смещения хвоста от начала потока (с BOM): вызывающий
+// читает диапазон из того же файла и разбирает его ParseValues.
+func TestValuesAtReportsStreamOffsets(t *testing.T) {
+	sql := "\xEF\xBB\xBFINSERT INTO users (email) VALUES ('a@example.test');\n" +
+		"INSERT INTO t SELECT 1;\n" +
+		"INSERT INTO users (email) VALUES ('b@example.test'), ('c');"
+	var tails []string
+	err := Parse(strings.NewReader(sql), Handler{
+		ValuesAt: func(m Meta, off, n int64) error {
 			if m.Table != "users" {
 				t.Fatalf("таблица %s", m.Table)
 			}
-			got = append([]byte(nil), body...)
+			tails = append(tails, sql[off:off+n])
 			return nil
 		},
 		Row: func([]Cell) error {
@@ -643,46 +698,208 @@ func TestValuesHandlerReceivesTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(got), "'a@example.test'") {
-		t.Fatalf("хвост: %q", got)
+	want := []int{1, 2}
+	if len(tails) != len(want) {
+		t.Fatalf("хвосты: %q", tails)
 	}
-	res := 0
-	if err := ParseValues(bytes.NewReader(got), Meta{Table: "users", Columns: []string{"email"}}, Handler{
-		Row: func(cells []Cell) error {
-			res += len(cells)
-			return nil
-		},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if res != 1 {
-		t.Fatalf("ячеек в хвосте: %d", res)
+	for i, tail := range tails {
+		rows := 0
+		if err := ParseValues(strings.NewReader(tail), Meta{Table: "users", Columns: []string{"email"}}, Handler{
+			Row: func([]Cell) error { rows++; return nil },
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if rows != want[i] {
+			t.Fatalf("хвост %q: строк %d, ожидалось %d", tail, rows, want[i])
+		}
 	}
 }
 
-func TestValuesFileDoesNotKeepTailInMemory(t *testing.T) {
-	dir := t.TempDir()
-	var path string
-	err := Parse(strings.NewReader("INSERT INTO users (email) VALUES ('a@example.test');"), Handler{
-		SpillDir: dir,
-		ValuesFile: func(m Meta, p string) error {
-			path = p
-			return nil
-		},
-		Row: func([]Cell) error {
-			t.Fatal("сканер не должен разбирать ячейки")
+// parsed — INSERT в виде, удобном для сравнения: «таблица(колонки)» и строки
+// ячеек через «|». NULL/Missing — «∅».
+type parsed struct {
+	head string
+	rows []string
+}
+
+func flatten(meta Meta, rows [][]Cell) parsed {
+	p := parsed{head: meta.Table + "(" + strings.Join(meta.Columns, ",") + ")"}
+	for _, row := range rows {
+		cells := make([]string, len(row))
+		for i, c := range row {
+			if c.Kind == Text {
+				cells[i] = c.Text
+			} else {
+				cells[i] = "∅"
+			}
+		}
+		p.rows = append(p.rows, strings.Join(cells, "|"))
+	}
+	return p
+}
+
+// collectSpill идёт продакшен-путём: сканер отдаёт границы хвоста statement
+// (ValuesAt), ячейки из этого диапазона разбирает ParseValues.
+func collectSpill(t *testing.T, sql string) []parsed {
+	t.Helper()
+	var out []parsed
+	err := Parse(strings.NewReader(sql), Handler{
+		ValuesAt: func(meta Meta, off, n int64) error {
+			var rows [][]Cell
+			ok := false
+			err := ParseValues(io.NewSectionReader(strings.NewReader(sql), off, n), meta, Handler{
+				Row: func(cells []Cell) error {
+					rows = append(rows, append([]Cell(nil), cells...))
+					return nil
+				},
+				End: func() error { ok = true; return nil },
+			})
+			if err != nil {
+				return err
+			}
+			if ok {
+				out = append(out, flatten(meta, rows))
+			}
 			return nil
 		},
 	})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Parse: %v", err)
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+	return out
+}
+
+// parseBoth проверяет, что последовательный разбор и путь через spill дают
+// одно и то же, и возвращает результат.
+func parseBoth(t *testing.T, sql string) []parsed {
+	t.Helper()
+	inserts, _ := collect(t, sql)
+	var direct []parsed
+	for _, in := range inserts {
+		direct = append(direct, flatten(in.meta, in.rows))
 	}
-	if !strings.Contains(string(raw), "'a@example.test'") {
-		t.Fatalf("хвост: %q", raw)
+	spilled := collectSpill(t, sql)
+	if fmt.Sprint(direct) != fmt.Sprint(spilled) {
+		t.Fatalf("разбор расходится:\n Parse: %v\n spill: %v", direct, spilled)
 	}
-	_ = os.Remove(path)
+	return direct
+}
+
+func TestParseDialects(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want []parsed
+	}{
+		{
+			name: "MSSQL: имя из трёх частей",
+			sql:  "INSERT INTO [shop].[dbo].[users] ([email], [phone]) VALUES ('a@example.test', '555');",
+			want: []parsed{{"users(email,phone)", []string{"a@example.test|555"}}},
+		},
+		{
+			name: "MySQL/MSSQL: INSERT без INTO",
+			sql: "INSERT users (email) VALUES ('a');\n" +
+				"INSERT [dbo].[users] ([email]) VALUES ('b');",
+			want: []parsed{
+				{"users(email)", []string{"a"}},
+				{"users(email)", []string{"b"}},
+			},
+		},
+		{
+			name: "MSSQL N'…' и Postgres E'…': префикс не попадает в ячейку",
+			sql:  "INSERT INTO users (a, b, c) VALUES (N'Иван', n'O''Neil', E'x\\'y');",
+			want: []parsed{{"users(a,b,c)", []string{"Иван|O'Neil|x'y"}}},
+		},
+		{
+			name: "идентификатор на N без кавычки остаётся значением",
+			sql:  "INSERT INTO users (a) VALUES (NOW());",
+			want: []parsed{{"users(a)", []string{"NOW()"}}},
+		},
+		{
+			name: "\\\" в двойных кавычках: сканер и парсер режут одинаково",
+			sql: "INSERT INTO users (a, b) VALUES (\"x\\\"y\", 'z');\n" +
+				"INSERT INTO users (a, b) VALUES ('q', 'w');",
+			want: []parsed{
+				{"users(a,b)", []string{"x\"y|z"}},
+				{"users(a,b)", []string{"q|w"}},
+			},
+		},
+		{
+			name: "INSERT внутри $$-тела функции Postgres не данные",
+			sql: "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN " +
+				"INSERT INTO audit (email, phone) VALUES (NEW.email, NEW.phone); RETURN NEW; END; " +
+				"$$ LANGUAGE plpgsql;\n" +
+				"CREATE FUNCTION g() RETURNS void AS $body$ INSERT INTO audit (email) VALUES ('x'); $body$ LANGUAGE sql;\n" +
+				"INSERT INTO users (email) VALUES ('a');",
+			want: []parsed{{"users(email)", []string{"a"}}},
+		},
+		{
+			name: "знак $ внутри имени не открывает $$-строку",
+			sql:  "INSERT INTO a$b$c (email) VALUES ('a');\nINSERT INTO users (email) VALUES ('b');",
+			want: []parsed{
+				{"a$b$c(email)", []string{"a"}},
+				{"users(email)", []string{"b"}},
+			},
+		},
+		{
+			name: "GRANT/TRIGGER с INSERT не дают таблицу",
+			sql: "GRANT INSERT, UPDATE ON users TO app;\n" +
+				"INSERT INTO users (email) VALUES ('a');",
+			want: []parsed{{"users(email)", []string{"a"}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseBoth(t, tt.sql)
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Fatalf("\n got %v\nwant %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Обрезанный дамп: INSERT оборван после целых строк (висящая запятая, конец
+// файла, битая последняя строка). Целые строки сохраняются, обрыв — в Cut
+// со строкой файла; следующий INSERT разбирается как обычно.
+func TestParseCutInsertKeepsAcceptedRows(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		wantRows int
+		wantLine int
+		reason   string
+	}{
+		{"висящая запятая", "INSERT INTO t (email) VALUES\n('a'),\n('b'),;\nINSERT INTO ok (email) VALUES ('x');", 2, 3, "после запятой"},
+		{"конец файла после запятой", "INSERT INTO t (email) VALUES\n('a'),\n('b'),\n", 2, 4, "после запятой"},
+		{"битая последняя строка", "INSERT INTO t (email) VALUES\n('a'),\n('b'),\n('c", 2, 4, "битая строка"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, spill := range []bool{false, true} {
+				var rows, cutLine int
+				var reason string
+				var tables []string
+				h := Handler{
+					Row:   func([]Cell) error { rows++; return nil },
+					Cut:   func(r string, line int) { reason, cutLine = r, line },
+					Begin: func(m Meta) error { tables = append(tables, m.Table); return nil },
+					Skip:  func(sk Skip) { t.Fatalf("пропуск вместо обрыва: %+v", sk) },
+				}
+				if spill {
+					h.ValuesAt = func(m Meta, off, n int64) error {
+						return ParseValues(io.NewSectionReader(strings.NewReader(tt.sql), off, n), m, Handler{
+							Row: h.Row, Cut: h.Cut, Skip: h.Skip,
+							Begin: func(m Meta) error { tables = append(tables, m.Table); return nil },
+						})
+					}
+				}
+				if err := Parse(strings.NewReader(tt.sql), h); err != nil {
+					t.Fatal(err)
+				}
+				if tables[0] != "t" || rows < tt.wantRows || !strings.Contains(reason, tt.reason) || cutLine != tt.wantLine {
+					t.Fatalf("spill=%v: rows=%d reason=%q line=%d tables=%v", spill, rows, reason, cutLine, tables)
+				}
+			}
+		})
+	}
 }

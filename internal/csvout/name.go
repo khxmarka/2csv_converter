@@ -42,8 +42,8 @@ func FileBaseDefault(name, empty string) string {
 		return empty
 	}
 	stem := s
-	if i := strings.IndexByte(s, '.'); i >= 0 {
-		stem = s[:i]
+	if before, _, ok := strings.Cut(s, "."); ok {
+		stem = before
 	}
 	if _, bad := reservedStems[strings.ToUpper(stem)]; bad {
 		return "_" + s
@@ -52,28 +52,7 @@ func FileBaseDefault(name, empty string) string {
 }
 
 func limitCSVBase(base string) string {
-	if utf16Units(base) <= maxCSVBaseUTF16 {
-		return base
-	}
-
-	sum := sha256.Sum256([]byte(base))
-	suffix := "~" + hex.EncodeToString(sum[:8])
-	prefixLimit := maxCSVBaseUTF16 - len(suffix)
-	var b strings.Builder
-	units := 0
-	for _, r := range base {
-		n := 1
-		if r > 0xFFFF {
-			n = 2
-		}
-		if units+n > prefixLimit {
-			break
-		}
-		b.WriteRune(r)
-		units += n
-	}
-	b.WriteString(suffix)
-	return b.String()
+	return limitCSVBaseSuffix(base, "")
 }
 
 // limitCSVBaseSuffix ограничивает основу вместе с суффиксом вроде «_2».
@@ -84,10 +63,7 @@ func limitCSVBaseSuffix(base, suffix string) string {
 	}
 	sum := sha256.Sum256([]byte(base))
 	tail := "~" + hex.EncodeToString(sum[:8]) + suffix
-	prefixLimit := maxCSVBaseUTF16 - utf16Units(tail)
-	if prefixLimit < 0 {
-		prefixLimit = 0
-	}
+	prefixLimit := max(maxCSVBaseUTF16-utf16Units(tail), 0)
 	var b strings.Builder
 	units := 0
 	for _, r := range base {
@@ -115,25 +91,4 @@ func utf16Units(s string) int {
 		}
 	}
 	return n
-}
-
-func csvName(base string, n int) string {
-	if n <= 0 {
-		return base + ".csv"
-	}
-	return base + "(" + itoa(n) + ").csv"
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var buf [16]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
 }

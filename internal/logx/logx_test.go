@@ -3,6 +3,8 @@ package logx
 import (
 	"bytes"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 )
@@ -65,5 +67,44 @@ func TestLoggerCapturesFirstWriteError(t *testing.T) {
 	log.Errorf("later error")
 	if err := log.Err(); err == nil || !strings.Contains(err.Error(), "write failed") {
 		t.Fatalf("Err=%v", err)
+	}
+}
+
+// В файл или pipe статусная строка не пишется: там она копилась бы \r и
+// пробелами раз в секунду. Обычные строки лога идут как раньше.
+func TestHangOffWhenNotTerminal(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	log := New(w)
+	log.Hang("папка в обработке: Alpha (0 с)")
+	log.Linef("папка обработана: Alpha")
+	log.Hang("")
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "папка обработана: Alpha\n" {
+		t.Fatalf("вывод: %q", got)
+	}
+}
+
+// Иероглиф занимает две колонки: затирание должно покрыть всю строку.
+func TestClearHangCoversWideRunes(t *testing.T) {
+	var buf bytes.Buffer
+	log := New(&buf)
+	log.Hang("папка: 数据")
+	log.Hang("")
+	want := "\r" + strings.Repeat(" ", DisplayWidth("папка: 数据")) + "\r"
+	if !strings.Contains(buf.String(), want) {
+		t.Fatalf("затирание: %q", buf.String())
+	}
+	if DisplayWidth("папка: 数据") != 11 {
+		t.Fatalf("ширина: %d", DisplayWidth("папка: 数据"))
 	}
 }

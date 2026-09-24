@@ -44,12 +44,30 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 		log.Errorf("%s: %v", sql.Path, err)
 		return Result{Skipped: 1, Failed: true}
 	}
+	// Воркеры читают хвосты INSERT через ReadAt по своему дескриптору: сканер
+	// идёт по f последовательно, а временных файлов на INSERT больше нет.
+	// Закрывается после q (defer ниже выполняется раньше).
+	body, err := os.Open(sql.Path)
+	if err != nil {
+		return Result{OpenErr: err}
+	}
+	defer body.Close()
 
 	q := newCommitQ()
-	done := q.start()
+	done := q.start(func(rec any) {
+		st.skipped++
+		st.failed = true
+		log.Errorf("%s: сбой записи INSERT (%v), INSERT пропущен", sql.Path, rec)
+	})
 	defer func() {
 		q.close()
 		<-done
+		// Дескрипторы дописывания CSV живут только пока пишет этот .sql:
+		// дальше Excel, нарезка и замена файлов этой директории.
+		if err := reg.CloseDir(st.dir); err != nil {
+			st.failed = true
+			log.Errorf("%s: не удалось закрыть CSV: %v", sql.Path, err)
+		}
 		out = Result{
 			Created:  st.created,
 			CSV:      st.csvNew,
@@ -72,14 +90,12 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 			})
 			return true, nil
 		},
-		SpillDir: st.dir,
-		ValuesFile: func(meta insert.Meta, path string) error {
+		ValuesAt: func(meta insert.Meta, off, n int64) error {
 			meta.Columns = append([]string(nil), meta.Columns...)
 			fill := q.reserve()
 			submit(func() {
 				var apply func()
 				defer func() {
-					_ = os.Remove(path)
 					if rec := recover(); rec != nil {
 						apply = func() {
 							st.skipped++
@@ -92,17 +108,7 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 					}
 					fill(apply)
 				}()
-				src, err := os.Open(path)
-				if err != nil {
-					apply = func() {
-						st.skipped++
-						st.failed = true
-						st.log.Errorf("%s таблица %s: %v", st.sql.Path, meta.Table, err)
-					}
-					return
-				}
-				prep := prepareInsert(st.dir, meta, src)
-				_ = src.Close()
+				prep := prepareInsert(st.dir, meta, io.NewSectionReader(body, off, n))
 				apply = func() { st.apply(meta, prep) }
 			})
 			return nil
@@ -122,14 +128,23 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 }
 
 type prepared struct {
-	data *csvout.DataFile
-	skip *insert.Skip
-	err  error
+	data    *csvout.DataFile
+	skip    *insert.Skip
+	err     error
+	surplus int
+	// cut — INSERT оборван после целых строк (обрезанный дамп): они пишутся,
+	// в лог — причина и строка файла cutLine.
+	cut     string
+	cutLine int
 }
 
 func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) {
 	var data *csvout.DataFile
 	var skipped *insert.Skip
+	surplus := 0
+	var cut string
+	cutLine := 0
+	var cellw dataCellWriter // один на INSERT, не на строку
 	defer func() {
 		if out.data == nil && data != nil {
 			data.Abort()
@@ -137,26 +152,37 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 	}()
 	err := insert.ParseValues(body, meta, insert.Handler{
 		Begin: func(insert.Meta) error {
-			d, err := csvout.CreateData(dir)
-			if err != nil {
-				return err
-			}
-			data = d
+			data = csvout.CreateData(dir)
 			return nil
 		},
-		Row: func(cells []insert.Cell) error {
-			width := 0
-			if len(meta.Columns) > 0 {
-				width = len(meta.Columns)
-			} else if data != nil {
-				width = data.Width()
+		StreamRow: func(emit func(insert.CellWriter) error) error {
+			if data == nil {
+				return io.ErrClosedPipe
 			}
-			values, _, err := csvout.NormalizeRow(cells, width)
-			if err != nil {
+			if err := data.BeginRow(); err != nil {
 				return err
 			}
-			return data.Row(values)
+			cw := &cellw
+			cw.d = data
+			err := emit(cw)
+			if errors.Is(err, insert.ErrRowSurplus) {
+				_ = data.RollbackRow()
+				return insert.ErrRowSurplus
+			}
+			if err != nil {
+				_ = data.RollbackRow()
+				return err
+			}
+			if err := data.EndRow(); err != nil {
+				if errors.Is(err, csvout.ErrTooManyValues) {
+					return insert.ErrRowSurplus
+				}
+				return err
+			}
+			return nil
 		},
+		RowSurplus: func() { surplus++ },
+		Cut:        func(reason string, line int) { cut, cutLine = reason, line },
 		Skip: func(sk insert.Skip) {
 			cp := sk
 			skipped = &cp
@@ -171,22 +197,35 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 			data.Abort()
 			data = nil
 		}
-		if errors.Is(err, csvout.ErrTooManyValues) {
-			return prepared{skip: &insert.Skip{Table: meta.Table, Reason: err.Error(), Offset: meta.Offset, Line: meta.Line}}
-		}
-		return prepared{err: err}
+		return prepared{err: err, surplus: surplus}
 	}
 	if skipped != nil {
-		return prepared{skip: skipped}
+		return prepared{skip: skipped, surplus: surplus}
 	}
 	if data == nil {
-		return prepared{}
+		return prepared{surplus: surplus}
 	}
 	if err := data.Finish(); err != nil {
-		return prepared{err: err}
+		return prepared{err: err, surplus: surplus}
 	}
-	out = prepared{data: data}
+	out = prepared{data: data, surplus: surplus, cut: cut, cutLine: cutLine}
 	return out
+}
+
+type dataCellWriter struct {
+	d *csvout.DataFile
+}
+
+func (c *dataCellWriter) Null() error {
+	return c.d.WriteNullCell()
+}
+
+func (c *dataCellWriter) Missing() error {
+	return c.d.WriteNullCell()
+}
+
+func (c *dataCellWriter) Text(write func(io.Writer) error) error {
+	return c.d.WriteTextCellStream(write)
 }
 
 func (s *session) apply(meta insert.Meta, prep prepared) {
@@ -198,22 +237,36 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 	}
 	if prep.skip != nil {
 		s.skip(*prep.skip)
+		if prep.surplus > 0 {
+			s.unitFail += prep.surplus
+			s.log.Errorf("%s:%d таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Line, meta.Table, prep.surplus)
+		}
 		return
 	}
 	if prep.data == nil || prep.data.Rows() == 0 {
 		if prep.data != nil {
 			prep.data.Abort()
 		}
+		if prep.surplus > 0 {
+			s.skipped++
+			s.unitFail += prep.surplus
+			s.log.Errorf("%s:%d таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Line, meta.Table, prep.surplus)
+			return
+		}
 		s.skip(insert.Skip{Table: meta.Table, Reason: "нет строк VALUES", Offset: meta.Offset, Line: meta.Line})
 		return
 	}
 	defer prep.data.Abort()
-	res, err := csvout.CommitPrepared(s.reg, s.dir, meta.Table, meta.Columns, prep.data.Path())
+	res, err := csvout.CommitPrepared(s.reg, s.dir, meta.Table, meta.Columns, prep.data)
 	if err != nil {
 		if errors.Is(err, csvout.ErrTooManyValues) {
+			n := res.SkippedRows
+			if n < 1 {
+				n = prep.data.Rows()
+			}
 			s.skipped++
-			s.unitFail++
-			s.log.Errorf("%s таблица %s: %v", s.sql.Path, meta.Table, err)
+			s.unitFail += n
+			s.log.Errorf("%s:%d таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Line, meta.Table, n)
 			return
 		}
 		s.skipped++
@@ -225,5 +278,16 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 	s.paths = append(s.paths, res.Path)
 	if !res.Appended {
 		s.csvNew++
+	}
+	totalSurplus := prep.surplus + res.SkippedRows
+	if totalSurplus > 0 {
+		s.unitFail += totalSurplus
+		s.log.Errorf("%s:%d таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Line, meta.Table, totalSurplus)
+	}
+	if prep.cut != "" {
+		// Не молчим: хвост INSERT потерян, исходник остаётся (unitFail, §15).
+		s.unitFail++
+		s.log.Errorf("%s:%d таблица %s: INSERT оборван (%s), записано строк: %d",
+			s.sql.Path, prep.cutLine, meta.Table, prep.cut, prep.data.Rows()-res.SkippedRows)
 	}
 }

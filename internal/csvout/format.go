@@ -1,42 +1,31 @@
 package csvout
 
-import (
-	"strings"
-	"unicode/utf8"
-)
+import "strings"
 
 func encodeRow(cols []string) string {
-	var b strings.Builder
-	// грубая оценка: кавычки + запятые + экранирование
-	size := 0
-	for _, c := range cols {
-		size += 2 + len(c) + strings.Count(c, `"`) + 1
-	}
-	b.Grow(size)
-	for i, c := range cols {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteByte('"')
-		if strings.Contains(c, `"`) {
-			writeEscaped(&b, c)
-		} else {
-			b.WriteString(c)
-		}
-		b.WriteByte('"')
-	}
-	b.WriteByte('\n')
-	return b.String()
+	return string(appendRow(nil, cols))
 }
 
-func writeEscaped(b *strings.Builder, s string) {
-	for i := 0; i < len(s); {
-		r, n := utf8.DecodeRuneInString(s[i:])
-		if r == '"' {
-			b.WriteString(`""`)
-		} else {
-			b.WriteString(s[i : i+n])
+// appendRow дописывает к dst строку CSV по §6: все ячейки в кавычках, `"` →
+// `""`, LF. Байт '"' в UTF-8 не встречается внутри многобайтовых символов,
+// поэтому экранирование побайтовое.
+func appendRow(dst []byte, cols []string) []byte {
+	for i, c := range cols {
+		if i > 0 {
+			dst = append(dst, ',')
 		}
-		i += n
+		dst = append(dst, '"')
+		for {
+			j := strings.IndexByte(c, '"')
+			if j < 0 {
+				break
+			}
+			dst = append(dst, c[:j+1]...)
+			dst = append(dst, '"')
+			c = c[j+1:]
+		}
+		dst = append(dst, c...)
+		dst = append(dst, '"')
 	}
+	return append(dst, '\n')
 }

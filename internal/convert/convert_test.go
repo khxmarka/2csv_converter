@@ -3,6 +3,7 @@ package convert
 import (
 	"bufio"
 	"bytes"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,7 +28,7 @@ func runFileReg(t *testing.T, reg *csvout.Registry, dir, name, sql string) (Resu
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	res := File(logx.New(&buf), reg, scan.SQLFile{Path: path, TopFolder: "Alpha"})
+	res := Schedule(logx.New(&buf), reg, scan.SQLFile{Path: path, TopFolder: "Alpha"}, nil)
 	if res.OpenErr != nil {
 		t.Fatalf("OpenErr: %v", res.OpenErr)
 	}
@@ -262,7 +263,7 @@ func TestRejectedInsertDoesNotOverwriteExistingCSV(t *testing.T) {
 	}
 	res, _ := runFile(t, dir, "dump.sql", `
 INSERT INTO users (email) VALUES ('a@example.test', 'extra');
-INSERT INTO users (email) VALUES ('valid@example.test'), ('unclosed);
+INSERT INTO users (email) VALUES ('valid@example.test'), ('a' 'no comma');
 `)
 	if res.Created != 0 || res.CSV != 0 || res.Skipped != 2 {
 		t.Fatalf("created=%d csv=%d skipped=%d", res.Created, res.CSV, res.Skipped)
@@ -304,6 +305,82 @@ INSERT INTO t (id, name, email, extra) VALUES (2, 'x', 'y', 'z');
 	}
 }
 
+func TestSurplusRowKeepsValidRowsInSameInsert(t *testing.T) {
+	dir := t.TempDir()
+	sql := `INSERT INTO t (email, phone) VALUES ('a@example.test', '1'), ('b', '2', 'extra'), ('c@example.test', '3');`
+	res, log := runFile(t, dir, "dump.sql", sql)
+	if res.Created != 1 || res.CSV != 1 {
+		t.Fatalf("created=%d csv=%d log:\n%s", res.Created, res.CSV, log)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\"email\",\"phone\"\n\"a@example.test\",\"1\"\n\"c@example.test\",\"3\"\n"
+	if string(raw) != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", raw, want)
+	}
+	if !strings.Contains(log, "1 строк пропущено") {
+		t.Fatalf("нужен счётчик surplus:\n%s", log)
+	}
+	if strings.Contains(log, "extra") || strings.Contains(log, "VALUES") {
+		t.Fatal("тело VALUES не должно попадать в лог")
+	}
+}
+
+func TestLargeCellStreamsWithoutFullBuffer(t *testing.T) {
+	dir := t.TempDir()
+	const n = 2_000_000
+	path := filepath.Join(dir, "big.sql")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(f, "INSERT INTO t (email, phone) VALUES ('"); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 64*1024)
+	for i := range buf {
+		buf[i] = 'x'
+	}
+	left := n
+	for left > 0 {
+		chunk := buf
+		if left < len(chunk) {
+			chunk = buf[:left]
+		}
+		if _, err := f.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		left -= len(chunk)
+	}
+	if _, err := io.WriteString(f, "', '555');"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var logBuf bytes.Buffer
+	res := Schedule(logx.New(&logBuf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"}, nil)
+	if res.Created != 1 || res.CSV != 1 {
+		t.Fatalf("created=%d csv=%d log:\n%s", res.Created, res.CSV, logBuf.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "t.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := "\"email\",\"phone\"\n\""
+	wantSuffix := "\",\"555\"\n"
+	if !strings.HasPrefix(string(raw), wantPrefix) || !strings.HasSuffix(string(raw), wantSuffix) {
+		t.Fatalf("обёртка CSV сломана, len=%d", len(raw))
+	}
+	body := string(raw[len(wantPrefix) : len(raw)-len(wantSuffix)])
+	if len(body) != n {
+		t.Fatalf("тело ячейки: len=%d want %d", len(body), n)
+	}
+}
+
 func TestSkipDoesNotStopNextInsert(t *testing.T) {
 	dir := t.TempDir()
 	sql := `
@@ -328,9 +405,9 @@ INSERT INTO t SET a=1;
 
 func TestOpenMissingFile(t *testing.T) {
 	var buf bytes.Buffer
-	res := File(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{
+	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{
 		Path: filepath.Join(t.TempDir(), "нет.sql"),
-	})
+	}, nil)
 	if res.OpenErr == nil {
 		t.Fatal("ожидалась ошибка открытия")
 	}
@@ -512,7 +589,7 @@ func TestLargeInsertThroughFilePipeline(t *testing.T) {
 	const rows = 10_000
 	var sql strings.Builder
 	sql.WriteString("INSERT INTO users (id, email) VALUES\n")
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		if i > 0 {
 			sql.WriteString(",\n")
 		}
@@ -564,7 +641,7 @@ func TestTabularCSVSQLWritesOurFormatAndKeepsSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	res := File(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"})
+	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"}, nil)
 	if res.OpenErr != nil || res.Failed || res.CSV != 1 || res.PIISkip != 0 {
 		t.Fatalf("результат=%+v log=%q", res, buf.String())
 	}
@@ -619,7 +696,7 @@ func TestTabularSQLPIIRejectsWithoutCSV(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	res := File(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"})
+	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"}, nil)
 	if res.CSV != 0 || res.PIISkip != 1 {
 		t.Fatalf("результат=%+v log=%q", res, buf.String())
 	}

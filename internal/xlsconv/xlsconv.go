@@ -26,19 +26,16 @@ type Sheet struct {
 	Empty bool
 }
 
-// Read открывает книгу по расширению. Неподдерживаемое расширение — ошибка.
+// Read читает .xls целиком в Book: у BIFF-библиотеки нет потокового чтения.
+// .xlsx идёт потоково мимо Read (File → fileXLSX). Иное расширение — ошибка.
 // Книга с более чем MaxSheets листами: SkipTooMany, без данных листов.
 func Read(path string) (Book, error) {
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".xlsx":
-		return readXLSX(path)
-	case ".xls":
+	if strings.EqualFold(filepath.Ext(path), ".xls") {
 		return readXLS(path)
-	default:
-		ext := filepath.Ext(path)
-		if ext == "" {
-			ext = "(нет расширения)"
-		}
-		return Book{}, fmt.Errorf("xlsconv: неподдерживаемое расширение %s", ext)
 	}
+	ext := filepath.Ext(path)
+	if ext == "" {
+		ext = "(нет расширения)"
+	}
+	return Book{}, fmt.Errorf("xlsconv: неподдерживаемое расширение %s", ext)
 }

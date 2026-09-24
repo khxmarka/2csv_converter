@@ -25,7 +25,10 @@ func newCommitQ() *commitQ {
 	return q
 }
 
-func (q *commitQ) start() <-chan struct{} {
+// start запускает применение слотов. Паника одного слота не останавливает
+// очередь: она уходит в onPanic (в той же горутине, что и слоты), чтобы
+// сбой воркера попал в лог и файл не считался успешным (§8, §15).
+func (q *commitQ) start(onPanic func(any)) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -38,7 +41,11 @@ func (q *commitQ) start() <-chan struct{} {
 				continue
 			}
 			func() {
-				defer func() { _ = recover() }()
+				defer func() {
+					if rec := recover(); rec != nil && onPanic != nil {
+						onPanic(rec)
+					}
+				}()
 				fn()
 			}()
 		}

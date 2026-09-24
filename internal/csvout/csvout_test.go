@@ -2,6 +2,8 @@ package csvout
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -32,7 +34,7 @@ func TestFileBase(t *testing.T) {
 		"COM1":     "_COM1",
 		"aux.data": "_aux.data",
 		"end.":     "end",
-		"end ":     "end",
+		"end ":     "end", //nolint:gocritic // пробел в конце имени — проверяемый случай
 		`a/b\c`:    "a_b_c",
 		"":         "table",
 		"***":      "___",
@@ -414,7 +416,7 @@ func TestConcurrentSameTableSerialized(t *testing.T) {
 	var wg sync.WaitGroup
 	errc := make(chan error, n)
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			w, err := Create(reg, dir, "same", []string{"id"})
@@ -498,7 +500,7 @@ func TestCreateNoHeaderFromEmptyColumns(t *testing.T) {
 	}
 }
 
-func TestCreatePlainOverwritesSameNamedSQLWithoutAppending(t *testing.T) {
+func TestCreatePlainDoesNotOverwriteCSVOfThisRun(t *testing.T) {
 	dir := t.TempDir()
 	reg := NewRegistry()
 	sql := commitInsert(t, reg, dir, "t", []string{"id"}, []string{"1"})
@@ -509,16 +511,18 @@ func TestCreatePlainOverwritesSameNamedSQLWithoutAppending(t *testing.T) {
 	if err := w.Row([]string{"excel"}); err != nil {
 		t.Fatal(err)
 	}
-	plain, err := w.Commit()
+	if _, err := w.Commit(); !errors.Is(err, ErrNameTaken) {
+		t.Fatalf("ожидался ErrNameTaken, получено %v", err)
+	}
+	if got := readCSV(t, sql.Path); got != "\"id\"\n\"1\"\n" {
+		t.Fatalf("CSV SQL затёрт: %q", got)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, tmpPattern))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(plain.Path) != "t.csv" || plain.Path != sql.Path {
-		t.Fatalf("Excel должен заменить целевой t.csv: SQL=%s Excel=%s", sql.Path, plain.Path)
-	}
-	got := readCSV(t, plain.Path)
-	if got != "\"col\"\n\"excel\"\n" {
-		t.Fatalf("заголовок + данные: %q", got)
+	if len(matches) != 0 {
+		t.Fatalf("временные файлы: %v", matches)
 	}
 }
 
@@ -551,5 +555,82 @@ func TestCreatePlainAbortKeepsFirst(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "book_Second.csv")); err == nil {
 		t.Fatal("после Abort второго листа CSV быть не должно")
+	}
+}
+
+// Провал дописывания через кэшированный дескриптор откатывает CSV к прежнему
+// размеру; следующая дописка идёт в конец уже откаченного файла.
+func TestSlotAppendRollsBackAndContinues(t *testing.T) {
+	dir := t.TempDir()
+	reg := NewRegistry()
+	res := commitInsert(t, reg, dir, "t", []string{"id"}, []string{"1"})
+	s := reg.acquire(dir, "t")
+	err := s.appendTo(func(w io.Writer) error {
+		if _, err := io.WriteString(w, "\"partial"); err != nil {
+			return err
+		}
+		return errors.New("сбой посреди INSERT")
+	})
+	if err == nil {
+		t.Fatal("ожидалась ошибка")
+	}
+	if err := s.appendTo(func(w io.Writer) error {
+		_, err := io.WriteString(w, "\"2\"\n")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	if err := reg.CloseDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got := readCSV(t, res.Path); got != "\"id\"\n\"1\"\n\"2\"\n" {
+		t.Fatalf("CSV после отката: %q", got)
+	}
+}
+
+// Строку с лишними значениями откатывают уже после выгрузки во временный
+// файл (ячейка больше dataMemLimit): в данных остаются только прежние строки.
+func TestDataFileRollbackAfterSpill(t *testing.T) {
+	d := CreateData(t.TempDir())
+	defer d.Abort()
+	if err := d.Row([]string{"keep"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.BeginRow(); err != nil {
+		t.Fatal(err)
+	}
+	big := strings.Repeat("x", dataMemLimit+10)
+	if err := d.WriteTextCellStream(func(w io.Writer) error {
+		_, err := io.WriteString(w, big)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if d.f == nil {
+		t.Fatal("ожидалась выгрузка во временный файл")
+	}
+	if err := d.RollbackRow(); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Row([]string{`a"b`, "c"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	src, err := d.open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "\"keep\"\n\"a\"\"b\",\"c\"\n"; string(got) != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	if d.rows != 2 || d.minCells != 1 || d.maxCells != 2 {
+		t.Fatalf("rows=%d min=%d max=%d", d.rows, d.minCells, d.maxCells)
 	}
 }

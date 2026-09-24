@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -645,15 +646,14 @@ func TestSecondInsertTooManyKeepsCSVAndLogsReason(t *testing.T) {
 	}
 }
 
-func TestWorkerCount(t *testing.T) {
-	if workerCount(0) != 0 {
-		t.Fatalf("0 файлов → 0 воркеров")
-	}
-	if n := workerCount(1); n != 1 {
-		t.Fatalf("1 файл → 1 воркер, получено %d", n)
-	}
-	if n := workerCount(1000); n < 1 || n > maxWorkers {
-		t.Fatalf("потолок: %d", n)
+func TestPoolSizeBounds(t *testing.T) {
+	for _, procs := range []int{1, 4, maxWorkers, 64} {
+		prev := runtime.GOMAXPROCS(procs)
+		got := poolSize()
+		runtime.GOMAXPROCS(prev)
+		if want := min(procs, maxWorkers); got != want {
+			t.Fatalf("GOMAXPROCS=%d: воркеров %d, ожидалось %d", procs, got, want)
+		}
 	}
 }
 
@@ -969,7 +969,7 @@ func TestGroupByDirSerializesSameFolder(t *testing.T) {
 }
 
 func TestGroupByDirKeepsSQLStreamBeforeExcel(t *testing.T) {
-	dir := filepath.Join("Alpha")
+	dir := "Alpha"
 	groups := groupByDir([]scan.SQLFile{
 		{Path: filepath.Join(dir, "m.xlsx"), Kind: scan.KindXLSX},
 		{Path: filepath.Join(dir, "z.sql"), Kind: scan.KindSQL},
@@ -1258,18 +1258,23 @@ func TestSQLExcelSQLSameTargetNeverMixesStreams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.InsertOK != 2 || res.CSV != 2 {
+	// SQL закрывает ключ раньше Excel (§9). Лист Excel не затирает CSV этого
+	// запуска: иначе оба .sql удалились бы без своих данных на диске.
+	if res.InsertOK != 2 || res.CSV != 1 || res.FilesFail != 1 {
 		t.Fatalf("результат: %+v", res)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "m_users.csv"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) != "\"excel_header\"\n\"excel\"\n" {
+	if string(raw) != "\"email\"\n\"first@example.test\"\n\"second@example.test\"\n" {
 		t.Fatalf("SQL и Excel не должны смешиваться: %q", raw)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "m_users(1).csv")); !os.IsNotExist(err) {
 		t.Fatalf("индексный CSV не должен создаваться, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "m.xlsx")); err != nil {
+		t.Fatalf("книга без своего CSV должна остаться: %v", err)
 	}
 }
 
@@ -1541,6 +1546,35 @@ func TestSQLKeyIsMergedBeforeSplit(t *testing.T) {
 	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"email\"\n\"a\"\n\"b\"\n")
 }
 
+// Прошлый запуск оборвался после публикации части: users_2.csv лежит,
+// папки нет в converted.txt. Повторная нарезка занимает тот же слот, а не _3.
+func TestRerunAfterInterruptedSplitDoesNotDuplicateParts(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "users_2.csv"), []byte("\"email\"\n\"b\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sql := "INSERT INTO users (email) VALUES ('a'),('a'),('b');\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "users.csv"), "\"email\"\n\"a\"\n\"a\"\n")
+	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"email\"\n\"b\"\n")
+	if _, err := os.Stat(filepath.Join(dir, "users_3.csv")); !os.IsNotExist(err) {
+		t.Fatalf("дубль части users_3.csv: %v", err)
+	}
+}
+
 func TestHeaderlessSQLSplitDoesNotInventHeader(t *testing.T) {
 	restore := csvout.SetSplitLimits(2, 2)
 	defer restore()
@@ -1682,6 +1716,97 @@ func TestXLSDeletedAfterOneSheetCSV(t *testing.T) {
 	}
 }
 
+// report.xls и report.xlsx претендуют на report_Sheet1.csv. Второй не затирает
+// CSV первого: его лист — ошибка записи, а книга остаётся на диске.
+func TestSameTargetNameDoesNotOverwriteCSVOfThisRun(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	xls := filepath.Join(dir, "report.xls")
+	xlsx := filepath.Join(dir, "report.xlsx")
+	if err := xlsconv.WriteXLS(xls, []xlsconv.Sheet{{
+		Name: "Sheet1",
+		Rows: [][]string{{"email"}, {"from-xls@example.test"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := xlsconv.WriteXLSX(xlsx, []xlsconv.Sheet{{
+		Name: "Sheet1",
+		Rows: [][]string{{"email"}, {"from-xlsx@example.test"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if _, err := Run(logx.New(&buf), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "report_Sheet1.csv"), "\"email\"\n\"from-xls@example.test\"\n")
+	if _, err := os.Stat(xls); !os.IsNotExist(err) {
+		t.Fatalf("report.xls дал CSV и должен быть удалён: %v", err)
+	}
+	if _, err := os.Stat(xlsx); err != nil {
+		t.Fatalf("report.xlsx без своего CSV должен остаться: %v", err)
+	}
+	if !strings.Contains(buf.String(), "report.xlsx") {
+		t.Fatalf("нужна ошибка столкновения имён:\n%s", buf.String())
+	}
+}
+
+// Нарезка users.csv не занимает users_2.csv, который этот запуск записал
+// для таблицы users_2: нарезка падает, оба CSV целы, исходник остаётся.
+func TestSplitDoesNotOverwriteCSVOfThisRun(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sql := "" +
+		"INSERT INTO users_2 (email) VALUES ('x');\n" +
+		"INSERT INTO users (email) VALUES ('a'),('b'),('c');\n"
+	src := filepath.Join(dir, "a.sql")
+	if err := os.WriteFile(src, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if _, err := Run(logx.New(&buf), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"email\"\n\"x\"\n")
+	assertFile(t, filepath.Join(dir, "users.csv"), "\"email\"\n\"a\"\n\"b\"\n\"c\"\n")
+	if !strings.Contains(buf.String(), "не удалось нарезать") {
+		t.Fatalf("нужна ошибка нарезки:\n%s", buf.String())
+	}
+}
+
+// Исходник удаляется только при чистом успехе: INSERT, не попавший в CSV
+// из-за ошибки, иначе пропал бы безвозвратно.
+func TestPartialFailureKeepsSource(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(dir, "dump.sql")
+	copySQLFixture(t, "06_second_too_many.sql", src)
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "t.csv")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Fatalf("исходник с проваленным INSERT должен остаться: %v", err)
+	}
+}
+
 func TestPIISkipKeepsSourceWhileNeighborIsDeleted(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "Alpha")
@@ -1776,7 +1901,7 @@ func writeRepeatedRows(t *testing.T, path, header, line string, rows int) {
 		t.Fatal(err)
 	}
 	b := []byte(line)
-	for i := 0; i < rows; i++ {
+	for range rows {
 		if _, err := w.Write(b); err != nil {
 			t.Fatal(err)
 		}
@@ -1795,4 +1920,65 @@ func assertFile(t *testing.T, path, want string) {
 	if string(got) != want {
 		t.Fatalf("%s:\n got %q\nwant %q", path, got, want)
 	}
+}
+
+// §8: все активные папки не влезают в строку — показывается самая давняя.
+func TestHangShowsOldestWhenListTooWide(t *testing.T) {
+	var buf bytes.Buffer
+	log := logx.New(&buf)
+	var files []scan.SQLFile
+	for i := range 6 {
+		files = append(files, scan.SQLFile{Path: "x.sql", TopFolder: fmt.Sprintf("Папка_с_длинным_именем_%d", i)})
+	}
+	acc := newAccumulator(log, t.TempDir(), files, nil)
+	acc.mu.Lock()
+	for i, f := range files {
+		acc.active[folderKey(f)] = activeFolder{name: f.TopFolder, start: time.Now().Add(-time.Duration(i+1) * time.Second)}
+	}
+	acc.refreshHang()
+	acc.mu.Unlock()
+	got := buf.String()
+	if !strings.Contains(got, "папка в обработке: Папка_с_длинным_именем_5 (6 с)") {
+		t.Fatalf("нужна самая давняя: %q", got)
+	}
+	if strings.Contains(got, "именем_4") {
+		t.Fatalf("список не влезает, остальные не показываются: %q", got)
+	}
+	if w := logx.DisplayWidth(strings.TrimSpace(got)); w > logx.HangWidth {
+		t.Fatalf("ширина %d > %d", w, logx.HangWidth)
+	}
+}
+
+// .txt в незавершённой папке режется как CSV, но построчно и без шапки;
+// папка с одной нарезкой попадает в converted.txt. Мелкий .txt не трогается.
+func TestForeignTxtIsSplitByLines(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "Combo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "list.txt"), []byte("a:1\nb:\"2\nc:3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "small.txt"), []byte("x\ny\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Run(logx.New(io.Discard), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "list.txt"), "a:1\nb:\"2\n")
+	assertFile(t, filepath.Join(dir, "list_2.txt"), "c:3\n")
+	assertFile(t, filepath.Join(dir, "small.txt"), "x\ny\n")
+	if strings.Join(res.SuccessTops, ",") != "Combo" {
+		t.Fatalf("папка с нарезкой должна быть в converted.txt: %v", res.SuccessTops)
+	}
+	if _, err := os.Stat(filepath.Join(root, "converted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(root, "converted.txt"), "Combo\n")
 }

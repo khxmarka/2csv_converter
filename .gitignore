@@ -1,0 +1,9 @@
+# Сборки. 2csv.exe уже в репозитории как способ раздачи и остаётся отслеживаемым.
+*.exe
+*.test
+*.prof
+
+# Локальные настройки IDE и агентов
+.idea/workspace.xml
+.claude/settings.local.json
+.serena/

@@ -116,13 +116,11 @@ func TestAppendConcurrentNamesRemainWholeAndUnique(t *testing.T) {
 	const repeats = 5
 	var wg sync.WaitGroup
 	errs := make(chan error, unique*repeats)
-	for i := 0; i < unique*repeats; i++ {
+	for i := range unique * repeats {
 		name := "Folder " + strconv.Itoa(i%unique)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			errs <- Append(root, name)
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

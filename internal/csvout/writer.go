@@ -46,9 +46,10 @@ type Writer struct {
 
 // Result — итог успешного Commit.
 type Result struct {
-	Path       string
-	PaddedRows int
-	Appended   bool
+	Path        string
+	PaddedRows  int
+	Appended    bool
+	SkippedRows int // строки шире ключа, пропущенные при влитии
 }
 
 // Create открывает временный файл в dir. Заголовок пишется только если это
@@ -63,8 +64,12 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 		return nil, err
 	}
 	base := limitCSVBase(FileBase(table))
-	s := reg.acquire(dir, base)
+	return newWriter(reg, reg.acquire(dir, base), dir, base, columns)
+}
 
+// newWriter открывает temp для уже захваченного слота s. При ошибке слот
+// отпускается.
+func newWriter(reg *Registry, s *slot, dir, base string, columns []string) (*Writer, error) {
 	tmp, err := os.CreateTemp(dir, tmpPattern)
 	if err != nil {
 		s.mu.Unlock()
@@ -163,8 +168,6 @@ func (w *Writer) Row(values []string) error {
 	return err
 }
 
-func (w *Writer) PaddedRows() int { return w.padded }
-
 // Commit вливает временный файл в итоговый CSV и снимает блокировку ключа.
 func (w *Writer) Commit() (Result, error) {
 	var empty Result
@@ -205,19 +208,22 @@ func (w *Writer) Commit() (Result, error) {
 	w.slot.path = final
 	w.slot.nCol = w.nCol
 	w.slot.hasHeader = w.wroteHeader
-	w.reg.addOutput(w.dir, final, w.wroteHeader)
 	return Result{Path: final, PaddedRows: w.padded}, nil
 }
 
+// place публикует первый CSV ключа. Проверка занятости и регистрация идут
+// под одним lockDir: иначе два ключа с одним именем проскочили бы оба.
 func (w *Writer) place(tmpName string) (string, error) {
-	if w.reg != nil {
-		dmu := w.reg.lockDir(w.dir)
-		defer dmu.Unlock()
+	dmu := w.reg.lockDir(w.dir)
+	defer dmu.Unlock()
+	path := filepath.Join(w.dir, w.base+".csv")
+	if w.reg.isWritten(path) {
+		return "", fmt.Errorf("%w: %s", ErrNameTaken, filepath.Base(path))
 	}
-	path := filepath.Join(w.dir, csvName(w.base, 0))
 	if err := replaceFile(tmpName, path); err != nil {
 		return "", err
 	}
+	w.reg.addOutput(w.dir, path, w.wroteHeader)
 	return path, nil
 }
 
@@ -227,6 +233,15 @@ func appendCopy(dst, src string) error {
 		return err
 	}
 	defer in.Close()
+	return appendTo(dst, func(w io.Writer) error {
+		_, err := io.Copy(w, in)
+		return err
+	})
+}
+
+// appendTo дописывает в конец dst то, что пишет write. Провал откатывает
+// dst к исходному размеру: уже записанный CSV ключа не портится (§6).
+func appendTo(dst string, write func(io.Writer) error) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -236,11 +251,15 @@ func appendCopy(dst, src string) error {
 		return errors.Join(err, out.Close())
 	}
 	originalSize := info.Size()
-	_, copyErr := io.Copy(out, in)
+	bw := bufio.NewWriterSize(out, 64*1024)
+	writeErr := write(bw)
+	if writeErr == nil {
+		writeErr = bw.Flush()
+	}
 	closeErr := out.Close()
-	if copyErr != nil || closeErr != nil {
+	if writeErr != nil || closeErr != nil {
 		rollbackErr := os.Truncate(dst, originalSize)
-		return errors.Join(copyErr, closeErr, rollbackErr)
+		return errors.Join(writeErr, closeErr, rollbackErr)
 	}
 	return nil
 }

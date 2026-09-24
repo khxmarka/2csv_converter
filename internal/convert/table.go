@@ -41,6 +41,13 @@ var sqlStartWords = map[string]struct{}{
 	"EXECUTE":  {},
 	"MERGE":    {},
 	"USE":      {},
+	// START/COMMIT/ROLLBACK сюда не входят: «Start Date» — обычная шапка,
+	// а «COMMIT;» отсекает pickTableHeader по пустому хвосту после ';'.
+	"PRAGMA":   {},
+	"DECLARE":  {},
+	"IF":       {},
+	"COPY":     {},
+	"PRINT":    {},
 	"SHOW":     {},
 	"EXPLAIN":  {},
 	"DESCRIBE": {},
@@ -72,11 +79,16 @@ func sniffTable(f *os.File) (*tableHeader, *bufio.Reader, error) {
 		return nil, nil, err
 	}
 	for {
-		line, err := r.ReadString('\n')
+		// ReadSlice, а не ReadString: однострочный дамп на гигабайты не должен
+		// попасть в память целиком (§2). Шапка длиннее буфера — это не шапка.
+		raw, err := r.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			return nil, nil, nil
+		}
 		if err != nil && err != io.EOF {
 			return nil, nil, err
 		}
-		line = trimLine(line)
+		line := trimLine(string(raw))
 		if strings.TrimSpace(line) != "" {
 			if looksLikeSQL(line) {
 				return nil, nil, nil
@@ -126,6 +138,10 @@ func looksLikeSQL(line string) bool {
 		if !ok {
 			return false
 		}
+		// Слово перед запятой — имя колонки шапки (desc,email), не оператор.
+		if strings.HasPrefix(rest, ",") {
+			return false
+		}
 		upper := strings.ToUpper(word)
 		if _, sql := sqlStartWords[upper]; sql {
 			return true
@@ -156,15 +172,22 @@ func nextWord(s string) (word, rest string, ok bool) {
 	return s[:i], s[i:], true
 }
 
+// pickTableHeader считает только непустые поля: у «PRAGMA x=1;» после ';'
+// пустой хвост, это не вторая колонка. Пустое имя внутри шапки (индекс pandas)
+// остаётся колонкой.
 func pickTableHeader(line string) (*tableHeader, bool) {
 	bestN := 1
 	var best *tableHeader
 	for _, d := range tableDelims {
 		fields, err := splitFields(line, d)
-		if err != nil || len(fields) <= bestN {
+		if err != nil {
 			continue
 		}
-		bestN = len(fields)
+		n := nonEmptyFields(fields)
+		if n <= bestN {
+			continue
+		}
+		bestN = n
 		cols := make([]string, len(fields))
 		for i, f := range fields {
 			cols[i] = strings.TrimSpace(f)
@@ -175,6 +198,16 @@ func pickTableHeader(line string) (*tableHeader, bool) {
 		return nil, false
 	}
 	return best, true
+}
+
+func nonEmptyFields(fields []string) int {
+	n := 0
+	for _, f := range fields {
+		if strings.TrimSpace(f) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func splitFields(line string, delim rune) ([]string, error) {
@@ -191,6 +224,79 @@ func splitFields(line string, delim rune) ([]string, error) {
 	out := make([]string, len(rec))
 	copy(out, rec)
 	return out, nil
+}
+
+// maxTableRecord — предел склейки строк с незакрытой кавычкой. Поле в кавычках
+// может содержать перевод строки, но одна битая кавычка не должна съесть файл.
+const maxTableRecord = 1 << 20
+
+// tableReader отдаёт записи табличного .sql без перевода строки в конце.
+// Строка с нечётным числом кавычек склеивается со следующими, пока кавычки
+// не закроются. Не закрылись до maxTableRecord или EOF — запись только из
+// первой строки (она битая), прочитанные вперёд строки идут в разбор снова.
+type tableReader struct {
+	r       *bufio.Reader
+	pending []string
+	// noJoin — сколько строк из pending отдать без склейки: они уже были
+	// хвостом неудачной склейки. Без этого файл, где кавычка нечётна в каждой
+	// строке, читался бы вперёд на maxTableRecord от каждой строки.
+	noJoin int
+	eof    bool
+}
+
+func (t *tableReader) line() (string, bool, error) {
+	if len(t.pending) > 0 {
+		l := t.pending[0]
+		t.pending = t.pending[1:]
+		return l, true, nil
+	}
+	if t.eof {
+		return "", false, nil
+	}
+	l, err := t.r.ReadString('\n')
+	if err == io.EOF {
+		t.eof = true
+		return l, l != "", nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return l, true, nil
+}
+
+func (t *tableReader) next() (string, bool, error) {
+	first, ok, err := t.line()
+	if err != nil || !ok {
+		return "", ok, err
+	}
+	if t.noJoin > 0 {
+		t.noJoin--
+		return trimLine(first), true, nil
+	}
+	quotes := strings.Count(first, `"`)
+	if quotes%2 == 0 {
+		return trimLine(first), true, nil
+	}
+	group := []string{first}
+	size := len(first)
+	for quotes%2 != 0 && size < maxTableRecord {
+		l, ok, err := t.line()
+		if err != nil {
+			return "", false, err
+		}
+		if !ok {
+			break
+		}
+		group = append(group, l)
+		size += len(l)
+		quotes += strings.Count(l, `"`)
+	}
+	if quotes%2 == 0 {
+		return trimLine(strings.Join(group, "")), true, nil
+	}
+	t.pending = append(group[1:], t.pending...)
+	t.noJoin = len(group) - 1
+	return trimLine(first), true, nil
 }
 
 func fileStem(path string) string {
@@ -210,39 +316,44 @@ func convertTable(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, h *t
 		return Result{Skipped: 1, Failed: true}
 	}
 	out := Result{}
-	wrote := 0
+	wrote, badParse, tooMany := 0, 0, 0
+	tr := tableReader{r: r}
 	for {
-		line, err := r.ReadString('\n')
-		atEOF := err == io.EOF
-		if err != nil && !atEOF {
+		rec, ok, err := tr.next()
+		if err != nil {
 			_ = w.Abort()
 			log.Errorf("%s таблица %s: %v", sql.Path, stem, err)
 			return Result{Skipped: 1, Failed: true, UnitFail: 1}
 		}
-		line = trimLine(line)
-		if strings.TrimSpace(line) != "" {
-			fields, splitErr := splitFields(line, h.delim)
-			if splitErr != nil {
-				out.Skipped++
-				out.UnitFail++
-				log.Errorf("%s таблица %s: не разобрать строку", sql.Path, stem)
-			} else if err := w.Row(fields); err != nil {
-				if err == csvout.ErrTooManyValues {
-					out.Skipped++
-					out.UnitFail++
-					log.Errorf("%s таблица %s: %v", sql.Path, stem, err)
-				} else {
-					_ = w.Abort()
-					log.Errorf("%s таблица %s: запись CSV: %v", sql.Path, stem, err)
-					return Result{Skipped: out.Skipped + 1, Failed: true, UnitFail: out.UnitFail + 1}
-				}
-			} else {
-				wrote++
-			}
-		}
-		if atEOF {
+		if !ok {
 			break
 		}
+		if strings.TrimSpace(rec) == "" {
+			continue
+		}
+		fields, splitErr := splitFields(rec, h.delim)
+		if splitErr != nil {
+			badParse++
+			continue
+		}
+		if err := w.Row(fields); err != nil {
+			if err == csvout.ErrTooManyValues {
+				tooMany++
+				continue
+			}
+			_ = w.Abort()
+			log.Errorf("%s таблица %s: запись CSV: %v", sql.Path, stem, err)
+			return Result{Skipped: badParse + tooMany + 1, Failed: true, UnitFail: badParse + tooMany + 1}
+		}
+		wrote++
+	}
+	// Одна строка на файл, а не на каждую битую строку: иначе большой
+	// табличный дамп затапливает консоль (§8).
+	if bad := badParse + tooMany; bad > 0 {
+		out.Skipped += bad
+		out.UnitFail += bad
+		log.Errorf("%s таблица %s: пропущено строк: %d (не разобрать: %d, значений больше, чем колонок: %d)",
+			sql.Path, stem, bad, badParse, tooMany)
 	}
 	if wrote == 0 && out.UnitFail > 0 {
 		_ = w.Abort()

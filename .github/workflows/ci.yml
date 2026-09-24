@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Боевая платформа — Windows: MoveFileExW, mutex корня, регистронезависимые
+    # имена. Linux — вторая платформа для rootlock_other и flock.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go mod tidy
+        shell: bash
+        run: go mod tidy && git diff --exit-code go.mod go.sum
+      - run: go vet ./...
+      - run: go test -race -shuffle=on -count=1 ./...
+      - name: build 2csv.exe
+        if: runner.os == 'Windows'
+        run: go build -o 2csv.exe .
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.13
+
+  vuln:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # GO-2026-6452 (паника excelize на битом .xlsx) без исправления: паника
+      # перехватывается в app.convertExcel, книга пропускается и не удаляется.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./... || true

@@ -19,9 +19,11 @@ const (
 	KindXLSX
 	KindXLS
 	KindCSV
+	// KindTXT — .txt только для построчной нарезки (converted.txt исключён).
+	KindTXT
 )
 
-// SQLFile — найденный .sql / .xlsx / .xls / .csv и его место в дереве относительно корня.
+// SQLFile — найденный .sql / .xlsx / .xls / .csv / .txt и его место в дереве относительно корня.
 type SQLFile struct {
 	Path string
 	Kind Kind
@@ -32,14 +34,11 @@ type SQLFile struct {
 	TopFolder string
 }
 
-// InRoot сообщает, что файл лежит прямо в корне, а не в подпапке.
-func (f SQLFile) InRoot() bool { return f.TopFolder == "" }
-
 // IsExcel — книга .xlsx или .xls.
 func (f SQLFile) IsExcel() bool { return f.Kind == KindXLSX || f.Kind == KindXLS }
 
-// IsCSV — файл .csv для нарезки.
-func (f SQLFile) IsCSV() bool { return f.Kind == KindCSV }
+// IsCSV — файл только для нарезки: .csv или .txt, конвертировать нечего.
+func (f SQLFile) IsCSV() bool { return f.Kind == KindCSV || f.Kind == KindTXT }
 
 // Skip — единица, пропущенная при обходе: symlink или недоступный каталог.
 type Skip struct {
@@ -71,7 +70,7 @@ func ValidateRoot(path string) error {
 	return nil
 }
 
-// Find рекурсивно обходит root и собирает пути *.sql, *.xlsx, *.xls и *.csv без учёта регистра.
+// Find рекурсивно обходит root и собирает пути *.sql, *.xlsx, *.xls, *.csv и *.txt без учёта регистра.
 // Symlink-и не раскрываются: и ссылки на каталоги, и ссылки на файлы попадают в Skips.
 // Ошибки чтения каталогов возвращаются как блокирующие Skips и не роняют обход.
 func Find(root string) (Result, error) {
@@ -82,6 +81,7 @@ func Find(root string) (Result, error) {
 // папки до открытия находящихся в них файлов.
 func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 	var res Result
+	completed = foldTopNames(completed)
 
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -130,7 +130,7 @@ func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 		top, err := topFolder(root, path)
 		if err != nil {
 			res.Skips = append(res.Skips, Skip{Path: path, Reason: err.Error()})
-			return nil
+			return nil //nolint:nilerr // ошибка файла — пропуск в Skips, обход продолжается (§8)
 		}
 		res.Files = append(res.Files, SQLFile{Path: path, Kind: kind, TopFolder: top})
 		return nil
@@ -145,6 +145,7 @@ func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 	return res, nil
 }
 
+// isCompletedTop: completed уже приведён foldTopNames, поиск — O(1).
 func isCompletedTop(root, path string, completed map[string]struct{}) bool {
 	if len(completed) == 0 {
 		return false
@@ -153,16 +154,27 @@ func isCompletedTop(root, path string, completed map[string]struct{}) bool {
 	if err != nil || rel == "." || filepath.Dir(rel) != "." {
 		return false
 	}
-	if runtime.GOOS != "windows" {
-		_, ok := completed[rel]
-		return ok
+	_, ok := completed[foldTopName(rel)]
+	return ok
+}
+
+// foldTopName — ключ сравнения имени верхней папки: на Windows без учёта
+// регистра (§7), как canonicalPath в csvout.
+func foldTopName(name string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(name)
 	}
-	for name := range completed {
-		if strings.EqualFold(name, rel) {
-			return true
-		}
+	return name
+}
+
+// foldTopNames строит множество ключей один раз на обход: иначе на Windows
+// каждая верхняя папка сравнивалась бы со всем converted.txt (O(n²)).
+func foldTopNames(names map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(names))
+	for name := range names {
+		out[foldTopName(name)] = struct{}{}
 	}
-	return false
+	return out
 }
 
 func directTopDir(root, path string) (string, bool) {
@@ -194,33 +206,6 @@ func skipTopFolder(root, path string, isDir bool) string {
 	return parts[0]
 }
 
-// TopFolders возвращает отсортированный список верхних папок, в которых нашлись рабочие файлы.
-func (r Result) TopFolders() []string {
-	seen := make(map[string]struct{})
-	for _, f := range r.Files {
-		if !f.InRoot() {
-			seen[f.TopFolder] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for name := range seen {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// InRootCount — сколько рабочих файлов лежит прямо в корне.
-func (r Result) InRootCount() int {
-	n := 0
-	for _, f := range r.Files {
-		if f.InRoot() {
-			n++
-		}
-	}
-	return n
-}
-
 // isLink отсекает symlink-и и прочие reparse point-ы Windows (junction, mount point).
 func isLink(mode fs.FileMode) bool {
 	return mode&(fs.ModeSymlink|fs.ModeIrregular) != 0
@@ -244,6 +229,8 @@ func workKind(path string) (Kind, bool) {
 		return KindXLS, true
 	case ".csv":
 		return KindCSV, true
+	case ".txt":
+		return KindTXT, true
 	default:
 		return 0, false
 	}

@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"os"
 	"strings"
 )
 
@@ -15,20 +14,19 @@ var errUnclosedBlockComment = errors.New("незакрытый блочный к
 var errIncompleteInsertTail = errors.New("незавершённый хвост INSERT")
 
 type src struct {
-	br      *bufio.Reader
-	pos     int64
-	line    int
-	col     int
-	grab    io.Writer
-	grabErr error
-	wbyte   [1]byte
+	br   *bufio.Reader
+	pos  int64
+	line int
 }
 
 func newSrc(r io.Reader) *src {
+	return newSrcSize(r, readBuf)
+}
+
+func newSrcSize(r io.Reader, size int) *src {
 	return &src{
-		br:   bufio.NewReaderSize(r, readBuf),
+		br:   bufio.NewReaderSize(r, size),
 		line: 1,
-		col:  1,
 	}
 }
 
@@ -52,74 +50,34 @@ func (s *src) next() (byte, error) {
 	s.pos++
 	if b == '\n' {
 		s.line++
-		s.col = 1
-	} else {
-		s.col++
-	}
-	if s.grab != nil && s.grabErr == nil {
-		s.wbyte[0] = b
-		_, s.grabErr = s.grab.Write(s.wbyte[:])
-	}
-	if s.grabErr != nil {
-		return 0, s.grabErr
 	}
 	return b, nil
 }
 
-func (s *src) captureUntilSemicolon() ([]byte, error) {
-	var buf bytes.Buffer
-	s.grab = &buf
-	s.grabErr = nil
-	err := s.skipUntilSemicolon(true, false)
-	s.grab = nil
-	if err == nil {
-		err = s.grabErr
+// plainRun — уже прочитанные в буфер байты до первого quote или '\\'.
+// Срез действителен до следующего чтения; сдвиг — через advance.
+func (s *src) plainRun(quote byte) []byte {
+	if s.br.Buffered() == 0 {
+		if _, err := s.br.Peek(1); err != nil {
+			return nil
+		}
 	}
-	s.grabErr = nil
-	if err != nil {
-		return nil, err
+	buf, _ := s.br.Peek(s.br.Buffered())
+	end := len(buf)
+	if i := bytes.IndexByte(buf, quote); i >= 0 {
+		end = i
 	}
-	return buf.Bytes(), nil
+	if i := bytes.IndexByte(buf[:end], '\\'); i >= 0 {
+		end = i
+	}
+	return buf[:end]
 }
 
-const spillPattern = ".2csv-*.tmp"
-
-func (s *src) spillUntilSemicolon(dir string) (string, error) {
-	if dir == "" {
-		dir = os.TempDir()
-	}
-	f, err := os.CreateTemp(dir, spillPattern)
-	if err != nil {
-		return "", err
-	}
-	ok := false
-	defer func() {
-		if !ok {
-			_ = f.Close()
-			_ = os.Remove(f.Name())
-		}
-	}()
-	w := bufio.NewWriterSize(f, 256*1024)
-	s.grab = w
-	s.grabErr = nil
-	err = s.skipUntilSemicolon(true, false)
-	s.grab = nil
-	if err == nil {
-		err = s.grabErr
-	}
-	s.grabErr = nil
-	if err != nil {
-		return "", err
-	}
-	if err := w.Flush(); err != nil {
-		return "", err
-	}
-	name := f.Name()
-	if err := f.Close(); err != nil {
-		return "", err
-	}
-	ok = true
-	return name, nil
+// advance пропускает chunk, только что полученный из plainRun.
+func (s *src) advance(chunk []byte) {
+	s.pos += int64(len(chunk))
+	s.line += bytes.Count(chunk, []byte{'\n'})
+	_, _ = s.br.Discard(len(chunk))
 }
 
 func (s *src) peek() (byte, error) {
@@ -136,11 +94,6 @@ func (s *src) peekByte(i int) (byte, bool) {
 		return 0, false
 	}
 	return xs[i], true
-}
-
-func (s *src) eof() bool {
-	_, err := s.peek()
-	return err != nil
 }
 
 func (s *src) skipSpaceAndComments() error {
@@ -282,6 +235,9 @@ func (s *src) skipBlockCommentStrict() error {
 	}
 }
 
+// skipQuoted пропускает литерал. Обратный слэш экранирует и в '…', и в "…" —
+// так же, как readString при разборе ячеек: иначе сканер и парсер находят
+// конец statement в разных местах и следующий INSERT теряется.
 func (s *src) skipQuoted(quote byte) error {
 	if _, err := s.next(); err != nil {
 		return err
@@ -291,7 +247,7 @@ func (s *src) skipQuoted(quote byte) error {
 		if err != nil {
 			return err
 		}
-		if quote == '\'' && b == '\\' {
+		if quote != '`' && b == '\\' {
 			if _, err := s.next(); err != nil && err != io.EOF {
 				return err
 			}
@@ -308,6 +264,59 @@ func (s *src) skipQuoted(quote byte) error {
 			}
 		}
 		return nil
+	}
+}
+
+const maxDollarTag = 64
+
+// dollarTag возвращает открывающий тег Postgres-строки ($$ или $tag$), если
+// с текущего байта начинается такой литерал. $1 и одиночный $ — не литерал.
+func (s *src) dollarTag() (string, bool) {
+	for i := 1; i <= maxDollarTag; i++ {
+		c, ok := s.peekByte(i)
+		if !ok {
+			return "", false
+		}
+		if c == '$' {
+			tag, _ := s.br.Peek(i + 1)
+			return string(tag), true
+		}
+		if !identStart(c) && (i <= 1 || !isDigit(c)) {
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// skipDollarQuoted пропускает $tag$…$tag$ целиком: тела функций Postgres
+// содержат INSERT, которые не являются данными дампа. Не литерал — один '$'.
+func (s *src) skipDollarQuoted() error {
+	tag, ok := s.dollarTag()
+	if !ok {
+		_, err := s.next()
+		return err
+	}
+	for range len(tag) {
+		if _, err := s.next(); err != nil {
+			return err
+		}
+	}
+	for {
+		b, err := s.peek()
+		if err != nil {
+			return err
+		}
+		if b == '$' && s.starts(tag) {
+			for range len(tag) {
+				if _, err := s.next(); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if _, err := s.next(); err != nil {
+			return err
+		}
 	}
 }
 
@@ -460,17 +469,32 @@ func (s *src) skipUntilSemicolon(stopAtStmt, strictComments bool) error {
 				depth--
 			}
 			_, _ = s.next()
-		case stopAtStmt && depth == 0 && identStart(b):
-			word, ok, err := s.peekUnquotedWord()
+		case b == '$':
+			seenContent = true
+			if err := s.skipDollarQuoted(); err != nil {
+				if err == io.EOF {
+					if strictComments {
+						return errIncompleteInsertTail
+					}
+					return nil
+				}
+				return err
+			}
+		case identStart(b):
+			// Слово съедается целиком: '$' внутри имени (a$b$c) не должен
+			// открывать $$-литерал.
+			word, _, err := s.peekUnquotedWord()
 			if err != nil {
 				return err
 			}
-			if ok && isStmtStart(word) {
+			if stopAtStmt && depth == 0 && isStmtStart(word) {
 				return nil
 			}
 			seenContent = true
-			if _, err := s.next(); err != nil {
-				return err
+			for range max(len(word), 1) {
+				if _, err := s.next(); err != nil {
+					return err
+				}
 			}
 		default:
 			if !isSpace(b) {

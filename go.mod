@@ -2,6 +2,8 @@ module sql2csv
 
 go 1.26.5
 
+toolchain go1.26.6
+
 require (
 	github.com/nkiri/xls v0.0.4
 	github.com/xuri/excelize/v2 v2.11.0

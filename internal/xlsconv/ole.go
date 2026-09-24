@@ -69,7 +69,7 @@ func (w *oleWriter) writeTo(dst *bytes.Buffer) error {
 			}
 			layouts[i].startSect = nextMini
 			n := (len(s.data) + oleMini - 1) / oleMini
-			for j := 0; j < n; j++ {
+			for j := range n {
 				var sector [oleMini]byte
 				copy(sector[:], s.data[j*oleMini:])
 				miniStream = append(miniStream, sector[:]...)
@@ -135,7 +135,7 @@ func (w *oleWriter) writeTo(dst *bytes.Buffer) error {
 		fat[i] = oleFAT
 	}
 	chain := func(start uint32, n int) {
-		for i := 0; i < n; i++ {
+		for i := range n {
 			sid := start + uint32(i)
 			if i < n-1 {
 				fat[sid] = sid + 1
@@ -177,7 +177,7 @@ func (w *oleWriter) writeTo(dst *bytes.Buffer) error {
 	binary.LittleEndian.PutUint32(hdr[60:], firstMiniFAT)
 	binary.LittleEndian.PutUint32(hdr[64:], uint32(numMiniFAT))
 	binary.LittleEndian.PutUint32(hdr[68:], oleEnd)
-	for i := 0; i < 109; i++ {
+	for i := range 109 {
 		v := oleFree
 		if i < numFAT {
 			v = uint32(i)
@@ -191,7 +191,7 @@ func (w *oleWriter) writeTo(dst *bytes.Buffer) error {
 	perFAT := oleSector / 4
 	for i := 0; i < numFAT; i++ {
 		var sector [oleSector]byte
-		for j := 0; j < perFAT; j++ {
+		for j := range perFAT {
 			idx := i*perFAT + j
 			v := oleFree
 			if idx < len(fat) {
@@ -227,9 +227,9 @@ func (w *oleWriter) writeTo(dst *bytes.Buffer) error {
 		}
 		slots[i+1] = oleDir(l.name, oleObjStream, oleFree, right, oleFree, l.startSect, uint32(len(l.data)))
 	}
-	for s := 0; s < numDirSectors; s++ {
+	for s := range numDirSectors {
 		var sector [oleSector]byte
-		for e := 0; e < 4; e++ {
+		for e := range 4 {
 			copy(sector[e*oleDirEntry:], slots[s*4+e][:])
 		}
 		if _, err := dst.Write(sector[:]); err != nil {

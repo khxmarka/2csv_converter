@@ -56,6 +56,7 @@ func TestFindOnFixtureTree(t *testing.T) {
 		{Path: filepath.Join(root, "Alpha", "alpha.SQL"), TopFolder: "Alpha"},
 		{Path: filepath.Join(root, "Alpha", "x", "y", "deep.sql"), TopFolder: "Alpha"},
 		{Path: filepath.Join(root, "Beta", "beta.Sql"), TopFolder: "Beta"},
+		{Path: filepath.Join(root, "Beta", "notes.txt"), Kind: KindTXT, TopFolder: "Beta"},
 		{Path: filepath.Join(root, "root_level.sql"), TopFolder: ""},
 	}
 	if !reflect.DeepEqual(result.Files, want) {
@@ -63,12 +64,6 @@ func TestFindOnFixtureTree(t *testing.T) {
 	}
 	if len(result.Skips) != 0 {
 		t.Fatalf("пропусков на чистой фикстуре быть не должно: %#v", result.Skips)
-	}
-	if got := result.InRootCount(); got != 1 {
-		t.Fatalf("файлов в корне: получено %d, ожидалось 1", got)
-	}
-	if got := result.TopFolders(); !reflect.DeepEqual(got, []string{"Alpha", "Beta"}) {
-		t.Fatalf("верхние папки: получено %v, ожидалось [Alpha Beta]", got)
 	}
 	if !reflect.DeepEqual(result.TopDirs, []string{"Alpha", "Beta", "Gamma"}) {
 		t.Fatalf("верхние каталоги: %v", result.TopDirs)
@@ -83,6 +78,7 @@ func TestFindSkippingExcludesCompletedTopFolder(t *testing.T) {
 	}
 	want := []SQLFile{
 		{Path: filepath.Join(root, "Beta", "beta.Sql"), TopFolder: "Beta"},
+		{Path: filepath.Join(root, "Beta", "notes.txt"), Kind: KindTXT, TopFolder: "Beta"},
 		{Path: filepath.Join(root, "root_level.sql"), TopFolder: ""},
 	}
 	if !reflect.DeepEqual(result.Files, want) {
@@ -94,7 +90,7 @@ func TestFindSkippingExcludesCompletedTopFolder(t *testing.T) {
 }
 
 func TestSkipTopFolderForWalkError(t *testing.T) {
-	root := filepath.Join("root")
+	root := "root"
 	if got := skipTopFolder(root, filepath.Join(root, "Alpha", "locked", "file.sql"), false); got != "Alpha" {
 		t.Fatalf("TopFolder=%q", got)
 	}
@@ -194,7 +190,7 @@ func TestFindIgnoresNonSQL(t *testing.T) {
 		t.Fatalf("Find: %v", err)
 	}
 	for _, f := range result.Files {
-		if strings.EqualFold(filepath.Ext(f.Path), ".sqlx") || strings.HasSuffix(f.Path, "notes.txt") {
+		if strings.EqualFold(filepath.Ext(f.Path), ".sqlx") {
 			t.Fatalf("не-.sql попал в список: %s", f.Path)
 		}
 	}
@@ -216,7 +212,7 @@ func TestFindCollectsExcelIgnoresOtherTables(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"skip.xlsm", "old.xlsb", "calc.ods", "notes.txt"} {
+	for _, name := range []string{"skip.xlsm", "old.xlsb", "calc.ods", "notes.md"} {
 		if err := os.WriteFile(filepath.Join(alpha, name), []byte("no"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -279,13 +275,13 @@ func TestFindCollectsCSVSkipsTempsAndConverted(t *testing.T) {
 	if err := os.MkdirAll(alpha, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	keep := []string{"rows.csv", "DATA.CSV"}
-	for _, name := range keep {
+	keep := map[string]Kind{"rows.csv": KindCSV, "DATA.CSV": KindCSV, "notes.txt": KindTXT, "LIST.TXT": KindTXT}
+	for name := range keep {
 		if err := os.WriteFile(filepath.Join(alpha, name), []byte("h\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"converted.txt", ".2csv-left.tmp", "notes.txt"} {
+	for _, name := range []string{"converted.txt", "Converted.TXT", ".2csv-left.tmp", "notes.md"} {
 		if err := os.WriteFile(filepath.Join(alpha, name), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -298,11 +294,11 @@ func TestFindCollectsCSVSkipsTempsAndConverted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Files) != 2 {
+	if len(result.Files) != len(keep) {
 		t.Fatalf("файлы: %#v", result.Files)
 	}
 	for _, f := range result.Files {
-		if f.Kind != KindCSV || f.TopFolder != "Alpha" {
+		if f.Kind != keep[filepath.Base(f.Path)] || f.TopFolder != "Alpha" {
 			t.Fatalf("csv: %+v", f)
 		}
 		base := filepath.Base(f.Path)

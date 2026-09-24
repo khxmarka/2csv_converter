@@ -35,7 +35,7 @@ func (h jobHeap) Less(i, j int) bool {
 
 func (h jobHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
-func (h *jobHeap) Push(x any) { *h = append(*h, x.(schedJob)) }
+func (h *jobHeap) Push(x any) { *h = append(*h, x.(schedJob)) } //nolint:forcetypeassert // container/heap: в кучу кладём только schedJob
 
 func (h *jobHeap) Pop() any {
 	old := *h
@@ -92,7 +92,7 @@ func runDirs(acc *accumulator, log *logx.Logger, reg *csvout.Registry, files []s
 		reg:   reg,
 	}
 	r.cond = sync.NewCond(&r.mu)
-	for i := 0; i < n; i++ {
+	for range n {
 		r.wg.Add(1)
 		go r.worker()
 	}
@@ -158,7 +158,7 @@ func (r *runner) worker() {
 			r.mu.Unlock()
 			return
 		}
-		item := heap.Pop(&r.jobs).(schedJob)
+		item := heap.Pop(&r.jobs).(schedJob) //nolint:forcetypeassert // container/heap: в куче только schedJob
 		if len(r.jobs) == 0 {
 			r.fillLocked()
 		}

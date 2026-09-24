@@ -2,6 +2,7 @@ package xlsconv
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -134,6 +135,51 @@ func TestWriteTwoSheetsTwoFiles(t *testing.T) {
 				t.Fatalf("склеены или неверный формат:\nFirst %q\nSecond %q", a, b)
 			}
 		})
+	}
+}
+
+// §13: ширина = максимум колонок среди строк; короткая шапка и строки
+// дополняются "", внутренняя пустая строка сохраняется, хвостовая — нет.
+func TestWriteXLSXWidthFromWidestRow(t *testing.T) {
+	src := writeXLSX(t, []specSheet{{
+		Name: "W",
+		Rows: [][]string{
+			{"h"},
+			{"a", "b", "c"},
+			{""},
+			{"d"},
+			{""},
+		},
+	}})
+	res := File(csvout.NewRegistry(), src)
+	if res.WriteErr != nil || res.CSV != 1 {
+		t.Fatalf("результат: %+v", res)
+	}
+	want := "\"h\",\"\",\"\"\n\"a\",\"b\",\"c\"\n\"\",\"\",\"\"\n\"d\",\"\",\"\"\n"
+	if got := readFile(t, res.Paths[0]); got != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+}
+
+// §13: скрытые и очень скрытые листы тоже дают CSV; 5 листов — ещё в scope.
+func TestWriteHiddenAndFiveSheetsXLSX(t *testing.T) {
+	src := writeXLSX(t, []specSheet{
+		{Name: "Visible", Rows: [][]string{{"v"}}},
+		{Name: "Hidden", Rows: [][]string{{"h"}}, Hidden: true},
+		{Name: "Very", Rows: [][]string{{"w"}}, VeryHidden: true},
+		{Name: "Four", Rows: [][]string{{"4"}}},
+		{Name: "Five", Rows: [][]string{{"5"}}},
+	})
+	res := File(csvout.NewRegistry(), src)
+	if res.OpenErr != nil || res.WriteErr != nil || res.SkipTooMany || res.CSV != 5 {
+		t.Fatalf("результат: %+v", res)
+	}
+	dir := filepath.Dir(src)
+	if got := readFile(t, filepath.Join(dir, "book_Hidden.csv")); got != "\"h\"\n" {
+		t.Fatalf("скрытый лист: %q", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "book_Very.csv")); got != "\"w\"\n" {
+		t.Fatalf("очень скрытый лист: %q", got)
 	}
 }
 
@@ -300,7 +346,7 @@ func TestWriteEmptySheetSkipped(t *testing.T) {
 	}
 }
 
-func TestWriteOverwritesSQLCSVWithoutAppending(t *testing.T) {
+func TestWriteDoesNotOverwriteSQLCSVOfThisRun(t *testing.T) {
 	src := writeXLSX(t, []specSheet{{Name: "Only", Rows: [][]string{{"excel"}}}})
 	dir := filepath.Dir(src)
 	reg := csvout.NewRegistry()
@@ -320,15 +366,11 @@ func TestWriteOverwritesSQLCSVWithoutAppending(t *testing.T) {
 	}
 
 	res := File(reg, src)
-	if res.OpenErr != nil || res.CSV != 1 {
-		t.Fatalf("err=%v csv=%d", res.OpenErr, res.CSV)
+	if res.OpenErr != nil || res.CSV != 0 || !errors.Is(res.WriteErr, csvout.ErrNameTaken) {
+		t.Fatalf("err=%v csv=%d writeErr=%v", res.OpenErr, res.CSV, res.WriteErr)
 	}
-	if filepath.Base(res.Paths[0]) != "book_Only.csv" || res.Paths[0] != sqlRes.Path {
-		t.Fatalf("Excel должен заменить целевой CSV: SQL=%s Excel=%s", sqlRes.Path, res.Paths[0])
-	}
-	sqlRaw := readFile(t, sqlRes.Path)
-	if strings.Contains(sqlRaw, "\"id\"") || sqlRaw != "\"excel\"\n" {
-		t.Fatalf("CSV должен содержать только Excel без дописывания: %q", sqlRaw)
+	if sqlRaw := readFile(t, sqlRes.Path); sqlRaw != "\"id\"\n\"sql\"\n" {
+		t.Fatalf("CSV SQL затёрт или дописан: %q", sqlRaw)
 	}
 }
 
