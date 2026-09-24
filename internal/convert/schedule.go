@@ -46,7 +46,11 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 	}
 
 	q := newCommitQ()
-	done := q.start()
+	done := q.start(func(rec any) {
+		st.skipped++
+		st.failed = true
+		log.Errorf("%s: сбой записи INSERT (%v), INSERT пропущен", sql.Path, rec)
+	})
 	defer func() {
 		q.close()
 		<-done
