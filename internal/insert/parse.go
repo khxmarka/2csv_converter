@@ -225,6 +225,7 @@ func parseInsert(s *src, h Handler) error {
 	if h.ValuesAt != nil {
 		meta.ValuesLine = s.line
 		off := s.pos
+		meta.ValuesOffset = off
 		if err := s.skipUntilSemicolon(true, false); err != nil {
 			return err
 		}
@@ -346,11 +347,17 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 				return err
 			}
 		case err != nil:
+			// Место ошибки — строка и байт файла: по ним видно, что в дампе
+			// (дамп INSERT часто одна строка на мегабайты).
+			reason := fmt.Sprintf("битый INSERT: %v (строка %d, байт %d)", err, s.line, meta.ValuesOffset+s.pos)
+			if errors.Is(err, io.EOF) {
+				reason = fmt.Sprintf("INSERT оборван концом файла, целых строк нет (строка %d)", s.line)
+			}
 			if began {
-				_ = skip("битый INSERT: "+err.Error(), table)
+				_ = skip(reason, table)
 				return nil
 			}
-			return skip("битый INSERT: "+err.Error(), table)
+			return skip(reason, table)
 		default:
 			accepted++
 		}

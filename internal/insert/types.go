@@ -15,6 +15,9 @@ type Meta struct {
 	// ValuesLine — строка файла, с которой начинается хвост после VALUES.
 	// ParseValues по ней считает абсолютные номера строк (Handler.Cut).
 	ValuesLine int
+	// ValuesOffset — байт файла, с которого начинается хвост после VALUES:
+	// ParseValues по нему считает абсолютный байт места ошибки.
+	ValuesOffset int64
 }
 
 // Kind — тип ячейки VALUES.

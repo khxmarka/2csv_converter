@@ -2,6 +2,7 @@ package convert
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -228,5 +229,22 @@ func TestScheduleTruncatedDumpKeepsRows(t *testing.T) {
 	if !strings.Contains(buf.String(), ".sql:6 таблица interestedtoparticipate: INSERT оборван") ||
 		!strings.Contains(buf.String(), "записано строк: 2") {
 		t.Fatalf("лог: %q", buf.String())
+	}
+}
+
+// Ошибка разбора указывает строку и байт файла места поломки (не начала
+// INSERT): дамп INSERT часто одна строка на мегабайты.
+func TestScheduleBrokenRowReportsByteOffset(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.sql")
+	sql := "-- dump\nINSERT INTO users (email, name) VALUES ('x','y'),\n('a' 'b');\n"
+	if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path}, nil)
+	want := fmt.Sprintf("a.sql:2 таблица users: битый INSERT: между значениями нет запятой (строка 3, байт %d)", strings.Index(sql, "'b'"))
+	if !strings.Contains(buf.String(), want) {
+		t.Fatalf("лог:\n%s\nждали: %s", buf.String(), want)
 	}
 }

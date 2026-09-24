@@ -239,7 +239,7 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 		s.skip(*prep.skip)
 		if prep.surplus > 0 {
 			s.unitFail += prep.surplus
-			s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Table, prep.surplus)
+			s.log.Errorf("%s:%d таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Line, meta.Table, prep.surplus)
 		}
 		return
 	}
@@ -250,7 +250,7 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 		if prep.surplus > 0 {
 			s.skipped++
 			s.unitFail += prep.surplus
-			s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Table, prep.surplus)
+			s.log.Errorf("%s:%d таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Line, meta.Table, prep.surplus)
 			return
 		}
 		s.skip(insert.Skip{Table: meta.Table, Reason: "нет строк VALUES", Offset: meta.Offset, Line: meta.Line})
@@ -266,7 +266,7 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 			}
 			s.skipped++
 			s.unitFail += n
-			s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Table, n)
+			s.log.Errorf("%s:%d таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Line, meta.Table, n)
 			return
 		}
 		s.skipped++
@@ -282,7 +282,7 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 	totalSurplus := prep.surplus + res.SkippedRows
 	if totalSurplus > 0 {
 		s.unitFail += totalSurplus
-		s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Table, totalSurplus)
+		s.log.Errorf("%s:%d таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Line, meta.Table, totalSurplus)
 	}
 	if prep.cut != "" {
 		// Не молчим: хвост INSERT потерян, исходник остаётся (unitFail, §15).
