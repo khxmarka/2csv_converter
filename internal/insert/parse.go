@@ -124,7 +124,8 @@ func parseInsert(s *src, h Handler) error {
 		if err == io.EOF {
 			return skip("незакрытый INSERT", "")
 		}
-		return skip(err.Error(), "")
+		// Обычно это склеенная/повреждённая строка дампа: «INSERT INTO pre_ucente119.220…».
+		return skip("битое имя таблицы после INSERT INTO: "+err.Error(), "")
 	}
 	if table == "" {
 		return skip("пустое имя таблицы", "")
