@@ -18,7 +18,9 @@ type Registry struct {
 	byDir map[string]*sync.Mutex
 	// slotsIn — слоты склейки по canonicalPath директории, для CloseDir.
 	slotsIn map[string][]*slot
-	outs    []output
+	// outs — CSV этого запуска по canonicalPath директории. Map, а не общий
+	// список: иначе каждый новый CSV сканировал бы все CSV запуска (O(n²)).
+	outs map[string][]output
 	// written — canonicalPath каждого CSV, записанного в этом запуске.
 	written map[string]struct{}
 }
@@ -68,7 +70,7 @@ func (s *slot) closeApp() error {
 }
 
 type output struct {
-	dir       string
+	key       string // canonicalPath(path)
 	path      string
 	hasHeader bool
 }
@@ -84,6 +86,7 @@ func NewRegistry() *Registry {
 		byKey:   make(map[string]*slot),
 		byDir:   make(map[string]*sync.Mutex),
 		slotsIn: make(map[string][]*slot),
+		outs:    make(map[string][]output),
 		written: make(map[string]struct{}),
 	}
 }
@@ -154,13 +157,15 @@ func (r *Registry) addOutput(dir, path string, hasHeader bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.written[pathKey] = struct{}{}
-	for i, o := range r.outs {
-		if o.dir == dir && canonicalPath(o.path) == pathKey {
-			r.outs[i] = output{dir: dir, path: path, hasHeader: hasHeader}
+	item := output{key: pathKey, path: path, hasHeader: hasHeader}
+	list := r.outs[dir]
+	for i, o := range list {
+		if o.key == pathKey {
+			list[i] = item
 			return
 		}
 	}
-	r.outs = append(r.outs, output{dir: dir, path: path, hasHeader: hasHeader})
+	r.outs[dir] = append(list, item)
 }
 
 func (r *Registry) isWritten(path string) bool {
@@ -179,11 +184,10 @@ func (r *Registry) OutputsIn(dir string) []Output {
 	dir = canonicalPath(dir)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var out []Output
-	for _, o := range r.outs {
-		if o.dir == dir {
-			out = append(out, Output{Path: o.path, HasHeader: o.hasHeader})
-		}
+	list := r.outs[dir]
+	out := make([]Output, len(list))
+	for i, o := range list {
+		out[i] = Output{Path: o.path, HasHeader: o.hasHeader}
 	}
 	return out
 }
