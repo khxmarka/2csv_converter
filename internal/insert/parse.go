@@ -245,9 +245,9 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		return s.skipUntilSemicolon(true, false)
 	}
 	began := false
-	surplus := false
-	rows := 0
+	accepted := 0
 	expectRow := false
+	maxCells := len(cols)
 
 	begin := func() error {
 		if began {
@@ -258,6 +258,12 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 			return h.Begin(meta)
 		}
 		return nil
+	}
+
+	noteSurplus := func() {
+		if h.RowSurplus != nil {
+			h.RowSurplus()
+		}
 	}
 
 	for {
@@ -281,28 +287,56 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 			break
 		}
 		expectRow = false
-		cells, err := parseRow(s)
-		if err != nil {
-			if began {
-				_ = skip("битый INSERT: "+err.Error(), table)
-				return nil
-			}
-			return skip("битый INSERT: "+err.Error(), table)
-		}
-		if len(cols) > 0 && len(cells) > len(cols) {
-			surplus = true
-		}
-		if !surplus {
+
+		if h.StreamRow != nil {
 			if err := begin(); err != nil {
 				return err
 			}
-			if h.Row != nil {
-				if err := h.Row(cells); err != nil {
+			err := h.StreamRow(func(cw CellWriter) error {
+				return emitRow(s, cw, maxCells)
+			})
+			if errors.Is(err, ErrRowSurplus) {
+				noteSurplus()
+			} else if err != nil {
+				if began {
+					_ = skip("битый INSERT: "+err.Error(), table)
+					return nil
+				}
+				return skip("битый INSERT: "+err.Error(), table)
+			} else {
+				accepted++
+			}
+		} else {
+			cells, err := parseRow(s)
+			if err != nil {
+				if began {
+					_ = skip("битый INSERT: "+err.Error(), table)
+					return nil
+				}
+				return skip("битый INSERT: "+err.Error(), table)
+			}
+			if maxCells > 0 && len(cells) > maxCells {
+				noteSurplus()
+			} else {
+				if err := begin(); err != nil {
 					return err
+				}
+				if h.Row != nil {
+					if err := h.Row(cells); err != nil {
+						if errors.Is(err, ErrRowSurplus) {
+							noteSurplus()
+						} else {
+							return err
+						}
+					} else {
+						accepted++
+					}
+				} else {
+					accepted++
 				}
 			}
 		}
-		rows++
+
 		if err := s.skipTailSpaceAndComments(); err != nil {
 			if errors.Is(err, errUnclosedBlockComment) {
 				return skip(err.Error(), table)
@@ -324,10 +358,11 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		break
 	}
 
-	if surplus {
-		return skip("значений больше, чем колонок", table)
-	}
-	if rows == 0 {
+	if accepted == 0 {
+		if began {
+			// Begin уже вызван (StreamRow), но валидных строк нет — Skip сбросит temp.
+			return skip("нет строк VALUES", table)
+		}
 		return skip("нет строк VALUES", table)
 	}
 	validTail, err := consumeTail(s)

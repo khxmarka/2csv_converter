@@ -1,6 +1,11 @@
 // Package insert — потоковый разбор INSERT ... VALUES из io.Reader (§4 политики).
 package insert
 
+import (
+	"errors"
+	"io"
+)
+
 // Meta — заголовок одного оператора INSERT.
 type Meta struct {
 	Table   string
@@ -33,6 +38,17 @@ type Skip struct {
 	Reason string
 }
 
+// ErrRowSurplus — строка VALUES шире допустимой; INSERT не отменяется.
+var ErrRowSurplus = errors.New("значений больше, чем колонок")
+
+// CellWriter принимает ячейки одной строки VALUES без хранения всего текста в слайсе.
+type CellWriter interface {
+	Null() error
+	Missing() error
+	// Text копирует декодированный SQL-текст значения в w (без SQL-кавычек).
+	Text(write func(w io.Writer) error) error
+}
+
 // Handler принимает события разбора. Нил-колбэки пропускаются.
 // Ошибка из Begin/Row/End останавливает разбор (это I/O потребителя, не SQL).
 type Handler struct {
@@ -48,7 +64,15 @@ type Handler struct {
 	// SpillDir — каталог временного файла для ValuesFile. Пусто — TempDir.
 	SpillDir string
 	Begin    func(Meta) error
-	Row      func([]Cell) error
-	End      func() error
-	Skip     func(Skip)
+	// Row получает одну разобранную строку VALUES.
+	// Вернуть ErrRowSurplus — пропустить только эту строку.
+	Row func([]Cell) error
+	// StreamRow, если задан, используется вместо Row: пишет строку без []Cell.
+	// emit заполняет ячейки текущей tuple; потребитель пишет CSV сам.
+	// Вернуть ErrRowSurplus — пропустить строку; остальные строки INSERT продолжаются.
+	StreamRow func(emit func(CellWriter) error) error
+	// RowSurplus вызывается один раз на каждую пропущенную из‑за ширины строку.
+	RowSurplus func()
+	End        func() error
+	Skip       func(Skip)
 }

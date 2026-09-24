@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -56,6 +57,7 @@ func File(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile) Result {
 		BeforeValues: s.beforeValues,
 		Begin:        s.begin,
 		Row:          s.row,
+		RowSurplus:   func() { s.surplus++ },
 		End:          s.end,
 		Skip:         s.skip,
 	}); err != nil {
@@ -76,20 +78,22 @@ func File(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile) Result {
 }
 
 type session struct {
-	log      *logx.Logger
-	reg      *csvout.Registry
-	sql      scan.SQLFile
-	dir      string
-	writer   *csvout.Writer
-	meta     insert.Meta
-	created  int
-	csvNew   int
-	skipped  int
-	piiN     int
-	unitFail int
-	failed   bool
-	piiSkip  bool
-	paths    []string
+	log         *logx.Logger
+	reg         *csvout.Registry
+	sql         scan.SQLFile
+	dir         string
+	writer      *csvout.Writer
+	meta        insert.Meta
+	created     int
+	csvNew      int
+	skipped     int
+	piiN        int
+	unitFail    int
+	failed      bool
+	piiSkip     bool
+	surplus     int
+	rowsWritten int
+	paths       []string
 }
 
 func (s *session) dropWriter() {
@@ -113,6 +117,8 @@ func (s *session) begin(meta insert.Meta) error {
 	s.dropWriter()
 	s.meta = meta
 	s.piiSkip = false
+	s.surplus = 0
+	s.rowsWritten = 0
 	w, err := csvout.Create(s.reg, s.dir, meta.Table, meta.Columns)
 	if err != nil {
 		s.skipped++
@@ -130,24 +136,52 @@ func (s *session) row(cells []insert.Cell) error {
 	}
 	values, _, err := csvout.NormalizeRow(cells, s.writer.NCol())
 	if err != nil {
+		if errors.Is(err, csvout.ErrTooManyValues) {
+			s.surplus++
+			return nil
+		}
 		s.dropWriter()
 		s.skipped++
-		s.unitFail++
+		s.failed = true
 		s.log.Errorf("%s таблица %s: %v", s.sql.Path, s.meta.Table, err)
 		return nil
 	}
 	if err := s.writer.Row(values); err != nil {
+		if errors.Is(err, csvout.ErrTooManyValues) {
+			s.surplus++
+			return nil
+		}
 		s.dropWriter()
 		s.skipped++
 		s.failed = true
 		s.log.Errorf("%s таблица %s: запись CSV: %v", s.sql.Path, s.meta.Table, err)
+		return nil
 	}
+	s.rowsWritten++
 	return nil
 }
 
 func (s *session) end() error {
 	s.piiSkip = false
+	surplus := s.surplus
+	s.surplus = 0
 	if s.writer == nil {
+		if surplus > 0 {
+			s.skipped++
+			s.unitFail += surplus
+			s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, s.meta.Table, surplus)
+		}
+		return nil
+	}
+	if s.rowsWritten == 0 {
+		s.dropWriter()
+		if surplus > 0 {
+			s.skipped++
+			s.unitFail += surplus
+			s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, s.meta.Table, surplus)
+			return nil
+		}
+		s.skipped++
 		return nil
 	}
 	w := s.writer
@@ -164,6 +198,10 @@ func (s *session) end() error {
 	if !res.Appended {
 		s.csvNew++
 	}
+	if surplus > 0 {
+		s.unitFail += surplus
+		s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, s.meta.Table, surplus)
+	}
 	return nil
 }
 
@@ -178,12 +216,27 @@ func skipQuiet(reason string) bool {
 
 func (s *session) skip(sk insert.Skip) {
 	hadWriter := s.writer != nil
+	surplus := s.surplus
+	s.surplus = 0
 	s.dropWriter()
 	if s.piiSkip {
 		s.piiSkip = false
 		return
 	}
 	s.skipped++
+	if surplus > 0 {
+		s.unitFail += surplus
+		table := sk.Table
+		if table == "" {
+			table = s.meta.Table
+		}
+		if table != "" {
+			s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, table, surplus)
+		} else {
+			s.log.Errorf("%s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, surplus)
+		}
+		return
+	}
 	if skipQuiet(sk.Reason) && !hadWriter {
 		return
 	}

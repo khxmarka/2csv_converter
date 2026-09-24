@@ -394,17 +394,69 @@ func TestParseMissingValuesPaddedAsMissing(t *testing.T) {
 	}
 }
 
-func TestParseSurplusValuesSkipsWholeInsert(t *testing.T) {
-	sql := `INSERT INTO t (a, b) VALUES (1, 2), (3, 4, 5); INSERT INTO u (a) VALUES (9);`
+func TestParseSurplusValuesKeepsValidRows(t *testing.T) {
+	sql := `INSERT INTO t (a, b) VALUES (1, 2), (3, 4, 5), (6, 7); INSERT INTO u (a) VALUES (9);`
+	var surplus int
+	var inserts []collected
+	var skips []Skip
+	var cur *collected
+	err := Parse(strings.NewReader(sql), Handler{
+		Begin: func(m Meta) error {
+			c := collected{meta: m}
+			cur = &c
+			return nil
+		},
+		Row: func(cells []Cell) error {
+			if cur == nil {
+				t.Fatal("Row без Begin")
+			}
+			cloned := make([]Cell, len(cells))
+			copy(cloned, cells)
+			cur.rows = append(cur.rows, cloned)
+			return nil
+		},
+		RowSurplus: func() { surplus++ },
+		End: func() error {
+			inserts = append(inserts, *cur)
+			cur = nil
+			return nil
+		},
+		Skip: func(sk Skip) {
+			cur = nil
+			skips = append(skips, sk)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if surplus != 1 {
+		t.Fatalf("surplus=%d", surplus)
+	}
+	if len(skips) != 0 {
+		t.Fatalf("surplus не должен отменять INSERT: %+v", skips)
+	}
+	if len(inserts) != 2 || len(inserts[0].rows) != 2 {
+		t.Fatalf("ожидались 2 валидные строки у t: %+v", inserts)
+	}
+	if inserts[0].rows[0][0].Text != "1" || inserts[0].rows[1][0].Text != "6" {
+		t.Fatalf("строки: %+v", inserts[0].rows)
+	}
+	if inserts[1].meta.Table != "u" {
+		t.Fatalf("второй INSERT: %+v", inserts[1])
+	}
+}
+
+func TestParseAllSurplusSkipsInsert(t *testing.T) {
+	sql := `INSERT INTO t (a, b) VALUES (1, 2, 3), (4, 5, 6); INSERT INTO u (a) VALUES (9);`
 	inserts, skips := collect(t, sql)
-	if len(skips) != 1 || skips[0].Table != "t" {
-		t.Fatalf("лишние значения должны отменить весь INSERT t: %+v", skips)
-	}
-	if !strings.Contains(skips[0].Reason, "больше") {
-		t.Fatalf("причина: %q", skips[0].Reason)
-	}
 	if len(inserts) != 1 || inserts[0].meta.Table != "u" {
-		t.Fatalf("следующий INSERT должен выжить: %+v", inserts)
+		t.Fatalf("inserts=%+v", inserts)
+	}
+	if len(skips) != 1 || skips[0].Table != "t" {
+		t.Fatalf("весь INSERT без валидных строк: %+v", skips)
+	}
+	if !strings.Contains(skips[0].Reason, "нет строк") {
+		t.Fatalf("причина: %q", skips[0].Reason)
 	}
 }
 

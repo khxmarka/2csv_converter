@@ -122,14 +122,16 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 }
 
 type prepared struct {
-	data *csvout.DataFile
-	skip *insert.Skip
-	err  error
+	data    *csvout.DataFile
+	skip    *insert.Skip
+	err     error
+	surplus int
 }
 
 func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) {
 	var data *csvout.DataFile
 	var skipped *insert.Skip
+	surplus := 0
 	defer func() {
 		if out.data == nil && data != nil {
 			data.Abort()
@@ -144,19 +146,32 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 			data = d
 			return nil
 		},
-		Row: func(cells []insert.Cell) error {
-			width := 0
-			if len(meta.Columns) > 0 {
-				width = len(meta.Columns)
-			} else if data != nil {
-				width = data.Width()
+		StreamRow: func(emit func(insert.CellWriter) error) error {
+			if data == nil {
+				return io.ErrClosedPipe
 			}
-			values, _, err := csvout.NormalizeRow(cells, width)
-			if err != nil {
+			if err := data.BeginRow(); err != nil {
 				return err
 			}
-			return data.Row(values)
+			cw := &dataCellWriter{d: data}
+			err := emit(cw)
+			if errors.Is(err, insert.ErrRowSurplus) {
+				_ = data.RollbackRow()
+				return insert.ErrRowSurplus
+			}
+			if err != nil {
+				_ = data.RollbackRow()
+				return err
+			}
+			if err := data.EndRow(); err != nil {
+				if errors.Is(err, csvout.ErrTooManyValues) {
+					return insert.ErrRowSurplus
+				}
+				return err
+			}
+			return nil
 		},
+		RowSurplus: func() { surplus++ },
 		Skip: func(sk insert.Skip) {
 			cp := sk
 			skipped = &cp
@@ -171,22 +186,35 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 			data.Abort()
 			data = nil
 		}
-		if errors.Is(err, csvout.ErrTooManyValues) {
-			return prepared{skip: &insert.Skip{Table: meta.Table, Reason: err.Error(), Offset: meta.Offset, Line: meta.Line}}
-		}
-		return prepared{err: err}
+		return prepared{err: err, surplus: surplus}
 	}
 	if skipped != nil {
-		return prepared{skip: skipped}
+		return prepared{skip: skipped, surplus: surplus}
 	}
 	if data == nil {
-		return prepared{}
+		return prepared{surplus: surplus}
 	}
 	if err := data.Finish(); err != nil {
-		return prepared{err: err}
+		return prepared{err: err, surplus: surplus}
 	}
-	out = prepared{data: data}
+	out = prepared{data: data, surplus: surplus}
 	return out
+}
+
+type dataCellWriter struct {
+	d *csvout.DataFile
+}
+
+func (c *dataCellWriter) Null() error {
+	return c.d.WriteNullCell()
+}
+
+func (c *dataCellWriter) Missing() error {
+	return c.d.WriteNullCell()
+}
+
+func (c *dataCellWriter) Text(write func(io.Writer) error) error {
+	return c.d.WriteTextCellStream(write)
 }
 
 func (s *session) apply(meta insert.Meta, prep prepared) {
@@ -198,11 +226,21 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 	}
 	if prep.skip != nil {
 		s.skip(*prep.skip)
+		if prep.surplus > 0 {
+			s.unitFail += prep.surplus
+			s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Table, prep.surplus)
+		}
 		return
 	}
 	if prep.data == nil || prep.data.Rows() == 0 {
 		if prep.data != nil {
 			prep.data.Abort()
+		}
+		if prep.surplus > 0 {
+			s.skipped++
+			s.unitFail += prep.surplus
+			s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Table, prep.surplus)
+			return
 		}
 		s.skip(insert.Skip{Table: meta.Table, Reason: "нет строк VALUES", Offset: meta.Offset, Line: meta.Line})
 		return
@@ -211,9 +249,13 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 	res, err := csvout.CommitPrepared(s.reg, s.dir, meta.Table, meta.Columns, prep.data.Path())
 	if err != nil {
 		if errors.Is(err, csvout.ErrTooManyValues) {
+			n := res.SkippedRows
+			if n < 1 {
+				n = prep.data.Rows()
+			}
 			s.skipped++
-			s.unitFail++
-			s.log.Errorf("%s таблица %s: %v", s.sql.Path, meta.Table, err)
+			s.unitFail += n
+			s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Table, n)
 			return
 		}
 		s.skipped++
@@ -225,5 +267,10 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 	s.paths = append(s.paths, res.Path)
 	if !res.Appended {
 		s.csvNew++
+	}
+	totalSurplus := prep.surplus + res.SkippedRows
+	if totalSurplus > 0 {
+		s.unitFail += totalSurplus
+		s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Table, totalSurplus)
 	}
 }

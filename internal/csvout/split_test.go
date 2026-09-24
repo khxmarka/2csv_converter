@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -233,6 +234,31 @@ func TestSplitRejectsConvertedAndNonCSV(t *testing.T) {
 	}
 	if res.Split || res.DataRows != 1 || fileSHA(t, csvPath) != before {
 		t.Fatalf("DATA.CSV: %+v", res)
+	}
+}
+
+func TestSplitRecordTooLargeKeepsOriginal(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rows.csv")
+	restore := SetSplitLimits(2, 2)
+	defer restore()
+	restoreRec := SetMaxRecordBytes(64)
+	defer restoreRec()
+
+	var b strings.Builder
+	b.WriteString("\"h\"\n\"")
+	for i := 0; i < 200; i++ {
+		b.WriteByte('x')
+	}
+	b.WriteString("\"\n\"a\"\n\"b\"\n\"c\"\n")
+	writeRaw(t, path, b.String())
+	before := fileSHA(t, path)
+	_, err := SplitIfNeeded(path, SplitWithHeader)
+	if err == nil || !errors.Is(err, ErrRecordTooLarge) {
+		t.Fatalf("ожидался ErrRecordTooLarge, got %v", err)
+	}
+	if fileSHA(t, path) != before {
+		t.Fatal("при ошибке нарезки монолит должен остаться")
 	}
 }
 
