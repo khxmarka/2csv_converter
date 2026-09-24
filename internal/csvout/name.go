@@ -42,8 +42,8 @@ func FileBaseDefault(name, empty string) string {
 		return empty
 	}
 	stem := s
-	if i := strings.IndexByte(s, '.'); i >= 0 {
-		stem = s[:i]
+	if before, _, ok := strings.Cut(s, "."); ok {
+		stem = before
 	}
 	if _, bad := reservedStems[strings.ToUpper(stem)]; bad {
 		return "_" + s
@@ -63,10 +63,7 @@ func limitCSVBaseSuffix(base, suffix string) string {
 	}
 	sum := sha256.Sum256([]byte(base))
 	tail := "~" + hex.EncodeToString(sum[:8]) + suffix
-	prefixLimit := maxCSVBaseUTF16 - utf16Units(tail)
-	if prefixLimit < 0 {
-		prefixLimit = 0
-	}
+	prefixLimit := max(maxCSVBaseUTF16-utf16Units(tail), 0)
 	var b strings.Builder
 	units := 0
 	for _, r := range base {

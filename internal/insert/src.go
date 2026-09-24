@@ -254,7 +254,7 @@ func (s *src) dollarTag() (string, bool) {
 			tag, _ := s.br.Peek(i + 1)
 			return string(tag), true
 		}
-		if !identStart(c) && !(i > 1 && isDigit(c)) {
+		if !identStart(c) && (i <= 1 || !isDigit(c)) {
 			return "", false
 		}
 	}

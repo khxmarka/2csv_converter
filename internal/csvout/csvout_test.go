@@ -34,7 +34,7 @@ func TestFileBase(t *testing.T) {
 		"COM1":     "_COM1",
 		"aux.data": "_aux.data",
 		"end.":     "end",
-		"end ":     "end",
+		"end ":     "end", //nolint:gocritic // пробел в конце имени — проверяемый случай
 		`a/b\c`:    "a_b_c",
 		"":         "table",
 		"***":      "___",
@@ -416,7 +416,7 @@ func TestConcurrentSameTableSerialized(t *testing.T) {
 	var wg sync.WaitGroup
 	errc := make(chan error, n)
 	wg.Add(n)
-	for i := 0; i < n; i++ {
+	for range n {
 		go func() {
 			defer wg.Done()
 			w, err := Create(reg, dir, "same", []string{"id"})

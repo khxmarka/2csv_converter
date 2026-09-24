@@ -377,7 +377,7 @@ func writePlainRows(t *testing.T, path, header, line string, rows int) {
 		}
 	}
 	b := []byte(line)
-	for i := 0; i < rows; i++ {
+	for range rows {
 		if _, err := w.Write(b); err != nil {
 			t.Fatal(err)
 		}

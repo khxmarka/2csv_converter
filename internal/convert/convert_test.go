@@ -512,7 +512,7 @@ func TestLargeInsertThroughFilePipeline(t *testing.T) {
 	const rows = 10_000
 	var sql strings.Builder
 	sql.WriteString("INSERT INTO users (id, email) VALUES\n")
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		if i > 0 {
 			sql.WriteString(",\n")
 		}

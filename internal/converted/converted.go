@@ -45,7 +45,7 @@ func decode(raw []byte) map[string]struct{} {
 	complete := bytes.LastIndexByte(raw, '\n') + 1
 	raw = raw[:complete]
 	text := strings.TrimPrefix(string(raw), "\uFEFF")
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		line = strings.TrimSuffix(line, "\r")
 		if line != "" {
 			out[line] = struct{}{}

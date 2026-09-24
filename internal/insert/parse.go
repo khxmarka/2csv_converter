@@ -156,8 +156,8 @@ func parseInsert(s *src, h Handler) error {
 	var cols []string
 	valuesSeen := false
 
-	switch {
-	case b == '(':
+	switch b {
+	case '(':
 		cols, err = parseColumnList(s)
 		if err != nil {
 			if err == io.EOF {
@@ -288,7 +288,6 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 			}
 			break
 		}
-		expectRow = false
 		cells, err := parseRow(s)
 		if err != nil {
 			if began {

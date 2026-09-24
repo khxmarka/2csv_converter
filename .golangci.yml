@@ -1,0 +1,24 @@
+version: "2"
+
+linters:
+  # По умолчанию: errcheck, govet, ineffassign, staticcheck, unused.
+  enable:
+    - errorlint
+    - forcetypeassert
+    - gocritic
+    - modernize
+    - nilerr
+    - nolintlint
+  # gosec не включён: утилита по назначению открывает произвольные файлы
+  # корня (G304) и пишет CSV с правами 0644 (G306); остальное — переполнения
+  # в тестовых генераторах BIFF/OLE.
+  settings:
+    errorlint:
+      # err == io.EOF на результатах bufio: io запрещает оборачивать EOF, а
+      # errors.Is на каждом байте парсера — лишний вызов в горячем цикле.
+      comparison: false
+  exclusions:
+    presets:
+      # defer Close() файлов, открытых на чтение, и fmt.Fprint* в stderr.
+      # Close файлов на запись проверяется в коде явно.
+      - std-error-handling

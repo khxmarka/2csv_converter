@@ -88,7 +88,7 @@ func TestFindSkippingExcludesCompletedTopFolder(t *testing.T) {
 }
 
 func TestSkipTopFolderForWalkError(t *testing.T) {
-	root := filepath.Join("root")
+	root := "root"
 	if got := skipTopFolder(root, filepath.Join(root, "Alpha", "locked", "file.sql"), false); got != "Alpha" {
 		t.Fatalf("TopFolder=%q", got)
 	}

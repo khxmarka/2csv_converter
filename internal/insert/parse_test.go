@@ -456,7 +456,7 @@ func TestParseLargeMultilineInsert(t *testing.T) {
 	const n = 8000
 	var b strings.Builder
 	b.WriteString("INSERT INTO t (id, name) VALUES\n")
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if i > 0 {
 			b.WriteString(",\n")
 		}
@@ -536,7 +536,7 @@ func TestParseDoesNotReadAllIntoOneBuffer(t *testing.T) {
 }
 
 func TestParseTestdataFiles(t *testing.T) {
-	root := filepath.Join("testdata")
+	root := "testdata"
 	sql, err := os.ReadFile(filepath.Join(root, "several.sql"))
 	if err != nil {
 		t.Fatal(err)

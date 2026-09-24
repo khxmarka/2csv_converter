@@ -251,10 +251,7 @@ func (a *accumulator) refreshHang() {
 	now := time.Now()
 	parts := make([]string, len(folders))
 	for i, folder := range folders {
-		sec := int(now.Sub(folder.start) / time.Second)
-		if sec < 0 {
-			sec = 0
-		}
+		sec := max(int(now.Sub(folder.start)/time.Second), 0)
 		parts[i] = fmt.Sprintf("%s (%d с)", folder.name, sec)
 	}
 	a.log.Hang("папка в обработке: " + strings.Join(parts, ", "))

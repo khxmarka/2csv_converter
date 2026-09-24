@@ -127,7 +127,7 @@ func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 		top, err := topFolder(root, path)
 		if err != nil {
 			res.Skips = append(res.Skips, Skip{Path: path, Reason: err.Error()})
-			return nil
+			return nil //nolint:nilerr // ошибка файла — пропуск в Skips, обход продолжается (§8)
 		}
 		res.Files = append(res.Files, SQLFile{Path: path, Kind: kind, TopFolder: top})
 		return nil

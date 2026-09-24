@@ -968,7 +968,7 @@ func TestGroupByDirSerializesSameFolder(t *testing.T) {
 }
 
 func TestGroupByDirKeepsSQLStreamBeforeExcel(t *testing.T) {
-	dir := filepath.Join("Alpha")
+	dir := "Alpha"
 	groups := groupByDir([]scan.SQLFile{
 		{Path: filepath.Join(dir, "m.xlsx"), Kind: scan.KindXLSX},
 		{Path: filepath.Join(dir, "z.sql"), Kind: scan.KindSQL},
@@ -1900,7 +1900,7 @@ func writeRepeatedRows(t *testing.T, path, header, line string, rows int) {
 		t.Fatal(err)
 	}
 	b := []byte(line)
-	for i := 0; i < rows; i++ {
+	for range rows {
 		if _, err := w.Write(b); err != nil {
 			t.Fatal(err)
 		}
