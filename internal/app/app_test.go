@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -1918,5 +1919,32 @@ func assertFile(t *testing.T, path, want string) {
 	}
 	if string(got) != want {
 		t.Fatalf("%s:\n got %q\nwant %q", path, got, want)
+	}
+}
+
+// §8: все активные папки не влезают в строку — показывается самая давняя.
+func TestHangShowsOldestWhenListTooWide(t *testing.T) {
+	var buf bytes.Buffer
+	log := logx.New(&buf)
+	var files []scan.SQLFile
+	for i := range 6 {
+		files = append(files, scan.SQLFile{Path: "x.sql", TopFolder: fmt.Sprintf("Папка_с_длинным_именем_%d", i)})
+	}
+	acc := newAccumulator(log, t.TempDir(), files, nil)
+	acc.mu.Lock()
+	for i, f := range files {
+		acc.active[folderKey(f)] = activeFolder{name: f.TopFolder, start: time.Now().Add(-time.Duration(i+1) * time.Second)}
+	}
+	acc.refreshHang()
+	acc.mu.Unlock()
+	got := buf.String()
+	if !strings.Contains(got, "папка в обработке: Папка_с_длинным_именем_5 (6 с)") {
+		t.Fatalf("нужна самая давняя: %q", got)
+	}
+	if strings.Contains(got, "именем_4") {
+		t.Fatalf("список не влезает, остальные не показываются: %q", got)
+	}
+	if w := logx.DisplayWidth(strings.TrimSpace(got)); w > logx.HangWidth {
+		t.Fatalf("ширина %d > %d", w, logx.HangWidth)
 	}
 }

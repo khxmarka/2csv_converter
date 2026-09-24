@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -249,12 +250,40 @@ func (a *accumulator) refreshHang() {
 	}
 	sort.Slice(folders, func(i, j int) bool { return folders[i].name < folders[j].name })
 	now := time.Now()
+	label := func(f activeFolder) string {
+		return fmt.Sprintf("%s (%d с)", f.name, max(int(now.Sub(f.start)/time.Second), 0))
+	}
 	parts := make([]string, len(folders))
 	for i, folder := range folders {
-		sec := max(int(now.Sub(folder.start)/time.Second), 0)
-		parts[i] = fmt.Sprintf("%s (%d с)", folder.name, sec)
+		parts[i] = label(folder)
 	}
-	a.log.Hang("папка в обработке: " + strings.Join(parts, ", "))
+	const prefix = "папка в обработке: "
+	line := prefix + strings.Join(parts, ", ")
+	if logx.DisplayWidth(line) > logx.HangWidth {
+		// §8: все не влезают — самая давняя. Строка длиннее экрана переносится,
+		// и \r затирает только её хвост: каждую секунду в консоли мусор.
+		oldest := slices.MinFunc(folders, func(x, y activeFolder) int { return x.start.Compare(y.start) })
+		line = truncateWidth(prefix+label(oldest), logx.HangWidth)
+	}
+	a.log.Hang(line)
+}
+
+// truncateWidth обрезает s до width колонок, заменяя хвост на «…».
+func truncateWidth(s string, width int) string {
+	if logx.DisplayWidth(s) <= width {
+		return s
+	}
+	var b strings.Builder
+	w := 0
+	for _, r := range s {
+		rw := logx.DisplayWidth(string(r))
+		if w+rw > width-1 {
+			break
+		}
+		b.WriteRune(r)
+		w += rw
+	}
+	return b.String() + "…"
 }
 
 func (a *accumulator) tickHang() {

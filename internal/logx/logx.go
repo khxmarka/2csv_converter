@@ -4,28 +4,41 @@ package logx
 import (
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"sync"
-	"unicode/utf8"
 )
+
+// HangWidth — предел ширины строки статуса в колонках. Длиннее — строка
+// переносится, и \r затирает только её последний кусок.
+const HangWidth = 79
 
 // Logger безопасен для одновременного использования из пула воркеров.
 // Hang держит одну строку статуса без перевода строки, пока её не сменят.
 type Logger struct {
-	mu   sync.Mutex
-	w    io.Writer
-	hang string
-	err  error
+	mu      sync.Mutex
+	w       io.Writer
+	hang    string
+	hangOff bool
+	err     error
 }
 
+// New пишет лог в w. Если w — файл, но не терминал (перенаправление в файл
+// или pipe), строка статуса отключается: там она копила бы \r и пробелы.
 func New(w io.Writer) *Logger {
-	return &Logger{w: w}
+	l := &Logger{w: w}
+	if f, ok := w.(*os.File); ok {
+		if info, err := f.Stat(); err == nil && info.Mode()&os.ModeCharDevice == 0 {
+			l.hangOff = true
+		}
+	}
+	return l
 }
 
 // Hang показывает msg без '\n'. Повтор с тем же текстом ничего не пишет.
 // Пустая строка снимает статус.
 func (l *Logger) Hang(msg string) {
-	if l == nil {
+	if l == nil || l.hangOff {
 		return
 	}
 	l.mu.Lock()
@@ -72,9 +85,31 @@ func (l *Logger) clearHang() {
 	if l.hang == "" {
 		return
 	}
-	n := utf8.RuneCountInString(l.hang)
-	l.print("\r" + strings.Repeat(" ", n) + "\r")
+	l.print("\r" + strings.Repeat(" ", DisplayWidth(l.hang)) + "\r")
 	l.hang = ""
+}
+
+// DisplayWidth — ширина строки в колонках консоли: иероглифы, хангыль, кана
+// и полноширинные формы занимают две колонки, остальное — одну.
+func DisplayWidth(s string) int {
+	n := 0
+	for _, r := range s {
+		n++
+		if isWide(r) {
+			n++
+		}
+	}
+	return n
+}
+
+func isWide(r rune) bool {
+	return (r >= 0x1100 && r <= 0x115F) || // хангыль чамо
+		(r >= 0x2E80 && r <= 0xA4CF) || // CJK, кана, радикалы
+		(r >= 0xAC00 && r <= 0xD7A3) || // хангыль слоги
+		(r >= 0xF900 && r <= 0xFAFF) || // CJK совместимые
+		(r >= 0xFE30 && r <= 0xFE4F) ||
+		(r >= 0xFF00 && r <= 0xFF60) || (r >= 0xFFE0 && r <= 0xFFE6) || // полноширинные
+		(r >= 0x20000 && r <= 0x3FFFD)
 }
 
 func (l *Logger) print(s string) {
