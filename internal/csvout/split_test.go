@@ -220,6 +220,27 @@ func TestSplitFailureKeepsMonolithAndPreexistingParts(t *testing.T) {
 	assertNoTemps(t, dir)
 }
 
+// Незакрытая кавычка в чужом CSV превращала остаток файла в одну запись
+// в памяти. Запись длиннее предела — ошибка нарезки, файл не тронут.
+func TestSplitRejectsOverlongRecord(t *testing.T) {
+	prev := splitMaxRecord
+	splitMaxRecord = 64
+	defer func() { splitMaxRecord = prev }()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.csv")
+	body := "\"h\"\n\"open\n" + strings.Repeat("\"a\"\n", 100)
+	writeRaw(t, path, body)
+
+	if _, err := splitFile(path, SplitWithHeader, 1, 1, nil); err == nil {
+		t.Fatal("ожидалась ошибка длины записи")
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != body {
+		t.Fatalf("файл изменён: err=%v", err)
+	}
+	assertNoTemps(t, dir)
+}
+
 func TestSplitQuotedNewlineStaysOneRecord(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.csv")

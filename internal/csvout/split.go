@@ -178,6 +178,10 @@ func walkRecords(path string, mode HeaderMode, fn func(rec []byte, header bool) 
 	}
 }
 
+// splitMaxRecord — предел одной записи CSV. Незакрытая кавычка в чужом файле
+// иначе делает весь остаток одной записью в памяти. Тесты его понижают.
+var splitMaxRecord = 64 << 20
+
 type recordReader struct {
 	br  *bufio.Reader
 	buf []byte
@@ -196,6 +200,9 @@ func (r *recordReader) next() ([]byte, error) {
 		}
 		if err != nil {
 			return nil, err
+		}
+		if len(r.buf) >= splitMaxRecord {
+			return nil, fmt.Errorf("csvout: запись длиннее %d байт (незакрытая кавычка?)", splitMaxRecord)
 		}
 		r.buf = append(r.buf, b)
 		if inQuotes {
