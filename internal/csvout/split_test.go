@@ -273,7 +273,9 @@ func TestSplitDropsOnlyTrailingEmptyWhenCutting(t *testing.T) {
 func TestSplitRejectsConvertedAndNonCSV(t *testing.T) {
 	dir := t.TempDir()
 	cases := []string{
-		"converted.txt",
+		"_log.txt",
+		"_splitter_done_.txt",
+		"readme.txt",
 		"Converted.TXT",
 		"notes.txt",
 		".2csv-abc.tmp",
@@ -524,10 +526,10 @@ func TestSplitTextLines(t *testing.T) {
 
 func TestSplitTextRejectsConvertedAndCSVModeOnTxt(t *testing.T) {
 	dir := t.TempDir()
-	conv := filepath.Join(dir, "converted.txt")
+	conv := filepath.Join(dir, "_log.txt")
 	writeRaw(t, conv, "a\nb\nc\n")
 	if _, err := splitFile(conv, SplitLines, 1, 1, nil); err == nil {
-		t.Fatal("converted.txt не режется")
+		t.Fatal("_log.txt не режется")
 	}
 	txt := filepath.Join(dir, "a.txt")
 	writeRaw(t, txt, "a\nb\nc\n")

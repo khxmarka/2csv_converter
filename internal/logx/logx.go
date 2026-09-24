@@ -21,6 +21,30 @@ type Logger struct {
 	hang    string
 	hangOff bool
 	err     error
+	// file — копия лога (_log.txt). Строка прогресса туда не пишется.
+	// Ошибка записи в файл не останавливает работу: консоль важнее.
+	file    io.Writer
+	fileErr error
+}
+
+// SetFile дублирует все строки лога (кроме строки прогресса) в w.
+func (l *Logger) SetFile(w io.Writer) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.file = w
+}
+
+// FileErr — первая ошибка записи в файл лога.
+func (l *Logger) FileErr() error {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.fileErr
 }
 
 // New пишет лог в w. Если w — файл, но не терминал (перенаправление в файл
@@ -66,12 +90,36 @@ func (l *Logger) Linef(format string, args ...any) {
 	l.line(fmt.Sprintf(format, args...))
 }
 
+// FileLinef пишет строку только в файл лога, не в консоль: итоги папок,
+// уже записанных в списки состояний, консоль не засоряют.
+func (l *Logger) FileLinef(format string, args ...any) {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.toFile(fmt.Sprintf(format, args...))
+}
+
+// FileErrorf — FileLinef для ошибки.
+func (l *Logger) FileErrorf(format string, args ...any) {
+	l.FileLinef("error: "+format, args...)
+}
+
+func (l *Logger) toFile(s string) {
+	if l.file == nil || l.fileErr != nil {
+		return
+	}
+	_, l.fileErr = fmt.Fprintln(l.file, s)
+}
+
 func (l *Logger) line(s string) {
 	if l == nil {
 		return
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.toFile(s)
 	saved := l.hang
 	l.clearHang()
 	l.println(s)

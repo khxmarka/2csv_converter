@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"sql2csv/internal/marks"
 )
 
 // Kind — тип рабочего файла.
@@ -19,7 +21,8 @@ const (
 	KindXLSX
 	KindXLS
 	KindCSV
-	// KindTXT — .txt только для построчной нарезки (converted.txt исключён).
+	// KindTXT — .txt только для построчной нарезки (readme.txt и служебные
+	// списки программы исключены).
 	KindTXT
 )
 
@@ -29,8 +32,8 @@ type SQLFile struct {
 	Kind Kind
 
 	// TopFolder — первый сегмент пути относительно корня.
-	// Пусто для файлов, лежащих прямо в корне: они конвертируются,
-	// но в converted.txt не отражаются (§3, §7).
+	// Пусто для файлов, лежащих прямо в корне: они обрабатываются при
+	// каждом запуске и в списки состояний не попадают.
 	TopFolder string
 }
 
@@ -168,7 +171,7 @@ func foldTopName(name string) string {
 }
 
 // foldTopNames строит множество ключей один раз на обход: иначе на Windows
-// каждая верхняя папка сравнивалась бы со всем converted.txt (O(n²)).
+// каждая верхняя папка сравнивалась бы со всем списком (O(n²)).
 func foldTopNames(names map[string]struct{}) map[string]struct{} {
 	out := make(map[string]struct{}, len(names))
 	for name := range names {
@@ -211,9 +214,15 @@ func isLink(mode fs.FileMode) bool {
 	return mode&(fs.ModeSymlink|fs.ModeIrregular) != 0
 }
 
+// IsIgnored — файл не обрабатывается ни на какой глубине: readme.txt и
+// служебные файлы программы (_log.txt, _*_done_.txt, _*_passed_.txt).
+func IsIgnored(base string) bool {
+	return strings.EqualFold(base, "readme.txt") || marks.IsService(base)
+}
+
 func workKind(path string) (Kind, bool) {
 	base := filepath.Base(path)
-	if strings.EqualFold(base, "converted.txt") {
+	if IsIgnored(base) {
 		return 0, false
 	}
 	lower := strings.ToLower(base)

@@ -10,19 +10,23 @@ import (
 	"sql2csv/internal/scan"
 )
 
-func splitWritten(log *logx.Logger, reg *csvout.Registry, dir string) bool {
-	failed := false
+// splitWritten режет CSV, записанные этим запуском в dir. Возвращает, была
+// ли ошибка и нарезан ли хоть один файл.
+func splitWritten(log *logx.Logger, reg *csvout.Registry, dir string) (failed, split bool) {
 	for _, out := range reg.OutputsIn(dir) {
 		mode := csvout.SplitNoHeader
 		if out.HasHeader {
 			mode = csvout.SplitWithHeader
 		}
-		if _, err := reg.SplitIfNeeded(out.Path, mode); err != nil {
+		res, err := reg.SplitIfNeeded(out.Path, mode)
+		if err != nil {
 			log.Errorf("%s: не удалось нарезать: %v", out.Path, err)
 			failed = true
+			continue
 		}
+		split = split || res.Split
 	}
-	return failed
+	return failed, split
 }
 
 // splitForeignCSV режет лежавший заранее файл: .csv — с шапкой из первой
@@ -39,7 +43,7 @@ func splitForeignCSV(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) 
 		return fileOutcome{failed: true, splitFail: true}
 	}
 	if res.Split {
-		return fileOutcome{csv: 1}
+		return fileOutcome{split: true}
 	}
 	return fileOutcome{}
 }
