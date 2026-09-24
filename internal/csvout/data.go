@@ -8,12 +8,12 @@ import (
 )
 
 // DataFile — временный файл только со строками данных одного INSERT, без заголовка.
+// Строки хранятся без дополнения: ширину ключа (§6) применяет Writer при Commit.
 type DataFile struct {
-	f     *os.File
-	buf   *bufio.Writer
-	width int
-	rows  int
-	path  string
+	f    *os.File
+	buf  *bufio.Writer
+	rows int
+	path string
 }
 
 // CreateData открывает временный файл в dir.
@@ -27,13 +27,6 @@ func CreateData(dir string) (*DataFile, error) {
 		buf:  bufio.NewWriterSize(f, 64*1024),
 		path: f.Name(),
 	}, nil
-}
-
-func (d *DataFile) Width() int {
-	if d == nil {
-		return 0
-	}
-	return d.width
 }
 
 func (d *DataFile) Rows() int {
@@ -50,21 +43,14 @@ func (d *DataFile) Path() string {
 	return d.path
 }
 
-// Row пишет одну уже нормализованную строку данных.
+// Row пишет одну строку данных как есть. Пустая строка VALUES () становится
+// одной пустой ячейкой: пустую запись CSV-ридер при Commit пропустил бы.
 func (d *DataFile) Row(values []string) error {
 	if d == nil || d.f == nil {
 		return os.ErrClosed
 	}
-	if d.width == 0 {
-		d.width = len(values)
-	}
-	if len(values) > d.width {
-		return ErrTooManyValues
-	}
-	if len(values) < d.width {
-		padded := make([]string, d.width)
-		copy(padded, values)
-		values = padded
+	if len(values) == 0 {
+		values = []string{""}
 	}
 	if _, err := io.WriteString(d.buf, encodeRow(values)); err != nil {
 		return err

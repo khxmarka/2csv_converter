@@ -144,14 +144,11 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 			data = d
 			return nil
 		},
+		// Строка не дополняется до списка колонок этого INSERT: арность
+		// сверяется с шириной ключа при Commit (§6). Лишние значения против
+		// собственного списка колонок parseValueRows уже отверг.
 		Row: func(cells []insert.Cell) error {
-			width := 0
-			if len(meta.Columns) > 0 {
-				width = len(meta.Columns)
-			} else if data != nil {
-				width = data.Width()
-			}
-			values, _, err := csvout.NormalizeRow(cells, width)
+			values, _, err := csvout.NormalizeRow(cells, len(cells))
 			if err != nil {
 				return err
 			}
@@ -170,9 +167,6 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 		if data != nil {
 			data.Abort()
 			data = nil
-		}
-		if errors.Is(err, csvout.ErrTooManyValues) {
-			return prepared{skip: &insert.Skip{Table: meta.Table, Reason: err.Error(), Offset: meta.Offset, Line: meta.Line}}
 		}
 		return prepared{err: err}
 	}
