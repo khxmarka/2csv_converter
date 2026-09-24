@@ -138,6 +138,29 @@ func TestWriteTwoSheetsTwoFiles(t *testing.T) {
 	}
 }
 
+// §13: ширина = максимум колонок среди строк; короткая шапка и строки
+// дополняются "", внутренняя пустая строка сохраняется, хвостовая — нет.
+func TestWriteXLSXWidthFromWidestRow(t *testing.T) {
+	src := writeXLSX(t, []specSheet{{
+		Name: "W",
+		Rows: [][]string{
+			{"h"},
+			{"a", "b", "c"},
+			{""},
+			{"d"},
+			{""},
+		},
+	}})
+	res := File(csvout.NewRegistry(), src)
+	if res.WriteErr != nil || res.CSV != 1 {
+		t.Fatalf("результат: %+v", res)
+	}
+	want := "\"h\",\"\",\"\"\n\"a\",\"b\",\"c\"\n\"\",\"\",\"\"\n\"d\",\"\",\"\"\n"
+	if got := readFile(t, res.Paths[0]); got != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+}
+
 // §13: скрытые и очень скрытые листы тоже дают CSV; 5 листов — ещё в scope.
 func TestWriteHiddenAndFiveSheetsXLSX(t *testing.T) {
 	src := writeXLSX(t, []specSheet{

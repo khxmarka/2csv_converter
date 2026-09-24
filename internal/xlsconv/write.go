@@ -83,17 +83,7 @@ func fileXLSX(reg *csvout.Registry, path string) Result {
 	stem := bookStem(path)
 	var out Result
 	for _, name := range names {
-		width, nonEmpty, err := xlsxSheetShape(book, name)
-		if err != nil {
-			if out.WriteErr == nil {
-				out.WriteErr = fmt.Errorf("лист %q: %w", name, err)
-			}
-			continue
-		}
-		if !nonEmpty {
-			continue
-		}
-		p, err := writeXLSXSheet(reg, book, dir, stem, name, width)
+		p, err := writeXLSXSheet(reg, book, dir, stem, name)
 		if err != nil {
 			if out.WriteErr == nil {
 				out.WriteErr = err
@@ -108,96 +98,62 @@ func fileXLSX(reg *csvout.Registry, path string) Result {
 	return out
 }
 
-func xlsxSheetShape(book *excelize.File, name string) (width int, nonEmpty bool, err error) {
+// writeXLSXSheet читает лист один раз: первая строка — шапка, остальные —
+// в DataFile без дополнения; ширину по всем строкам применяет CommitPlain.
+// Пустой лист CSV не даёт; хвостовые пустые строки не пишутся (§13).
+func writeXLSXSheet(reg *csvout.Registry, book *excelize.File, dir, stem, name string) (string, error) {
 	rows, err := book.Rows(name)
 	if err != nil {
-		return 0, false, err
+		return "", fmt.Errorf("лист %q: %w", name, err)
 	}
+	data := csvout.CreateData(dir)
+	defer data.Abort()
+	var header []string
+	first, nonEmpty := true, false
+	pendingEmpty := 0
 	for rows.Next() {
 		cols, err := rows.Columns()
 		if err != nil {
 			_ = rows.Close()
-			return 0, false, err
+			return "", fmt.Errorf("лист %q: %w", name, err)
 		}
-		if len(cols) > width {
-			width = len(cols)
+		empty := rowEmpty(cols)
+		nonEmpty = nonEmpty || !empty
+		if first {
+			first = false
+			header = cols
+			continue
 		}
-		if !rowEmpty(cols) {
-			nonEmpty = true
+		if empty {
+			pendingEmpty++
+			continue
+		}
+		for ; pendingEmpty > 0; pendingEmpty-- {
+			if err := data.Row(nil); err != nil {
+				_ = rows.Close()
+				return "", err
+			}
+		}
+		if err := data.Row(cols); err != nil {
+			_ = rows.Close()
+			return "", err
 		}
 	}
 	iterErr := rows.Error()
 	closeErr := rows.Close()
 	if iterErr != nil {
-		return 0, false, iterErr
+		return "", fmt.Errorf("лист %q: %w", name, iterErr)
 	}
 	if closeErr != nil {
-		return 0, false, closeErr
+		return "", closeErr
 	}
-	return width, nonEmpty, nil
-}
-
-func writeXLSXSheet(
-	reg *csvout.Registry,
-	book *excelize.File,
-	dir, stem, name string,
-	width int,
-) (string, error) {
-	rows, err := book.Rows(name)
-	if err != nil {
-		return "", err
-	}
-	var writer *csvout.Writer
-	first := true
-	pendingEmpty := 0
-	abort := func(err error) (string, error) {
-		_ = rows.Close()
-		if writer != nil {
-			_ = writer.Abort()
-		}
-		return "", err
-	}
-
-	for rows.Next() {
-		cols, err := rows.Columns()
-		if err != nil {
-			return abort(err)
-		}
-		if first {
-			first = false
-			writer, err = csvout.CreatePlain(reg, dir, csvBase(stem, name), padRow(cols, width))
-			if err != nil {
-				return abort(err)
-			}
-			continue
-		}
-		if rowEmpty(cols) {
-			pendingEmpty++
-			continue
-		}
-		for pendingEmpty > 0 {
-			if err := writer.Row(nil); err != nil {
-				return abort(err)
-			}
-			pendingEmpty--
-		}
-		if err := writer.Row(cols); err != nil {
-			return abort(err)
-		}
-	}
-	if err := rows.Error(); err != nil {
-		return abort(err)
-	}
-	if err := rows.Close(); err != nil {
-		if writer != nil {
-			_ = writer.Abort()
-		}
-		return "", err
-	}
-	if writer == nil {
+	if !nonEmpty {
 		return "", nil
 	}
-	res, err := writer.Commit()
+	if err := data.Finish(); err != nil {
+		return "", err
+	}
+	res, err := csvout.CommitPlain(reg, dir, csvBase(stem, name), header, data)
 	if err != nil {
 		return "", err
 	}

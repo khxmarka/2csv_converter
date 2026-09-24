@@ -164,6 +164,42 @@ func CommitPrepared(reg *Registry, dir, table string, columns []string, data *Da
 	return w.Commit()
 }
 
+// CommitPlain публикует таблицу листа: header — первая строка, data —
+// остальные. Ширина = максимум колонок среди шапки и строк (§13), всё
+// короче дополняется "" . Ширина известна только после всех строк, поэтому
+// лист читается один раз в data, а шапка дописывается в конце.
+func CommitPlain(reg *Registry, dir, base string, header []string, data *DataFile) (Result, error) {
+	var empty Result
+	width := len(header)
+	if data.rows > 0 {
+		width = max(width, data.maxCells)
+	}
+	w, err := CreatePlain(reg, dir, base, padTo(header, max(width, 1)))
+	if err != nil {
+		return empty, err
+	}
+	defer func() { _ = w.Abort() }()
+	if data.rows > 0 {
+		src, err := data.open()
+		if err != nil {
+			return empty, err
+		}
+		if err := copyRows(w.buf, src, w.nCol, data.minCells < w.nCol); err != nil {
+			return empty, err
+		}
+	}
+	return w.Commit()
+}
+
+func padTo(row []string, n int) []string {
+	if len(row) >= n {
+		return row
+	}
+	out := make([]string, n)
+	copy(out, row)
+	return out
+}
+
 // copyRows переносит строки DataFile в dst. Без pad — байты как есть;
 // с pad — строки перечитываются и дополняются до width пустыми ячейками.
 func copyRows(dst io.Writer, src io.Reader, width int, pad bool) error {
