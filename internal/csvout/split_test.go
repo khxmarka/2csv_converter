@@ -496,3 +496,42 @@ func assertNoTemps(t *testing.T, dir string) {
 		t.Fatalf("временные файлы: %v", matches)
 	}
 }
+
+// .txt режется построчно: без шапки, кавычки — обычные символы (в combo-
+// списках "email:pa\"ss" — пароль, а не CSV-поле). Части — {stem}_2.txt,
+// расширение сохраняется как есть.
+func TestSplitTextLines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "combo.TXT")
+	writeRaw(t, path, "a@x:p\"1\nb@x:p2\r\n\nc@x:\"p3\n\n")
+
+	res, err := splitFile(path, SplitLines, 2, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPartBytes(t, res.Parts, []string{
+		"a@x:p\"1\nb@x:p2\r\n",
+		"\nc@x:\"p3\n",
+	})
+	if filepath.Base(res.Parts[1]) != "combo_2.TXT" {
+		t.Fatalf("часть: %s", res.Parts[1])
+	}
+	// Пустая строка между данными — тоже строка данных; хвостовая отброшена.
+	if res.DataRows != 4 {
+		t.Fatalf("строк данных: %d", res.DataRows)
+	}
+}
+
+func TestSplitTextRejectsConvertedAndCSVModeOnTxt(t *testing.T) {
+	dir := t.TempDir()
+	conv := filepath.Join(dir, "converted.txt")
+	writeRaw(t, conv, "a\nb\nc\n")
+	if _, err := splitFile(conv, SplitLines, 1, 1, nil); err == nil {
+		t.Fatal("converted.txt не режется")
+	}
+	txt := filepath.Join(dir, "a.txt")
+	writeRaw(t, txt, "a\nb\nc\n")
+	if _, err := splitFile(txt, SplitWithHeader, 1, 1, nil); err == nil {
+		t.Fatal(".txt режется только построчно")
+	}
+}

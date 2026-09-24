@@ -1948,3 +1948,37 @@ func TestHangShowsOldestWhenListTooWide(t *testing.T) {
 		t.Fatalf("ширина %d > %d", w, logx.HangWidth)
 	}
 }
+
+// .txt в незавершённой папке режется как CSV, но построчно и без шапки;
+// папка с одной нарезкой попадает в converted.txt. Мелкий .txt не трогается.
+func TestForeignTxtIsSplitByLines(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "Combo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "list.txt"), []byte("a:1\nb:\"2\nc:3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "small.txt"), []byte("x\ny\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Run(logx.New(io.Discard), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "list.txt"), "a:1\nb:\"2\n")
+	assertFile(t, filepath.Join(dir, "list_2.txt"), "c:3\n")
+	assertFile(t, filepath.Join(dir, "small.txt"), "x\ny\n")
+	if strings.Join(res.SuccessTops, ",") != "Combo" {
+		t.Fatalf("папка с нарезкой должна быть в converted.txt: %v", res.SuccessTops)
+	}
+	if _, err := os.Stat(filepath.Join(root, "converted.txt")); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(root, "converted.txt"), "Combo\n")
+}

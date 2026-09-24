@@ -7,6 +7,7 @@ import (
 
 	"sql2csv/internal/csvout"
 	"sql2csv/internal/logx"
+	"sql2csv/internal/scan"
 )
 
 func splitWritten(log *logx.Logger, reg *csvout.Registry, dir string) bool {
@@ -24,8 +25,15 @@ func splitWritten(log *logx.Logger, reg *csvout.Registry, dir string) bool {
 	return failed
 }
 
-func splitForeignCSV(log *logx.Logger, reg *csvout.Registry, path string) fileOutcome {
-	res, err := reg.SplitIfNeeded(path, csvout.SplitWithHeader)
+// splitForeignCSV режет лежавший заранее файл: .csv — с шапкой из первой
+// непустой строки (§14), .txt — построчно, без шапки и без CSV-кавычек.
+func splitForeignCSV(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) fileOutcome {
+	mode := csvout.SplitWithHeader
+	if file.Kind == scan.KindTXT {
+		mode = csvout.SplitLines
+	}
+	path := file.Path
+	res, err := reg.SplitIfNeeded(path, mode)
 	if err != nil {
 		log.Errorf("%s: не удалось нарезать: %v", path, err)
 		return fileOutcome{failed: true, splitFail: true}

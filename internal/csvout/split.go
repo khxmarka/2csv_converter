@@ -31,6 +31,8 @@ const (
 	SplitNoHeader HeaderMode = iota
 	// SplitWithHeader — первая непустая запись является заголовком и копируется в каждый кусок.
 	SplitWithHeader
+	// SplitLines — .txt: запись = строка, шапки нет, кавычки — обычные символы.
+	SplitLines
 )
 
 // SplitResult — итог нарезки одного файла.
@@ -82,7 +84,7 @@ func splitFile(path string, mode HeaderMode, threshold, chunkRows int, taken fun
 	if threshold < 1 || chunkRows < 1 {
 		return SplitResult{}, fmt.Errorf("csvout: неверный порог нарезки")
 	}
-	if err := rejectSplitPath(path); err != nil {
+	if err := rejectSplitPath(path, mode); err != nil {
 		return SplitResult{}, err
 	}
 	dataRows, over, err := countDataRowsUntil(path, mode, int64(threshold))
@@ -99,7 +101,7 @@ func splitFile(path string, mode HeaderMode, threshold, chunkRows int, taken fun
 	return SplitResult{Split: true, DataRows: written, Parts: names}, nil
 }
 
-func rejectSplitPath(path string) error {
+func rejectSplitPath(path string, mode HeaderMode) error {
 	base := filepath.Base(path)
 	if strings.EqualFold(base, "converted.txt") {
 		return fmt.Errorf("csvout: %s не нарезается", base)
@@ -108,10 +110,17 @@ func rejectSplitPath(path string) error {
 	if strings.HasPrefix(lower, ".2csv-") && strings.HasSuffix(lower, ".tmp") {
 		return fmt.Errorf("csvout: %s не нарезается", base)
 	}
-	if !strings.EqualFold(filepath.Ext(base), ".csv") {
-		return fmt.Errorf("csvout: %s не csv", base)
+	ext := strings.ToLower(filepath.Ext(base))
+	switch {
+	case ext == ".csv" && mode != SplitLines:
+		return nil
+	case ext == ".txt" && mode == SplitLines:
+		return nil
+	case ext == ".txt":
+		return fmt.Errorf("csvout: %s режется только построчно", base)
+	default:
+		return fmt.Errorf("csvout: %s не csv/txt", base)
 	}
-	return nil
 }
 
 var errNeedSplit = errors.New("csvout: нужно нарезать")
@@ -149,9 +158,9 @@ func walkRecords(path string, mode HeaderMode, fn func(rec []byte, header bool) 
 	}
 	defer f.Close()
 
-	rr := recordReader{br: bufio.NewReaderSize(f, 256*1024)}
+	rr := recordReader{br: bufio.NewReaderSize(f, 256*1024), plain: mode == SplitLines}
 	var pending [][]byte
-	haveHeader := mode == SplitNoHeader
+	haveHeader := mode != SplitWithHeader
 	for {
 		rec, err := rr.next()
 		if err == io.EOF {
@@ -189,6 +198,8 @@ func walkRecords(path string, mode HeaderMode, fn func(rec []byte, header bool) 
 type recordReader struct {
 	br  *bufio.Reader
 	buf []byte
+	// plain — кавычки не открывают поле: запись кончается на первом '\n'.
+	plain bool
 }
 
 func (r *recordReader) next() ([]byte, error) {
@@ -237,7 +248,7 @@ func (r *recordReader) next() ([]byte, error) {
 		}
 		switch b {
 		case '"':
-			inQuotes = true
+			inQuotes = !r.plain
 		case '\n':
 			return r.buf, nil
 		case '\r':
@@ -414,7 +425,8 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 func partName(path string, n int) string {
 	base := filepath.Base(path)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
-	return filepath.Join(filepath.Dir(path), limitCSVBaseSuffix(stem, "_"+strconv.Itoa(n))+".csv")
+	ext := filepath.Ext(base)
+	return filepath.Join(filepath.Dir(path), limitCSVBaseSuffix(stem, "_"+strconv.Itoa(n))+ext)
 }
 
 func fileExists(path string) (bool, error) {

@@ -19,9 +19,11 @@ const (
 	KindXLSX
 	KindXLS
 	KindCSV
+	// KindTXT — .txt только для построчной нарезки (converted.txt исключён).
+	KindTXT
 )
 
-// SQLFile — найденный .sql / .xlsx / .xls / .csv и его место в дереве относительно корня.
+// SQLFile — найденный .sql / .xlsx / .xls / .csv / .txt и его место в дереве относительно корня.
 type SQLFile struct {
 	Path string
 	Kind Kind
@@ -35,8 +37,8 @@ type SQLFile struct {
 // IsExcel — книга .xlsx или .xls.
 func (f SQLFile) IsExcel() bool { return f.Kind == KindXLSX || f.Kind == KindXLS }
 
-// IsCSV — файл .csv для нарезки.
-func (f SQLFile) IsCSV() bool { return f.Kind == KindCSV }
+// IsCSV — файл только для нарезки: .csv или .txt, конвертировать нечего.
+func (f SQLFile) IsCSV() bool { return f.Kind == KindCSV || f.Kind == KindTXT }
 
 // Skip — единица, пропущенная при обходе: symlink или недоступный каталог.
 type Skip struct {
@@ -68,7 +70,7 @@ func ValidateRoot(path string) error {
 	return nil
 }
 
-// Find рекурсивно обходит root и собирает пути *.sql, *.xlsx, *.xls и *.csv без учёта регистра.
+// Find рекурсивно обходит root и собирает пути *.sql, *.xlsx, *.xls, *.csv и *.txt без учёта регистра.
 // Symlink-и не раскрываются: и ссылки на каталоги, и ссылки на файлы попадают в Skips.
 // Ошибки чтения каталогов возвращаются как блокирующие Skips и не роняют обход.
 func Find(root string) (Result, error) {
@@ -227,6 +229,8 @@ func workKind(path string) (Kind, bool) {
 		return KindXLS, true
 	case ".csv":
 		return KindCSV, true
+	case ".txt":
+		return KindTXT, true
 	default:
 		return 0, false
 	}

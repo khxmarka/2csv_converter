@@ -503,7 +503,7 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 			acc.record(file, fileOutcome{})
 			continue
 		}
-		acc.record(file, splitForeignCSV(log, reg, file.Path))
+		acc.record(file, splitForeignCSV(log, reg, file))
 	}
 	for _, file := range produced {
 		removeSource(log, file.Path)
