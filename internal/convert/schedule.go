@@ -62,6 +62,12 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 	defer func() {
 		q.close()
 		<-done
+		// Дескрипторы дописывания CSV живут только пока пишет этот .sql:
+		// дальше Excel, нарезка и замена файлов этой директории.
+		if err := reg.CloseDir(st.dir); err != nil {
+			st.failed = true
+			log.Errorf("%s: не удалось закрыть CSV: %v", sql.Path, err)
+		}
 		out = Result{
 			Created:  st.created,
 			CSV:      st.csvNew,

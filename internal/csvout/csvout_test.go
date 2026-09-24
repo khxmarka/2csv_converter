@@ -3,6 +3,7 @@ package csvout
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -554,5 +555,36 @@ func TestCreatePlainAbortKeepsFirst(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "book_Second.csv")); err == nil {
 		t.Fatal("после Abort второго листа CSV быть не должно")
+	}
+}
+
+// Провал дописывания через кэшированный дескриптор откатывает CSV к прежнему
+// размеру; следующая дописка идёт в конец уже откаченного файла.
+func TestSlotAppendRollsBackAndContinues(t *testing.T) {
+	dir := t.TempDir()
+	reg := NewRegistry()
+	res := commitInsert(t, reg, dir, "t", []string{"id"}, []string{"1"})
+	s := reg.acquire(dir, "t")
+	err := s.appendTo(func(w io.Writer) error {
+		if _, err := io.WriteString(w, "\"partial"); err != nil {
+			return err
+		}
+		return errors.New("сбой посреди INSERT")
+	})
+	if err == nil {
+		t.Fatal("ожидалась ошибка")
+	}
+	if err := s.appendTo(func(w io.Writer) error {
+		_, err := io.WriteString(w, "\"2\"\n")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Unlock()
+	if err := reg.CloseDir(dir); err != nil {
+		t.Fatal(err)
+	}
+	if got := readCSV(t, res.Path); got != "\"id\"\n\"1\"\n\"2\"\n" {
+		t.Fatalf("CSV после отката: %q", got)
 	}
 }

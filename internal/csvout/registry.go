@@ -2,6 +2,8 @@ package csvout
 
 import (
 	"errors"
+	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,7 +16,9 @@ type Registry struct {
 	mu    sync.Mutex
 	byKey map[string]*slot
 	byDir map[string]*sync.Mutex
-	outs  []output
+	// slotsIn — слоты склейки по canonicalPath директории, для CloseDir.
+	slotsIn map[string][]*slot
+	outs    []output
 	// written — canonicalPath каждого CSV, записанного в этом запуске.
 	written map[string]struct{}
 }
@@ -28,6 +32,39 @@ type slot struct {
 	path      string
 	nCol      int
 	hasHeader bool
+	// app — открытый на дописывание path. Живёт между INSERT одного .sql,
+	// чтобы не открывать CSV на каждый INSERT; закрывает CloseDir.
+	app *os.File
+}
+
+// appendTo дописывает в path ключа через кэшированный дескриптор. Провал
+// откатывает файл к прежнему размеру (§6). Truncate — по пути: у дескриптора
+// O_APPEND в Windows нет права менять длину файла.
+func (s *slot) appendTo(write func(io.Writer) error) error {
+	if s.app == nil {
+		f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return err
+		}
+		s.app = f
+	}
+	info, err := s.app.Stat()
+	if err != nil {
+		return err
+	}
+	if err := write(s.app); err != nil {
+		return errors.Join(err, os.Truncate(s.path, info.Size()))
+	}
+	return nil
+}
+
+func (s *slot) closeApp() error {
+	if s.app == nil {
+		return nil
+	}
+	err := s.app.Close()
+	s.app = nil
+	return err
 }
 
 type output struct {
@@ -46,6 +83,7 @@ func NewRegistry() *Registry {
 	return &Registry{
 		byKey:   make(map[string]*slot),
 		byDir:   make(map[string]*sync.Mutex),
+		slotsIn: make(map[string][]*slot),
 		written: make(map[string]struct{}),
 	}
 }
@@ -76,10 +114,28 @@ func (r *Registry) acquire(dir, base string) *slot {
 	if !ok {
 		s = new(slot)
 		r.byKey[key] = s
+		d := canonicalPath(dir)
+		r.slotsIn[d] = append(r.slotsIn[d], s)
 	}
 	r.mu.Unlock()
 	s.mu.Lock()
 	return s
+}
+
+// CloseDir закрывает дескрипторы дописывания CSV директории dir. Вызывать,
+// когда в dir больше не пишут INSERT этого файла: до нарезки и замены CSV
+// (в Windows открытый файл не переименовать) и до конца запуска.
+func (r *Registry) CloseDir(dir string) error {
+	r.mu.Lock()
+	slots := r.slotsIn[canonicalPath(dir)]
+	r.mu.Unlock()
+	var errs []error
+	for _, s := range slots {
+		s.mu.Lock()
+		errs = append(errs, s.closeApp())
+		s.mu.Unlock()
+	}
+	return errors.Join(errs...)
 }
 
 // acquireUnique — отдельный слот без склейки INSERT. Имя файла сериализует lockDir.

@@ -133,7 +133,7 @@ func CommitPrepared(reg *Registry, dir, table string, columns []string, data *Da
 		if err != nil {
 			return empty, err
 		}
-		if err := appendTo(s.path, func(w io.Writer) error {
+		if err := s.appendTo(func(w io.Writer) error {
 			return copyRows(w, src, s.nCol, data.minCells < s.nCol)
 		}); err != nil {
 			return empty, err
@@ -171,6 +171,14 @@ func copyRows(dst io.Writer, src io.Reader, width int, pad bool) error {
 		_, err := io.Copy(dst, src)
 		return err
 	}
+	bw := bufio.NewWriterSize(dst, 64*1024)
+	if err := padRows(bw, src, width); err != nil {
+		return err
+	}
+	return bw.Flush()
+}
+
+func padRows(dst io.Writer, src io.Reader, width int) error {
 	r := csv.NewReader(src)
 	r.FieldsPerRecord = -1
 	r.ReuseRecord = true
