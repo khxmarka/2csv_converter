@@ -41,6 +41,13 @@ var sqlStartWords = map[string]struct{}{
 	"EXECUTE":  {},
 	"MERGE":    {},
 	"USE":      {},
+	// START/COMMIT/ROLLBACK сюда не входят: «Start Date» — обычная шапка,
+	// а «COMMIT;» отсекает pickTableHeader по пустому хвосту после ';'.
+	"PRAGMA":   {},
+	"DECLARE":  {},
+	"IF":       {},
+	"COPY":     {},
+	"PRINT":    {},
 	"SHOW":     {},
 	"EXPLAIN":  {},
 	"DESCRIBE": {},
@@ -72,11 +79,16 @@ func sniffTable(f *os.File) (*tableHeader, *bufio.Reader, error) {
 		return nil, nil, err
 	}
 	for {
-		line, err := r.ReadString('\n')
+		// ReadSlice, а не ReadString: однострочный дамп на гигабайты не должен
+		// попасть в память целиком (§2). Шапка длиннее буфера — это не шапка.
+		raw, err := r.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			return nil, nil, nil
+		}
 		if err != nil && err != io.EOF {
 			return nil, nil, err
 		}
-		line = trimLine(line)
+		line := trimLine(string(raw))
 		if strings.TrimSpace(line) != "" {
 			if looksLikeSQL(line) {
 				return nil, nil, nil
@@ -126,6 +138,10 @@ func looksLikeSQL(line string) bool {
 		if !ok {
 			return false
 		}
+		// Слово перед запятой — имя колонки шапки (desc,email), не оператор.
+		if strings.HasPrefix(rest, ",") {
+			return false
+		}
 		upper := strings.ToUpper(word)
 		if _, sql := sqlStartWords[upper]; sql {
 			return true
@@ -156,15 +172,22 @@ func nextWord(s string) (word, rest string, ok bool) {
 	return s[:i], s[i:], true
 }
 
+// pickTableHeader считает только непустые поля: у «PRAGMA x=1;» после ';'
+// пустой хвост, это не вторая колонка. Пустое имя внутри шапки (индекс pandas)
+// остаётся колонкой.
 func pickTableHeader(line string) (*tableHeader, bool) {
 	bestN := 1
 	var best *tableHeader
 	for _, d := range tableDelims {
 		fields, err := splitFields(line, d)
-		if err != nil || len(fields) <= bestN {
+		if err != nil {
 			continue
 		}
-		bestN = len(fields)
+		n := nonEmptyFields(fields)
+		if n <= bestN {
+			continue
+		}
+		bestN = n
 		cols := make([]string, len(fields))
 		for i, f := range fields {
 			cols[i] = strings.TrimSpace(f)
@@ -175,6 +198,16 @@ func pickTableHeader(line string) (*tableHeader, bool) {
 		return nil, false
 	}
 	return best, true
+}
+
+func nonEmptyFields(fields []string) int {
+	n := 0
+	for _, f := range fields {
+		if strings.TrimSpace(f) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func splitFields(line string, delim rune) ([]string, error) {
