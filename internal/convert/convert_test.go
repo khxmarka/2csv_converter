@@ -27,7 +27,7 @@ func runFileReg(t *testing.T, reg *csvout.Registry, dir, name, sql string) (Resu
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	res := File(logx.New(&buf), reg, scan.SQLFile{Path: path, TopFolder: "Alpha"})
+	res := Schedule(logx.New(&buf), reg, scan.SQLFile{Path: path, TopFolder: "Alpha"}, nil)
 	if res.OpenErr != nil {
 		t.Fatalf("OpenErr: %v", res.OpenErr)
 	}
@@ -328,9 +328,9 @@ INSERT INTO t SET a=1;
 
 func TestOpenMissingFile(t *testing.T) {
 	var buf bytes.Buffer
-	res := File(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{
+	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{
 		Path: filepath.Join(t.TempDir(), "нет.sql"),
-	})
+	}, nil)
 	if res.OpenErr == nil {
 		t.Fatal("ожидалась ошибка открытия")
 	}
@@ -564,7 +564,7 @@ func TestTabularCSVSQLWritesOurFormatAndKeepsSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	res := File(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"})
+	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"}, nil)
 	if res.OpenErr != nil || res.Failed || res.CSV != 1 || res.PIISkip != 0 {
 		t.Fatalf("результат=%+v log=%q", res, buf.String())
 	}
@@ -619,7 +619,7 @@ func TestTabularSQLPIIRejectsWithoutCSV(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	res := File(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"})
+	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path, TopFolder: "Alpha"}, nil)
 	if res.CSV != 0 || res.PIISkip != 1 {
 		t.Fatalf("результат=%+v log=%q", res, buf.String())
 	}

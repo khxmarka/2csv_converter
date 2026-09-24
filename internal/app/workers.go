@@ -414,31 +414,19 @@ func outcomeFromConvert(fr convert.Result) fileOutcome {
 	}
 }
 
-func convertOne(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (out fileOutcome) {
+func convertExcel(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (out fileOutcome) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			log.Errorf("%s: сбой обработки (%v), файл пропущен", file.Path, rec)
 			out = fileOutcome{skipped: 1, failed: true}
 		}
 	}()
-	if file.IsExcel() {
-		xr := xlsconv.File(reg, file.Path)
-		return fileOutcome{
-			openErr:     xr.OpenErr,
-			writeErr:    xr.WriteErr,
-			csv:         xr.CSV,
-			skipTooMany: xr.SkipTooMany,
-		}
-	}
-	fr := convert.File(log, reg, file)
+	xr := xlsconv.File(reg, file.Path)
 	return fileOutcome{
-		openErr:  fr.OpenErr,
-		created:  fr.Created,
-		skipped:  fr.Skipped,
-		csv:      fr.CSV,
-		failed:   fr.Failed,
-		piiSkip:  fr.PIISkip,
-		unitFail: fr.UnitFail,
+		openErr:     xr.OpenErr,
+		writeErr:    xr.WriteErr,
+		csv:         xr.CSV,
+		skipTooMany: xr.SkipTooMany,
 	}
 }
 
@@ -484,7 +472,7 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 	}
 	for _, file := range excels {
 		acc.start(file)
-		out := convertOne(log, reg, file)
+		out := convertExcel(log, reg, file)
 		acc.record(file, out)
 		if producedCSV(out) {
 			produced = append(produced, file)
