@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 )
@@ -256,17 +255,18 @@ func csvRecordEmpty(raw []byte) bool {
 
 func writeAndPublish(path string, mode HeaderMode, chunkRows int) ([]string, int64, error) {
 	dir := filepath.Dir(path)
-	namer := newPartNamer(path)
 	var (
-		names     []string
-		temps     []string
-		published []string
-		open      *os.File
-		buf       *bufio.Writer
-		header    []byte
-		rows      int
-		dataRows  int64
-		success   bool
+		names []string
+		temps []string
+		// created — части, которых до прогона не было. Только их можно убрать
+		// при провале: лежавший раньше {stem}_N.csv §14 не уничтожает.
+		created  []string
+		open     *os.File
+		buf      *bufio.Writer
+		header   []byte
+		rows     int
+		dataRows int64
+		success  bool
 	)
 	defer func() {
 		if open != nil {
@@ -280,7 +280,7 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int) ([]string, int
 			}
 		}
 		if !success {
-			for _, p := range published {
+			for _, p := range created {
 				_ = os.Remove(p)
 			}
 		}
@@ -302,9 +302,9 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int) ([]string, int
 			buf = nil
 			temps = append(temps, name)
 		}
-		next, err := namer.next(len(names) == 0)
-		if err != nil {
-			return err
+		next := path
+		if len(names) > 0 {
+			next = partName(path, len(names)+1)
 		}
 		names = append(names, next)
 		f, err := os.CreateTemp(dir, tmpPattern)
@@ -363,11 +363,17 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int) ([]string, int
 	}
 
 	for i := 1; i < len(names); i++ {
+		existed, err := fileExists(names[i])
+		if err != nil {
+			return nil, 0, err
+		}
 		if err := replaceFile(temps[i], names[i]); err != nil {
 			return nil, 0, err
 		}
 		temps[i] = ""
-		published = append(published, names[i])
+		if !existed {
+			created = append(created, names[i])
+		}
 	}
 	if err := replaceFile(temps[0], names[0]); err != nil {
 		return nil, 0, err
@@ -377,67 +383,12 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int) ([]string, int
 	return names, dataRows, nil
 }
 
-type partNamer struct {
-	dir   string
-	path  string
-	root  string
-	n     int
-	taken map[string]struct{}
-}
-
-func newPartNamer(path string) *partNamer {
+// partName — имя n-й части (n ≥ 2) по §14: {stem}_n.csv от собственного stem
+// файла. Лежащий на диске файл с этим именем заменяется частью.
+func partName(path string, n int) string {
 	base := filepath.Base(path)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
-	root, n := suffixStart(stem)
-	return &partNamer{
-		dir:   filepath.Dir(path),
-		path:  path,
-		root:  root,
-		n:     n,
-		taken: map[string]struct{}{foldKey(path): {}},
-	}
-}
-
-func (p *partNamer) next(first bool) (string, error) {
-	if first {
-		return p.path, nil
-	}
-	for {
-		if p.n <= 0 {
-			return "", fmt.Errorf("csvout: не удалось подобрать имя части")
-		}
-		name := limitCSVBaseSuffix(p.root, "_"+strconv.Itoa(p.n)) + ".csv"
-		p.n++
-		full := filepath.Join(p.dir, name)
-		key := foldKey(full)
-		if _, ok := p.taken[key]; ok {
-			continue
-		}
-		exists, err := fileExists(full)
-		if err != nil {
-			return "", err
-		}
-		p.taken[key] = struct{}{}
-		if !exists {
-			return full, nil
-		}
-	}
-}
-
-func suffixStart(stem string) (base string, n int) {
-	i := strings.LastIndex(stem, "_")
-	if i <= 0 || i == len(stem)-1 {
-		return stem, 2
-	}
-	digits := stem[i+1:]
-	if digits == "" || strings.Trim(digits, "0123456789") != "" {
-		return stem, 2
-	}
-	v, err := strconv.Atoi(digits)
-	if err != nil || strconv.Itoa(v) != digits {
-		return stem, 2
-	}
-	return stem[:i], v + 1
+	return filepath.Join(filepath.Dir(path), limitCSVBaseSuffix(stem, "_"+strconv.Itoa(n))+".csv")
 }
 
 func fileExists(path string) (bool, error) {
@@ -449,12 +400,4 @@ func fileExists(path string) (bool, error) {
 		return false, nil
 	}
 	return false, err
-}
-
-func foldKey(path string) string {
-	path = filepath.Clean(path)
-	if runtime.GOOS == "windows" {
-		path = strings.ToLower(path)
-	}
-	return path
 }

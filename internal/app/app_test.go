@@ -1541,6 +1541,35 @@ func TestSQLKeyIsMergedBeforeSplit(t *testing.T) {
 	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"email\"\n\"a\"\n\"b\"\n")
 }
 
+// Прошлый запуск оборвался после публикации части: users_2.csv лежит,
+// папки нет в converted.txt. Повторная нарезка занимает тот же слот, а не _3.
+func TestRerunAfterInterruptedSplitDoesNotDuplicateParts(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "users_2.csv"), []byte("\"email\"\n\"b\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sql := "INSERT INTO users (email) VALUES ('a'),('a'),('b');\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "users.csv"), "\"email\"\n\"a\"\n\"a\"\n")
+	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"email\"\n\"b\"\n")
+	if _, err := os.Stat(filepath.Join(dir, "users_3.csv")); !os.IsNotExist(err) {
+		t.Fatalf("дубль части users_3.csv: %v", err)
+	}
+}
+
 func TestHeaderlessSQLSplitDoesNotInventHeader(t *testing.T) {
 	restore := csvout.SetSplitLimits(2, 2)
 	defer restore()
