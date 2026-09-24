@@ -205,19 +205,22 @@ func (w *Writer) Commit() (Result, error) {
 	w.slot.path = final
 	w.slot.nCol = w.nCol
 	w.slot.hasHeader = w.wroteHeader
-	w.reg.addOutput(w.dir, final, w.wroteHeader)
 	return Result{Path: final, PaddedRows: w.padded}, nil
 }
 
+// place публикует первый CSV ключа. Проверка занятости и регистрация идут
+// под одним lockDir: иначе два ключа с одним именем проскочили бы оба.
 func (w *Writer) place(tmpName string) (string, error) {
-	if w.reg != nil {
-		dmu := w.reg.lockDir(w.dir)
-		defer dmu.Unlock()
-	}
+	dmu := w.reg.lockDir(w.dir)
+	defer dmu.Unlock()
 	path := filepath.Join(w.dir, csvName(w.base, 0))
+	if w.reg.isWritten(path) {
+		return "", fmt.Errorf("%w: %s", ErrNameTaken, filepath.Base(path))
+	}
 	if err := replaceFile(tmpName, path); err != nil {
 		return "", err
 	}
+	w.reg.addOutput(w.dir, path, w.wroteHeader)
 	return path, nil
 }
 

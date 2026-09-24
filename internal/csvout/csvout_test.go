@@ -2,6 +2,7 @@ package csvout
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -498,7 +499,7 @@ func TestCreateNoHeaderFromEmptyColumns(t *testing.T) {
 	}
 }
 
-func TestCreatePlainOverwritesSameNamedSQLWithoutAppending(t *testing.T) {
+func TestCreatePlainDoesNotOverwriteCSVOfThisRun(t *testing.T) {
 	dir := t.TempDir()
 	reg := NewRegistry()
 	sql := commitInsert(t, reg, dir, "t", []string{"id"}, []string{"1"})
@@ -509,16 +510,18 @@ func TestCreatePlainOverwritesSameNamedSQLWithoutAppending(t *testing.T) {
 	if err := w.Row([]string{"excel"}); err != nil {
 		t.Fatal(err)
 	}
-	plain, err := w.Commit()
+	if _, err := w.Commit(); !errors.Is(err, ErrNameTaken) {
+		t.Fatalf("ожидался ErrNameTaken, получено %v", err)
+	}
+	if got := readCSV(t, sql.Path); got != "\"id\"\n\"1\"\n" {
+		t.Fatalf("CSV SQL затёрт: %q", got)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, tmpPattern))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Base(plain.Path) != "t.csv" || plain.Path != sql.Path {
-		t.Fatalf("Excel должен заменить целевой t.csv: SQL=%s Excel=%s", sql.Path, plain.Path)
-	}
-	got := readCSV(t, plain.Path)
-	if got != "\"col\"\n\"excel\"\n" {
-		t.Fatalf("заголовок + данные: %q", got)
+	if len(matches) != 0 {
+		t.Fatalf("временные файлы: %v", matches)
 	}
 }
 

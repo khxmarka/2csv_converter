@@ -1,6 +1,7 @@
 package csvout
 
 import (
+	"errors"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,7 +15,13 @@ type Registry struct {
 	byKey map[string]*slot
 	byDir map[string]*sync.Mutex
 	outs  []output
+	// written — canonicalPath каждого CSV, записанного в этом запуске.
+	written map[string]struct{}
 }
+
+// ErrNameTaken — целевое имя уже занято CSV этого запуска от другого ключа.
+// Замена затёрла бы результат, исходник которого потом удаляется (§15).
+var ErrNameTaken = errors.New("имя CSV уже занято другим источником в этом запуске")
 
 type slot struct {
 	mu        sync.Mutex
@@ -37,8 +44,9 @@ type Output struct {
 
 func NewRegistry() *Registry {
 	return &Registry{
-		byKey: make(map[string]*slot),
-		byDir: make(map[string]*sync.Mutex),
+		byKey:   make(map[string]*slot),
+		byDir:   make(map[string]*sync.Mutex),
+		written: make(map[string]struct{}),
 	}
 }
 
@@ -89,6 +97,7 @@ func (r *Registry) addOutput(dir, path string, hasHeader bool) {
 	pathKey := canonicalPath(path)
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.written[pathKey] = struct{}{}
 	for i, o := range r.outs {
 		if o.dir == dir && canonicalPath(o.path) == pathKey {
 			r.outs[i] = output{dir: dir, path: path, hasHeader: hasHeader}
@@ -96,6 +105,14 @@ func (r *Registry) addOutput(dir, path string, hasHeader bool) {
 		}
 	}
 	r.outs = append(r.outs, output{dir: dir, path: path, hasHeader: hasHeader})
+}
+
+func (r *Registry) isWritten(path string) bool {
+	key := canonicalPath(path)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.written[key]
+	return ok
 }
 
 // OutputsIn возвращает CSV, которые этот запуск записал в dir.

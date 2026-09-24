@@ -54,10 +54,18 @@ func SetSplitLimits(threshold, chunkRows int) (restore func()) {
 // SplitIfNeeded режет path, если строк данных больше SplitThreshold.
 // Файл с порогом и ниже не открывается на запись.
 func SplitIfNeeded(path string, mode HeaderMode) (SplitResult, error) {
-	return splitFile(path, mode, splitLimitThreshold, splitLimitChunk)
+	return splitFile(path, mode, splitLimitThreshold, splitLimitChunk, nil)
 }
 
-func splitFile(path string, mode HeaderMode, threshold, chunkRows int) (SplitResult, error) {
+// SplitIfNeeded режет path как csvout.SplitIfNeeded, но часть не может занять
+// CSV, который этот запуск записал для другого ключа (таблица users_2 при
+// нарезке users): такая нарезка — ошибка, монолит остаётся как был.
+func (r *Registry) SplitIfNeeded(path string, mode HeaderMode) (SplitResult, error) {
+	return splitFile(path, mode, splitLimitThreshold, splitLimitChunk, r.isWritten)
+}
+
+// taken — занятые имена частей; nil — занятых нет.
+func splitFile(path string, mode HeaderMode, threshold, chunkRows int, taken func(string) bool) (SplitResult, error) {
 	if threshold < 1 || chunkRows < 1 {
 		return SplitResult{}, fmt.Errorf("csvout: неверный порог нарезки")
 	}
@@ -71,7 +79,7 @@ func splitFile(path string, mode HeaderMode, threshold, chunkRows int) (SplitRes
 	if !over {
 		return SplitResult{DataRows: dataRows}, nil
 	}
-	names, written, err := writeAndPublish(path, mode, chunkRows)
+	names, written, err := writeAndPublish(path, mode, chunkRows, taken)
 	if err != nil {
 		return SplitResult{}, err
 	}
@@ -253,7 +261,7 @@ func csvRecordEmpty(raw []byte) bool {
 	return true
 }
 
-func writeAndPublish(path string, mode HeaderMode, chunkRows int) ([]string, int64, error) {
+func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(string) bool) ([]string, int64, error) {
 	dir := filepath.Dir(path)
 	var (
 		names []string
@@ -305,6 +313,9 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int) ([]string, int
 		next := path
 		if len(names) > 0 {
 			next = partName(path, len(names)+1)
+			if taken != nil && taken(next) {
+				return fmt.Errorf("%w: %s", ErrNameTaken, filepath.Base(next))
+			}
 		}
 		names = append(names, next)
 		f, err := os.CreateTemp(dir, tmpPattern)

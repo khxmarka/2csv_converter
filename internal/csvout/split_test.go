@@ -77,7 +77,7 @@ func TestSplitHeaderRepeated(t *testing.T) {
 	path := filepath.Join(dir, "t.csv")
 	writeRaw(t, path, "\"h\"\n\"a\"\n\"b\"\n\"c\"\n")
 
-	res, err := splitFile(path, SplitWithHeader, 2, 2)
+	res, err := splitFile(path, SplitWithHeader, 2, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +92,7 @@ func TestSplitNoHeaderDoesNotInventHeader(t *testing.T) {
 	path := filepath.Join(dir, "t.csv")
 	writeRaw(t, path, "\"a\"\n\"b\"\n\"c\"\n")
 
-	res, err := splitFile(path, SplitNoHeader, 2, 2)
+	res, err := splitFile(path, SplitNoHeader, 2, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestSplitForeignFirstNonEmptyIsHeader(t *testing.T) {
 	path := filepath.Join(dir, "t.csv")
 	writeRaw(t, path, "\n\n\"h\"\n\"a\"\n\"b\"\n")
 
-	res, err := splitFile(path, SplitWithHeader, 1, 1)
+	res, err := splitFile(path, SplitWithHeader, 1, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestSplitReplacesOccupiedPartName(t *testing.T) {
 	writeRaw(t, path, "\"a\"\n\"b\"\n\"c\"\n")
 	writeRaw(t, filepath.Join(dir, "users_2.csv"), "STALE\n")
 
-	res, err := splitFile(path, SplitNoHeader, 2, 2)
+	res, err := splitFile(path, SplitNoHeader, 2, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestSplitPartNamesUseOwnStem(t *testing.T) {
 			path := filepath.Join(dir, tt.file)
 			writeRaw(t, path, "\"a\"\n\"b\"\n\"c\"\n")
 
-			res, err := splitFile(path, SplitNoHeader, 2, 2)
+			res, err := splitFile(path, SplitNoHeader, 2, 2, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -201,7 +201,7 @@ func TestSplitFailureKeepsMonolithAndPreexistingParts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := splitFile(path, SplitNoHeader, 2, 2); err == nil {
+	if _, err := splitFile(path, SplitNoHeader, 2, 2, nil); err == nil {
 		t.Fatal("ожидалась ошибка публикации части")
 	}
 	got, err := os.ReadFile(path)
@@ -225,7 +225,7 @@ func TestSplitQuotedNewlineStaysOneRecord(t *testing.T) {
 	path := filepath.Join(dir, "t.csv")
 	writeRaw(t, path, "\"a\nb\"\n\"c\"\n")
 
-	res, err := splitFile(path, SplitNoHeader, 1, 1)
+	res, err := splitFile(path, SplitNoHeader, 1, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +240,7 @@ func TestSplitDropsOnlyTrailingEmptyWhenCutting(t *testing.T) {
 	path := filepath.Join(dir, "t.csv")
 	writeRaw(t, path, "\"h\"\n\n\"a\"\n\n")
 
-	res, err := splitFile(path, SplitWithHeader, 1, 1)
+	res, err := splitFile(path, SplitWithHeader, 1, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

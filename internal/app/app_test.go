@@ -1258,18 +1258,23 @@ func TestSQLExcelSQLSameTargetNeverMixesStreams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.InsertOK != 2 || res.CSV != 2 {
+	// SQL закрывает ключ раньше Excel (§9). Лист Excel не затирает CSV этого
+	// запуска: иначе оба .sql удалились бы без своих данных на диске.
+	if res.InsertOK != 2 || res.CSV != 1 || res.FilesFail != 1 {
 		t.Fatalf("результат: %+v", res)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "m_users.csv"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) != "\"excel_header\"\n\"excel\"\n" {
+	if string(raw) != "\"email\"\n\"first@example.test\"\n\"second@example.test\"\n" {
 		t.Fatalf("SQL и Excel не должны смешиваться: %q", raw)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "m_users(1).csv")); !os.IsNotExist(err) {
 		t.Fatalf("индексный CSV не должен создаваться, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "m.xlsx")); err != nil {
+		t.Fatalf("книга без своего CSV должна остаться: %v", err)
 	}
 }
 
@@ -1708,6 +1713,97 @@ func TestXLSDeletedAfterOneSheetCSV(t *testing.T) {
 	}
 	if _, err := os.Stat(book); !os.IsNotExist(err) {
 		t.Fatalf(".xls должен быть удалён: %v", err)
+	}
+}
+
+// report.xls и report.xlsx претендуют на report_Sheet1.csv. Второй не затирает
+// CSV первого: его лист — ошибка записи, а книга остаётся на диске.
+func TestSameTargetNameDoesNotOverwriteCSVOfThisRun(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	xls := filepath.Join(dir, "report.xls")
+	xlsx := filepath.Join(dir, "report.xlsx")
+	if err := xlsconv.WriteXLS(xls, []xlsconv.Sheet{{
+		Name: "Sheet1",
+		Rows: [][]string{{"email"}, {"from-xls@example.test"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := xlsconv.WriteXLSX(xlsx, []xlsconv.Sheet{{
+		Name: "Sheet1",
+		Rows: [][]string{{"email"}, {"from-xlsx@example.test"}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if _, err := Run(logx.New(&buf), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "report_Sheet1.csv"), "\"email\"\n\"from-xls@example.test\"\n")
+	if _, err := os.Stat(xls); !os.IsNotExist(err) {
+		t.Fatalf("report.xls дал CSV и должен быть удалён: %v", err)
+	}
+	if _, err := os.Stat(xlsx); err != nil {
+		t.Fatalf("report.xlsx без своего CSV должен остаться: %v", err)
+	}
+	if !strings.Contains(buf.String(), "report.xlsx") {
+		t.Fatalf("нужна ошибка столкновения имён:\n%s", buf.String())
+	}
+}
+
+// Нарезка users.csv не занимает users_2.csv, который этот запуск записал
+// для таблицы users_2: нарезка падает, оба CSV целы, исходник остаётся.
+func TestSplitDoesNotOverwriteCSVOfThisRun(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sql := "" +
+		"INSERT INTO users_2 (email) VALUES ('x');\n" +
+		"INSERT INTO users (email) VALUES ('a'),('b'),('c');\n"
+	src := filepath.Join(dir, "a.sql")
+	if err := os.WriteFile(src, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if _, err := Run(logx.New(&buf), root); err != nil {
+		t.Fatal(err)
+	}
+	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"email\"\n\"x\"\n")
+	assertFile(t, filepath.Join(dir, "users.csv"), "\"email\"\n\"a\"\n\"b\"\n\"c\"\n")
+	if !strings.Contains(buf.String(), "не удалось нарезать") {
+		t.Fatalf("нужна ошибка нарезки:\n%s", buf.String())
+	}
+}
+
+// Исходник удаляется только при чистом успехе: INSERT, не попавший в CSV
+// из-за ошибки, иначе пропал бы безвозвратно.
+func TestPartialFailureKeepsSource(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(dir, "dump.sql")
+	copySQLFixture(t, "06_second_too_many.sql", src)
+
+	if _, err := Run(logx.New(io.Discard), root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "t.csv")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Fatalf("исходник с проваленным INSERT должен остаться: %v", err)
 	}
 }
 

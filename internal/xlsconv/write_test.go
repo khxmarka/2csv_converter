@@ -2,6 +2,7 @@ package xlsconv
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -300,7 +301,7 @@ func TestWriteEmptySheetSkipped(t *testing.T) {
 	}
 }
 
-func TestWriteOverwritesSQLCSVWithoutAppending(t *testing.T) {
+func TestWriteDoesNotOverwriteSQLCSVOfThisRun(t *testing.T) {
 	src := writeXLSX(t, []specSheet{{Name: "Only", Rows: [][]string{{"excel"}}}})
 	dir := filepath.Dir(src)
 	reg := csvout.NewRegistry()
@@ -320,15 +321,11 @@ func TestWriteOverwritesSQLCSVWithoutAppending(t *testing.T) {
 	}
 
 	res := File(reg, src)
-	if res.OpenErr != nil || res.CSV != 1 {
-		t.Fatalf("err=%v csv=%d", res.OpenErr, res.CSV)
+	if res.OpenErr != nil || res.CSV != 0 || !errors.Is(res.WriteErr, csvout.ErrNameTaken) {
+		t.Fatalf("err=%v csv=%d writeErr=%v", res.OpenErr, res.CSV, res.WriteErr)
 	}
-	if filepath.Base(res.Paths[0]) != "book_Only.csv" || res.Paths[0] != sqlRes.Path {
-		t.Fatalf("Excel должен заменить целевой CSV: SQL=%s Excel=%s", sqlRes.Path, res.Paths[0])
-	}
-	sqlRaw := readFile(t, sqlRes.Path)
-	if strings.Contains(sqlRaw, "\"id\"") || sqlRaw != "\"excel\"\n" {
-		t.Fatalf("CSV должен содержать только Excel без дописывания: %q", sqlRaw)
+	if sqlRaw := readFile(t, sqlRes.Path); sqlRaw != "\"id\"\n\"sql\"\n" {
+		t.Fatalf("CSV SQL затёрт или дописан: %q", sqlRaw)
 	}
 }
 

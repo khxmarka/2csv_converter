@@ -16,7 +16,7 @@ func splitWritten(log *logx.Logger, reg *csvout.Registry, dir string) bool {
 		if out.HasHeader {
 			mode = csvout.SplitWithHeader
 		}
-		if _, err := csvout.SplitIfNeeded(out.Path, mode); err != nil {
+		if _, err := reg.SplitIfNeeded(out.Path, mode); err != nil {
 			log.Errorf("%s: не удалось нарезать: %v", out.Path, err)
 			failed = true
 		}
@@ -24,8 +24,8 @@ func splitWritten(log *logx.Logger, reg *csvout.Registry, dir string) bool {
 	return failed
 }
 
-func splitForeignCSV(log *logx.Logger, path string) fileOutcome {
-	res, err := csvout.SplitIfNeeded(path, csvout.SplitWithHeader)
+func splitForeignCSV(log *logx.Logger, reg *csvout.Registry, path string) fileOutcome {
+	res, err := reg.SplitIfNeeded(path, csvout.SplitWithHeader)
 	if err != nil {
 		log.Errorf("%s: не удалось нарезать: %v", path, err)
 		return fileOutcome{failed: true, splitFail: true}

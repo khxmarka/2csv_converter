@@ -500,14 +500,20 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 			acc.record(file, fileOutcome{})
 			continue
 		}
-		acc.record(file, splitForeignCSV(log, file.Path))
+		acc.record(file, splitForeignCSV(log, reg, file.Path))
 	}
 	for _, file := range produced {
 		removeSource(log, file.Path)
 	}
 }
 
+// producedCSV — исходник можно удалить (§15): CSV получен и ни одна единица
+// файла не провалилась. Иначе удаление унесло бы INSERT или лист, которые
+// в CSV не попали (ошибка записи, лишние значения, занятое имя).
 func producedCSV(out fileOutcome) bool {
+	if out.writeErr != nil || out.failed || out.unitFail > 0 {
+		return false
+	}
 	return out.created > 0 || out.csv > 0
 }
 
