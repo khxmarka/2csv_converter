@@ -68,6 +68,13 @@ func seekInsert(s *src) (bool, error) {
 				}
 				return false, err
 			}
+		case b == '$':
+			if err := s.skipDollarQuoted(); err != nil {
+				if err == io.EOF {
+					return false, nil
+				}
+				return false, err
+			}
 		case identStart(b):
 			word, err := s.consumeUnquotedWord()
 			if err != nil {
@@ -684,6 +691,14 @@ func parseValue(s *src) (Cell, error) {
 	case '"':
 		text, err := readString(s, '"')
 		return Cell{Kind: Text, Text: text}, err
+	case 'N', 'n', 'E', 'e':
+		// N'…' (MSSQL, Unicode) и E'…' (Postgres) — тот же строковый литерал,
+		// префикс в ячейку не идёт. NOW(), NULL и прочие слова — не литерал.
+		if q, ok := s.peekByte(1); ok && q == '\'' {
+			_, _ = s.next()
+			text, err := readString(s, '\'')
+			return Cell{Kind: Text, Text: text}, err
+		}
 	}
 
 	word, ok, err := s.peekUnquotedWord()
@@ -810,7 +825,7 @@ func readQuotedRaw(s *src, quote byte) (string, error) {
 			return "", err
 		}
 		b.WriteByte(c)
-		if quote == '\'' && c == '\\' {
+		if quote != '`' && c == '\\' {
 			n, err := s.next()
 			if err != nil {
 				return b.String(), err

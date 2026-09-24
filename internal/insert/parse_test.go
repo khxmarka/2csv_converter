@@ -786,6 +786,42 @@ func TestParseDialects(t *testing.T) {
 			},
 		},
 		{
+			name: "MSSQL N'…' и Postgres E'…': префикс не попадает в ячейку",
+			sql:  "INSERT INTO users (a, b, c) VALUES (N'Иван', n'O''Neil', E'x\\'y');",
+			want: []parsed{{"users(a,b,c)", []string{"Иван|O'Neil|x'y"}}},
+		},
+		{
+			name: "идентификатор на N без кавычки остаётся значением",
+			sql:  "INSERT INTO users (a) VALUES (NOW());",
+			want: []parsed{{"users(a)", []string{"NOW()"}}},
+		},
+		{
+			name: "\\\" в двойных кавычках: сканер и парсер режут одинаково",
+			sql: "INSERT INTO users (a, b) VALUES (\"x\\\"y\", 'z');\n" +
+				"INSERT INTO users (a, b) VALUES ('q', 'w');",
+			want: []parsed{
+				{"users(a,b)", []string{"x\"y|z"}},
+				{"users(a,b)", []string{"q|w"}},
+			},
+		},
+		{
+			name: "INSERT внутри $$-тела функции Postgres не данные",
+			sql: "CREATE FUNCTION f() RETURNS trigger AS $$ BEGIN " +
+				"INSERT INTO audit (email, phone) VALUES (NEW.email, NEW.phone); RETURN NEW; END; " +
+				"$$ LANGUAGE plpgsql;\n" +
+				"CREATE FUNCTION g() RETURNS void AS $body$ INSERT INTO audit (email) VALUES ('x'); $body$ LANGUAGE sql;\n" +
+				"INSERT INTO users (email) VALUES ('a');",
+			want: []parsed{{"users(email)", []string{"a"}}},
+		},
+		{
+			name: "знак $ внутри имени не открывает $$-строку",
+			sql:  "INSERT INTO a$b$c (email) VALUES ('a');\nINSERT INTO users (email) VALUES ('b');",
+			want: []parsed{
+				{"a$b$c(email)", []string{"a"}},
+				{"users(email)", []string{"b"}},
+			},
+		},
+		{
 			name: "GRANT/TRIGGER с INSERT не дают таблицу",
 			sql: "GRANT INSERT, UPDATE ON users TO app;\n" +
 				"INSERT INTO users (email) VALUES ('a');",
