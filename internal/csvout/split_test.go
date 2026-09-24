@@ -363,7 +363,7 @@ func TestLimitCSVBaseSuffixKeepsNumber(t *testing.T) {
 	}
 }
 
-func writePlainRows(t *testing.T, path, header, line string, rows int) {
+func writePlainRows(t testing.TB, path, header, line string, rows int) {
 	t.Helper()
 	f, err := os.Create(path)
 	if err != nil {
