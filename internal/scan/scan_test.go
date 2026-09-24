@@ -64,12 +64,6 @@ func TestFindOnFixtureTree(t *testing.T) {
 	if len(result.Skips) != 0 {
 		t.Fatalf("пропусков на чистой фикстуре быть не должно: %#v", result.Skips)
 	}
-	if got := result.InRootCount(); got != 1 {
-		t.Fatalf("файлов в корне: получено %d, ожидалось 1", got)
-	}
-	if got := result.TopFolders(); !reflect.DeepEqual(got, []string{"Alpha", "Beta"}) {
-		t.Fatalf("верхние папки: получено %v, ожидалось [Alpha Beta]", got)
-	}
 	if !reflect.DeepEqual(result.TopDirs, []string{"Alpha", "Beta", "Gamma"}) {
 		t.Fatalf("верхние каталоги: %v", result.TopDirs)
 	}

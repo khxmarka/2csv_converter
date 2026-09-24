@@ -422,6 +422,11 @@ func readHead(t *testing.T, path string, n int) []byte {
 	return buf
 }
 
+func countDataRows(path string, mode HeaderMode) (int64, error) {
+	n, _, err := countDataRowsUntil(path, mode, -1)
+	return n, err
+}
+
 func assertPartData(t *testing.T, parts []string, mode HeaderMode, want []int64) {
 	t.Helper()
 	if len(parts) != len(want) {

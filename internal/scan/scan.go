@@ -32,9 +32,6 @@ type SQLFile struct {
 	TopFolder string
 }
 
-// InRoot сообщает, что файл лежит прямо в корне, а не в подпапке.
-func (f SQLFile) InRoot() bool { return f.TopFolder == "" }
-
 // IsExcel — книга .xlsx или .xls.
 func (f SQLFile) IsExcel() bool { return f.Kind == KindXLSX || f.Kind == KindXLS }
 
@@ -192,33 +189,6 @@ func skipTopFolder(root, path string, isDir bool) string {
 		return ""
 	}
 	return parts[0]
-}
-
-// TopFolders возвращает отсортированный список верхних папок, в которых нашлись рабочие файлы.
-func (r Result) TopFolders() []string {
-	seen := make(map[string]struct{})
-	for _, f := range r.Files {
-		if !f.InRoot() {
-			seen[f.TopFolder] = struct{}{}
-		}
-	}
-	out := make([]string, 0, len(seen))
-	for name := range seen {
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
-// InRootCount — сколько рабочих файлов лежит прямо в корне.
-func (r Result) InRootCount() int {
-	n := 0
-	for _, f := range r.Files {
-		if f.InRoot() {
-			n++
-		}
-	}
-	return n
 }
 
 // isLink отсекает symlink-и и прочие reparse point-ы Windows (junction, mount point).

@@ -20,21 +20,10 @@ import (
 
 const maxWorkers = 16
 
-func workerCount(files int) int {
-	if files <= 0 {
-		return 0
-	}
-	n := runtime.GOMAXPROCS(0)
-	if n < 1 {
-		n = 1
-	}
-	if n > maxWorkers {
-		n = maxWorkers
-	}
-	if n > files {
-		n = files
-	}
-	return n
+// poolSize — N воркеров на весь запуск: min(GOMAXPROCS, 16), не меньше 1 (§9).
+// Числом файлов не ограничивается: INSERT одного файла тоже идут в этот пул.
+func poolSize() int {
+	return min(max(runtime.GOMAXPROCS(0), 1), maxWorkers)
 }
 
 func folderName(f scan.SQLFile) string {

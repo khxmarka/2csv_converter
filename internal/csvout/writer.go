@@ -167,8 +167,6 @@ func (w *Writer) Row(values []string) error {
 	return err
 }
 
-func (w *Writer) PaddedRows() int { return w.padded }
-
 // Commit вливает временный файл в итоговый CSV и снимает блокировку ключа.
 func (w *Writer) Commit() (Result, error) {
 	var empty Result
@@ -217,7 +215,7 @@ func (w *Writer) Commit() (Result, error) {
 func (w *Writer) place(tmpName string) (string, error) {
 	dmu := w.reg.lockDir(w.dir)
 	defer dmu.Unlock()
-	path := filepath.Join(w.dir, csvName(w.base, 0))
+	path := filepath.Join(w.dir, w.base+".csv")
 	if w.reg.isWritten(path) {
 		return "", fmt.Errorf("%w: %s", ErrNameTaken, filepath.Base(path))
 	}

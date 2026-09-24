@@ -41,10 +41,6 @@ func (l *Logger) Hang(msg string) {
 	l.hang = msg
 }
 
-func (l *Logger) Infof(format string, args ...any) {
-	l.line("info: " + fmt.Sprintf(format, args...))
-}
-
 func (l *Logger) Warnf(format string, args ...any) {
 	l.line("warn: " + fmt.Sprintf(format, args...))
 }

@@ -208,11 +208,6 @@ func parseInsert(s *src, h Handler) error {
 			} else if ok {
 				return skip("INSERT ... SET", table)
 			}
-			if ok, err := s.tryKeyword("SELECT"); err != nil {
-				return err
-			} else if ok {
-				return skip("INSERT ... SELECT", table)
-			}
 			return skip("нет VALUES", table)
 		}
 	}

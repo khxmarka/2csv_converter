@@ -101,11 +101,6 @@ func rejectSplitPath(path string) error {
 	return nil
 }
 
-func countDataRows(path string, mode HeaderMode) (int64, error) {
-	n, _, err := countDataRowsUntil(path, mode, -1)
-	return n, err
-}
-
 var errNeedSplit = errors.New("csvout: нужно нарезать")
 
 // countDataRowsUntil считает строки данных. Если limit ≥ 0, останавливается

@@ -645,15 +645,14 @@ func TestSecondInsertTooManyKeepsCSVAndLogsReason(t *testing.T) {
 	}
 }
 
-func TestWorkerCount(t *testing.T) {
-	if workerCount(0) != 0 {
-		t.Fatalf("0 файлов → 0 воркеров")
-	}
-	if n := workerCount(1); n != 1 {
-		t.Fatalf("1 файл → 1 воркер, получено %d", n)
-	}
-	if n := workerCount(1000); n < 1 || n > maxWorkers {
-		t.Fatalf("потолок: %d", n)
+func TestPoolSizeBounds(t *testing.T) {
+	for _, procs := range []int{1, 4, maxWorkers, 64} {
+		prev := runtime.GOMAXPROCS(procs)
+		got := poolSize()
+		runtime.GOMAXPROCS(prev)
+		if want := min(procs, maxWorkers); got != want {
+			t.Fatalf("GOMAXPROCS=%d: воркеров %d, ожидалось %d", procs, got, want)
+		}
 	}
 }
 
