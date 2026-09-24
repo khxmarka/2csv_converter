@@ -263,7 +263,7 @@ func TestRejectedInsertDoesNotOverwriteExistingCSV(t *testing.T) {
 	}
 	res, _ := runFile(t, dir, "dump.sql", `
 INSERT INTO users (email) VALUES ('a@example.test', 'extra');
-INSERT INTO users (email) VALUES ('valid@example.test'), ('unclosed);
+INSERT INTO users (email) VALUES ('valid@example.test'), ('a' 'no comma');
 `)
 	if res.Created != 0 || res.CSV != 0 || res.Skipped != 2 {
 		t.Fatalf("created=%d csv=%d skipped=%d", res.Created, res.CSV, res.Skipped)

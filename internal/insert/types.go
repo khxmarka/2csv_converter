@@ -12,6 +12,9 @@ type Meta struct {
 	Columns []string
 	Offset  int64
 	Line    int
+	// ValuesLine — строка файла, с которой начинается хвост после VALUES.
+	// ParseValues по ней считает абсолютные номера строк (Handler.Cut).
+	ValuesLine int
 }
 
 // Kind — тип ячейки VALUES.
@@ -70,6 +73,10 @@ type Handler struct {
 	StreamRow func(emit func(CellWriter) error) error
 	// RowSurplus вызывается один раз на каждую пропущенную из‑за ширины строку.
 	RowSurplus func()
-	End        func() error
-	Skip       func(Skip)
+	// Cut — INSERT оборван после принятых строк (обрезанный дамп, битая
+	// последняя строка): принятые строки остаются, дальше вызывается End.
+	// line — строка файла, где оборвалось.
+	Cut  func(reason string, line int)
+	End  func() error
+	Skip func(Skip)
 }

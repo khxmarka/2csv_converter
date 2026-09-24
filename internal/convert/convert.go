@@ -1,6 +1,8 @@
 package convert
 
 import (
+	"fmt"
+
 	"sql2csv/internal/csvout"
 	"sql2csv/internal/insert"
 	"sql2csv/internal/logx"
@@ -50,9 +52,14 @@ func (s *session) skip(sk insert.Skip) {
 		return
 	}
 	s.unitFail++
+	// Путь со строкой INSERT (file.sql:120): место в файле видно сразу.
+	where := s.sql.Path
+	if sk.Line > 0 {
+		where = fmt.Sprintf("%s:%d", s.sql.Path, sk.Line)
+	}
 	if sk.Table != "" {
-		s.log.Errorf("%s таблица %s: %s", s.sql.Path, sk.Table, sk.Reason)
+		s.log.Errorf("%s таблица %s: %s", where, sk.Table, sk.Reason)
 		return
 	}
-	s.log.Errorf("%s: %s", s.sql.Path, sk.Reason)
+	s.log.Errorf("%s: %s", where, sk.Reason)
 }

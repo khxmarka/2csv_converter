@@ -223,6 +223,7 @@ func parseInsert(s *src, h Handler) error {
 		}
 	}
 	if h.ValuesAt != nil {
+		meta.ValuesLine = s.line
 		off := s.pos
 		if err := s.skipUntilSemicolon(true, false); err != nil {
 			return err
@@ -240,7 +241,11 @@ func ParseValues(r io.Reader, meta Meta, h Handler) error {
 	if sized, ok := r.(interface{ Size() int64 }); ok && sized.Size() < int64(size) {
 		size = int(sized.Size())
 	}
-	return parseValueRows(newSrcSize(r, size), h, meta)
+	s := newSrcSize(r, size)
+	if meta.ValuesLine > 0 {
+		s.line = meta.ValuesLine
+	}
+	return parseValueRows(s, h, meta)
 }
 
 func parseValueRows(s *src, h Handler, meta Meta) error {
@@ -254,6 +259,10 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 	}
 	began := false
 	accepted := 0
+	// cut — INSERT оборван после принятых строк (обрезанный дамп): строки
+	// выше сохраняются, причина и строка файла уходят в Handler.Cut.
+	var cut string
+	cutLine := 0
 	expectRow := false
 	maxCells := len(cols)
 
@@ -281,7 +290,11 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		b, err := s.peek()
 		if err == io.EOF {
 			if expectRow {
-				return skip("после запятой нет строки VALUES", table)
+				if accepted > 0 {
+					cut = "после запятой нет строки VALUES"
+				} else {
+					return skip("после запятой нет строки VALUES", table)
+				}
 			}
 			break
 		}
@@ -290,7 +303,11 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		}
 		if b != '(' {
 			if expectRow {
-				return skip("после запятой нет строки VALUES", table)
+				if accepted > 0 {
+					cut = "после запятой нет строки VALUES"
+				} else {
+					return skip("после запятой нет строки VALUES", table)
+				}
 			}
 			break
 		}
@@ -319,6 +336,15 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		switch {
 		case errors.Is(err, ErrRowSurplus):
 			noteSurplus()
+		case err != nil && accepted > 0 && errors.Is(err, io.EOF):
+			// Дамп оборван посреди строки (кончился файл/хвост): целые строки
+			// выше сохраняем. Синтаксический мусор посреди файла — как раньше,
+			// весь INSERT в пропуск.
+			cut = "битая строка VALUES: " + err.Error()
+			cutLine = s.line
+			if err := s.skipUntilSemicolon(true, false); err != nil {
+				return err
+			}
 		case err != nil:
 			if began {
 				_ = skip("битый INSERT: "+err.Error(), table)
@@ -327,6 +353,9 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 			return skip("битый INSERT: "+err.Error(), table)
 		default:
 			accepted++
+		}
+		if cut != "" {
+			break
 		}
 
 		if err := s.skipTailSpaceAndComments(); err != nil {
@@ -350,6 +379,18 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		break
 	}
 
+	if cut != "" {
+		if cutLine == 0 {
+			cutLine = s.line
+		}
+		if h.Cut != nil {
+			h.Cut(cut, cutLine)
+		}
+		if h.End != nil {
+			return h.End()
+		}
+		return nil
+	}
 	if accepted == 0 {
 		// Все строки отброшены по ширине: Skip сбросит начатый temp.
 		return skip("нет строк VALUES", table)

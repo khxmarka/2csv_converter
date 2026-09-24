@@ -276,8 +276,6 @@ func TestParseRejectsMalformedSeparatorsAndContinues(t *testing.T) {
 			INSERT INTO ok (email) VALUES ('ok@example.test');`,
 		"rows without comma": `INSERT INTO bad (email) VALUES ('a') ('b');
 			INSERT INTO ok (email) VALUES ('ok@example.test');`,
-		"trailing row comma": `INSERT INTO bad (email) VALUES ('a'),;
-			INSERT INTO ok (email) VALUES ('ok@example.test');`,
 		"unexpected tail": `INSERT INTO bad (email) VALUES ('a') GARBAGE;
 			INSERT INTO ok (email) VALUES ('ok@example.test');`,
 	}
@@ -855,6 +853,52 @@ func TestParseDialects(t *testing.T) {
 			got := parseBoth(t, tt.sql)
 			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
 				t.Fatalf("\n got %v\nwant %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Обрезанный дамп: INSERT оборван после целых строк (висящая запятая, конец
+// файла, битая последняя строка). Целые строки сохраняются, обрыв — в Cut
+// со строкой файла; следующий INSERT разбирается как обычно.
+func TestParseCutInsertKeepsAcceptedRows(t *testing.T) {
+	tests := []struct {
+		name     string
+		sql      string
+		wantRows int
+		wantLine int
+		reason   string
+	}{
+		{"висящая запятая", "INSERT INTO t (email) VALUES\n('a'),\n('b'),;\nINSERT INTO ok (email) VALUES ('x');", 2, 3, "после запятой"},
+		{"конец файла после запятой", "INSERT INTO t (email) VALUES\n('a'),\n('b'),\n", 2, 4, "после запятой"},
+		{"битая последняя строка", "INSERT INTO t (email) VALUES\n('a'),\n('b'),\n('c", 2, 4, "битая строка"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, spill := range []bool{false, true} {
+				var rows, cutLine int
+				var reason string
+				var tables []string
+				h := Handler{
+					Row:   func([]Cell) error { rows++; return nil },
+					Cut:   func(r string, line int) { reason, cutLine = r, line },
+					Begin: func(m Meta) error { tables = append(tables, m.Table); return nil },
+					Skip:  func(sk Skip) { t.Fatalf("пропуск вместо обрыва: %+v", sk) },
+				}
+				if spill {
+					h.ValuesAt = func(m Meta, off, n int64) error {
+						return ParseValues(io.NewSectionReader(strings.NewReader(tt.sql), off, n), m, Handler{
+							Row: h.Row, Cut: h.Cut, Skip: h.Skip,
+							Begin: func(m Meta) error { tables = append(tables, m.Table); return nil },
+						})
+					}
+				}
+				if err := Parse(strings.NewReader(tt.sql), h); err != nil {
+					t.Fatal(err)
+				}
+				if tables[0] != "t" || rows < tt.wantRows || !strings.Contains(reason, tt.reason) || cutLine != tt.wantLine {
+					t.Fatalf("spill=%v: rows=%d reason=%q line=%d tables=%v", spill, rows, reason, cutLine, tables)
+				}
 			}
 		})
 	}

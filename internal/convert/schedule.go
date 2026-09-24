@@ -132,12 +132,18 @@ type prepared struct {
 	skip    *insert.Skip
 	err     error
 	surplus int
+	// cut — INSERT оборван после целых строк (обрезанный дамп): они пишутся,
+	// в лог — причина и строка файла cutLine.
+	cut     string
+	cutLine int
 }
 
 func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) {
 	var data *csvout.DataFile
 	var skipped *insert.Skip
 	surplus := 0
+	var cut string
+	cutLine := 0
 	var cellw dataCellWriter // один на INSERT, не на строку
 	defer func() {
 		if out.data == nil && data != nil {
@@ -176,6 +182,7 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 			return nil
 		},
 		RowSurplus: func() { surplus++ },
+		Cut:        func(reason string, line int) { cut, cutLine = reason, line },
 		Skip: func(sk insert.Skip) {
 			cp := sk
 			skipped = &cp
@@ -201,7 +208,7 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 	if err := data.Finish(); err != nil {
 		return prepared{err: err, surplus: surplus}
 	}
-	out = prepared{data: data, surplus: surplus}
+	out = prepared{data: data, surplus: surplus, cut: cut, cutLine: cutLine}
 	return out
 }
 
@@ -276,5 +283,11 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 	if totalSurplus > 0 {
 		s.unitFail += totalSurplus
 		s.log.Errorf("%s таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Table, totalSurplus)
+	}
+	if prep.cut != "" {
+		// Не молчим: хвост INSERT потерян, исходник остаётся (unitFail, §15).
+		s.unitFail++
+		s.log.Errorf("%s:%d таблица %s: INSERT оборван (%s), записано строк: %d",
+			s.sql.Path, prep.cutLine, meta.Table, prep.cut, prep.data.Rows()-res.SkippedRows)
 	}
 }

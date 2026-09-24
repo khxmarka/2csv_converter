@@ -198,3 +198,35 @@ func TestScheduleOneWideRowKeepsRestOfInsert(t *testing.T) {
 type discardLog struct{}
 
 func (discardLog) Write(p []byte) (int, error) { return len(p), nil }
+
+// Файл со второго скриншота: дамп обрезан после «),» — раньше весь INSERT
+// отбрасывался («после запятой нет строки VALUES», 0 CSV). Теперь целые
+// строки в CSV, в лог — одна строка с номером строки файла.
+func TestScheduleTruncatedDumpKeepsRows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "interestedtoparticipate.sql")
+	sql := "CREATE TABLE `interestedtoparticipate` (`id` int);\n\n" +
+		"INSERT INTO `interestedtoparticipate` (`id`, `email`, `mobile`) VALUES\n" +
+		"(1, 'a@example.test', '1'),\n" +
+		"(2, 'b@example.test', '2'),\n"
+	if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	res := Schedule(logx.New(&buf), csvout.NewRegistry(), scan.SQLFile{Path: path}, nil)
+	if res.Created != 1 || res.CSV != 1 || res.UnitFail != 1 {
+		t.Fatalf("%+v log=%q", res, buf.String())
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "interestedtoparticipate.csv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "\"id\",\"email\",\"mobile\"\n\"1\",\"a@example.test\",\"1\"\n\"2\",\"b@example.test\",\"2\"\n"
+	if string(got) != want {
+		t.Fatalf("CSV:\n got %q\nwant %q", got, want)
+	}
+	if !strings.Contains(buf.String(), ".sql:6 таблица interestedtoparticipate: INSERT оборван") ||
+		!strings.Contains(buf.String(), "записано строк: 2") {
+		t.Fatalf("лог: %q", buf.String())
+	}
+}
