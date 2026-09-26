@@ -108,3 +108,25 @@ func TestClearHangCoversWideRunes(t *testing.T) {
 		t.Fatalf("ширина: %d", DisplayWidth("папка: 数据"))
 	}
 }
+
+// Файл лога получает все строки, кроме строки прогресса; FileLinef идёт
+// только в файл.
+func TestLogFileCopy(t *testing.T) {
+	var console, file bytes.Buffer
+	log := New(&console)
+	log.SetFile(&file)
+	log.Hang("папка в обработке: A (0 с)")
+	log.Linef("папка обработана: A")
+	log.Errorf("сбой %d", 1)
+	log.FileLinef("папка обработана: B")
+	log.Hang("")
+	if got, want := file.String(), "папка обработана: A\nerror: сбой 1\nпапка обработана: B\n"; got != want {
+		t.Fatalf("файл:\n got %q\nwant %q", got, want)
+	}
+	if strings.Contains(console.String(), "B") {
+		t.Fatalf("FileLinef попал в консоль: %q", console.String())
+	}
+	if !strings.Contains(console.String(), "папка обработана: A") {
+		t.Fatalf("консоль: %q", console.String())
+	}
+}

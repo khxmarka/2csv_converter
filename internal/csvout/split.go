@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"sql2csv/internal/marks"
 )
 
 const (
@@ -103,7 +105,7 @@ func splitFile(path string, mode HeaderMode, threshold, chunkRows int, taken fun
 
 func rejectSplitPath(path string, mode HeaderMode) error {
 	base := filepath.Base(path)
-	if strings.EqualFold(base, "converted.txt") {
+	if strings.EqualFold(base, "readme.txt") || marks.IsService(base) {
 		return fmt.Errorf("csvout: %s не нарезается", base)
 	}
 	lower := strings.ToLower(base)

@@ -281,12 +281,12 @@ func TestFindCollectsCSVSkipsTempsAndConverted(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"converted.txt", "Converted.TXT", ".2csv-left.tmp", "notes.md"} {
+	for _, name := range []string{"_log.txt", "_Convert_Done_.txt", "_splitter_passed_.txt", "README.txt", ".2csv-left.tmp", "notes.md"} {
 		if err := os.WriteFile(filepath.Join(alpha, name), []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(root, "converted.txt"), []byte("Old\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "_convert_done_.txt"), []byte("Old\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -302,7 +302,7 @@ func TestFindCollectsCSVSkipsTempsAndConverted(t *testing.T) {
 			t.Fatalf("csv: %+v", f)
 		}
 		base := filepath.Base(f.Path)
-		if base == "converted.txt" || strings.Contains(base, ".2csv-") {
+		if IsIgnored(base) || strings.Contains(base, ".2csv-") {
 			t.Fatalf("служебный файл попал в обход: %s", f.Path)
 		}
 	}
@@ -315,5 +315,30 @@ func TestFindOnEmptyDir(t *testing.T) {
 	}
 	if len(result.Files) != 0 || len(result.Skips) != 0 {
 		t.Fatalf("пустая директория должна давать пустой результат: %#v", result)
+	}
+}
+
+// readme.txt не обрабатывается ни на какой глубине, в любом регистре.
+func TestFindIgnoresReadmeAtAnyDepth(t *testing.T) {
+	root := t.TempDir()
+	deep := filepath.Join(root, "A", "b", "c")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{
+		filepath.Join(root, "readme.txt"),
+		filepath.Join(deep, "ReadMe.TXT"),
+		filepath.Join(deep, "list.txt"),
+	} {
+		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result, err := Find(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Files) != 1 || filepath.Base(result.Files[0].Path) != "list.txt" {
+		t.Fatalf("файлы: %#v", result.Files)
 	}
 }

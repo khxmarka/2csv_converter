@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"sql2csv/internal/converted"
 	"sql2csv/internal/csvout"
 	"sql2csv/internal/logx"
+	"sql2csv/internal/marks"
 	"sql2csv/internal/scan"
 	"sql2csv/internal/xlsconv"
 )
@@ -51,7 +51,7 @@ func TestRunMissingRoot(t *testing.T) {
 	if err == nil {
 		t.Fatal("ожидалась ошибка для отсутствующего корня")
 	}
-	if _, statErr := os.Stat(converted.Path(missing)); statErr == nil {
+	if _, statErr := os.Stat(marks.Path(missing, marks.ConvertDone)); statErr == nil {
 		t.Fatal("без корня converted.txt создавать нельзя")
 	}
 }
@@ -96,7 +96,7 @@ func TestConvertedReadAndAppendErrorsDoNotLoseCSV(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(converted.Path(root), 0o755); err != nil {
+	if err := os.Mkdir(marks.Path(root, marks.ConvertDone), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "dump.sql"), []byte(
@@ -137,7 +137,7 @@ func TestRunConvertedTxtTopFoldersOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(filepath.Join(root, "converted.txt"), []byte("OLD\n"), 0o644); err != nil {
+	if err := os.WriteFile(marks.Path(root, marks.ConvertDone), []byte("OLD\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -178,14 +178,14 @@ INSERT INTO t (email, phone) VALUES (2, 'b');
 		}
 	}
 
-	raw, err := os.ReadFile(converted.Path(root))
+	raw, err := os.ReadFile(marks.Path(root, marks.ConvertDone))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.HasPrefix(raw, []byte{0xEF, 0xBB, 0xBF}) {
 		t.Fatal("BOM в converted.txt запрещён")
 	}
-	done, err := converted.Read(root)
+	done, err := marks.Read(root, marks.ConvertDone)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestSecondRunSkipsCompletedTopFolder(t *testing.T) {
 	if second.CSV != 0 || second.InsertOK != 0 || len(second.SuccessTops) != 0 {
 		t.Fatalf("второй запуск: %+v", second)
 	}
-	raw, err := os.ReadFile(converted.Path(root))
+	raw, err := os.ReadFile(marks.Path(root, marks.ConvertDone))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,7 +327,7 @@ func TestCompletedFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
 	), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(converted.Path(root), []byte("alpha\n"), 0o644); err != nil {
+	if err := os.WriteFile(marks.Path(root, marks.ConvertDone), []byte("alpha\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -341,7 +341,7 @@ func TestCompletedFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "users.csv")); !os.IsNotExist(err) {
 		t.Fatalf("users.csv не должен создаваться, err=%v", err)
 	}
-	raw, err := os.ReadFile(converted.Path(root))
+	raw, err := os.ReadFile(marks.Path(root, marks.ConvertDone))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,7 +406,7 @@ func TestFolderWithNoCSVIsNotInConverted(t *testing.T) {
 	if len(res.SuccessTops) != 0 {
 		t.Fatalf("папка без CSV не завершена: %v", res.SuccessTops)
 	}
-	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+	if _, err := os.Stat(marks.Path(root, marks.ConvertDone)); !os.IsNotExist(err) {
 		t.Fatalf("converted.txt не должен создаваться, err=%v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "settings.csv")); !os.IsNotExist(err) {
@@ -443,14 +443,40 @@ func TestEmptyAndUnsupportedOnlyFoldersAreNotCompleted(t *testing.T) {
 	if len(first.SuccessTops) != 0 {
 		t.Fatalf("пустые папки не завершены: %v", first.SuccessTops)
 	}
-	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+	if _, err := os.Stat(marks.Path(root, marks.ConvertDone)); !os.IsNotExist(err) {
 		t.Fatalf("converted.txt не должен создаваться, err=%v", err)
 	}
 	log := buf.String()
 	if !strings.Contains(log, "папка Empty: нет файлов") || !strings.Contains(log, "папка Unsupported: нет файлов") {
 		t.Fatalf("нужна строка «нет файлов»:\n%s", log)
 	}
+	// Папки без работы идут в passed обоих этапов: повторно не открываются
+	// и консоль не засоряют.
+	for _, l := range []marks.List{marks.ConvertPassed, marks.SplitPassed} {
+		names, err := marks.Read(root, l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, e := names["Empty"]
+		_, u := names["Unsupported"]
+		if len(names) != 2 || !e || !u {
+			t.Fatalf("%s: %v", l, names)
+		}
+	}
+	var again bytes.Buffer
+	if _, err := Run(logx.New(&again), root); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(again.String(), "Empty") || strings.Contains(again.String(), "Unsupported") {
+		t.Fatalf("папки из списков не должны попадать в консоль:\n%s", again.String())
+	}
 
+	// Убрали папку из обоих списков — она обрабатывается заново.
+	for _, l := range []marks.List{marks.ConvertPassed, marks.SplitPassed} {
+		if err := os.WriteFile(marks.Path(root, l), []byte("Unsupported\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := os.WriteFile(filepath.Join(empty, "later.sql"), []byte(
 		"INSERT INTO users (email) VALUES ('later@example.test');\n",
 	), 0o644); err != nil {
@@ -461,7 +487,7 @@ func TestEmptyAndUnsupportedOnlyFoldersAreNotCompleted(t *testing.T) {
 		t.Fatal(err)
 	}
 	if second.CSV != 1 {
-		t.Fatalf("пустая папка без converted.txt должна обработаться: %+v", second)
+		t.Fatalf("папка, убранная из списков, должна обработаться: %+v", second)
 	}
 	if _, err := os.Stat(filepath.Join(empty, "users.csv")); err != nil {
 		t.Fatalf("users.csv должен появиться: %v", err)
@@ -494,7 +520,7 @@ func TestRootFileIsProcessedOnEveryRun(t *testing.T) {
 	if !strings.Contains(string(raw), "Second") || strings.Contains(string(raw), "First") {
 		t.Fatalf("корневой CSV не перезаписан: %q", raw)
 	}
-	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+	if _, err := os.Stat(marks.Path(root, marks.ConvertDone)); !os.IsNotExist(err) {
 		t.Fatalf("корневой файл не должен попадать в converted.txt, err=%v", err)
 	}
 }
@@ -529,7 +555,7 @@ func TestTopFolderNamedLikeRootStatusIsTrackedSeparately(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(top, "nested_users.csv")); err != nil {
 		t.Fatal(err)
 	}
-	done, err := converted.Read(root)
+	done, err := marks.Read(root, marks.ConvertDone)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -547,7 +573,7 @@ func TestRunRootOnlyDoesNotCreateConverted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+	if _, err := os.Stat(marks.Path(root, marks.ConvertDone)); !os.IsNotExist(err) {
 		t.Fatalf("для файлов прямо в корне converted.txt не создаётся, err=%v", err)
 	}
 	if len(res.SuccessTops) != 0 {
@@ -670,7 +696,7 @@ func TestBlockedScanPreventsFolderCompletion(t *testing.T) {
 	acc.start(file)
 	acc.add(file, fileOutcome{created: 1, csv: 1})
 
-	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+	if _, err := os.Stat(marks.Path(root, marks.ConvertDone)); !os.IsNotExist(err) {
 		t.Fatalf("заблокированную папку нельзя записывать в converted.txt, err=%v", err)
 	}
 	if strings.Contains(buf.String(), "папка обработана: Alpha") {
@@ -1121,11 +1147,11 @@ func TestRunExcelTreeConvertedTxt(t *testing.T) {
 		}
 	}
 
-	raw, err := os.ReadFile(converted.Path(root))
+	raw, err := os.ReadFile(marks.Path(root, marks.ConvertDone))
 	if err != nil {
 		t.Fatal(err)
 	}
-	done, err := converted.Read(root)
+	done, err := marks.Read(root, marks.ConvertDone)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1464,13 +1490,9 @@ func TestForeignCSVSplitLeavesSmallFileAndMarksFolder(t *testing.T) {
 	if strings.Join(res.SuccessTops, ",") != "Alpha" {
 		t.Fatalf("вершины: %+v\n%s", res.SuccessTops, buf.String())
 	}
-	raw, err := os.ReadFile(converted.Path(root))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(raw) != "Alpha\n" {
-		t.Fatalf("converted.txt: %q", raw)
-	}
+	// Конвертировать было нечего, зато нарезано: состояния раздельные.
+	assertFile(t, marks.Path(root, marks.SplitDone), "Alpha\n")
+	assertFile(t, marks.Path(root, marks.ConvertPassed), "Alpha\n")
 	for _, name := range []string{"big.csv", "big_2.csv", "big_3.csv"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Fatalf("нет %s: %v", name, err)
@@ -1508,7 +1530,7 @@ func TestFolderWithOnlySmallCSVHasNoFiles(t *testing.T) {
 	if len(res.SuccessTops) != 0 {
 		t.Fatalf("папка попала в список: %v", res.SuccessTops)
 	}
-	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+	if _, err := os.Stat(marks.Path(root, marks.ConvertDone)); !os.IsNotExist(err) {
 		t.Fatalf("converted.txt: %v", err)
 	}
 	got, err := os.ReadFile(path)
@@ -1613,8 +1635,11 @@ func TestCompletedTopIsNotSplit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(alpha, "big.csv"), body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(converted.Path(root), []byte("Alpha\n"), 0o644); err != nil {
-		t.Fatal(err)
+	// Папка закрыта в обоих этапах — целиком не открывается.
+	for _, l := range []marks.List{marks.ConvertDone, marks.SplitPassed} {
+		if err := os.WriteFile(marks.Path(root, l), []byte("Alpha\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := os.WriteFile(filepath.Join(beta, "dump.sql"), []byte(
 		"INSERT INTO users (email) VALUES ('a@example.test');\n",
@@ -1881,7 +1906,7 @@ func TestRootSQLDeletedAndNotListed(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "users.csv")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(converted.Path(root)); !os.IsNotExist(err) {
+	if _, err := os.Stat(marks.Path(root, marks.ConvertDone)); !os.IsNotExist(err) {
 		t.Fatalf("корень не пишется в converted.txt: %v", err)
 	}
 	if len(res.SuccessTops) != 0 {
@@ -1975,10 +2000,113 @@ func TestForeignTxtIsSplitByLines(t *testing.T) {
 	assertFile(t, filepath.Join(dir, "list_2.txt"), "c:3\n")
 	assertFile(t, filepath.Join(dir, "small.txt"), "x\ny\n")
 	if strings.Join(res.SuccessTops, ",") != "Combo" {
-		t.Fatalf("папка с нарезкой должна быть в converted.txt: %v", res.SuccessTops)
+		t.Fatalf("папка с нарезкой должна быть в _splitter_done_: %v", res.SuccessTops)
 	}
-	if _, err := os.Stat(filepath.Join(root, "converted.txt")); err != nil {
+	assertFile(t, marks.Path(root, marks.SplitDone), "Combo\n")
+	assertFile(t, marks.Path(root, marks.ConvertPassed), "Combo\n")
+}
+
+// Состояния конверта и нарезки независимы: папка в _convert_done_ не
+// конвертируется, но режется; папка в _splitter_passed_ конвертируется, но
+// лежавшие CSV не режутся. Итоги таких папок — только в _log.txt.
+func TestConvertAndSplitStatesAreIndependent(t *testing.T) {
+	restore := csvout.SetSplitLimits(2, 2)
+	defer restore()
+
+	root := t.TempDir()
+	onlySplit := filepath.Join(root, "OnlySplit")
+	onlyConvert := filepath.Join(root, "OnlyConvert")
+	for _, d := range []string{onlySplit, onlyConvert} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "dump.sql"), []byte(
+			"INSERT INTO users (email) VALUES ('a@example.test');\n",
+		), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(d, "big.txt"), []byte("1\n2\n3\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(marks.Path(root, marks.ConvertDone), []byte("OnlySplit\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	assertFile(t, filepath.Join(root, "converted.txt"), "Combo\n")
+	if err := os.WriteFile(marks.Path(root, marks.SplitPassed), []byte("OnlyConvert\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var console bytes.Buffer
+	if _, err := Run(logx.New(&console), root); err != nil {
+		t.Fatal(err)
+	}
+	// OnlySplit: .sql не тронут, big.txt нарезан.
+	if _, err := os.Stat(filepath.Join(onlySplit, "users.csv")); !os.IsNotExist(err) {
+		t.Fatalf("папка из _convert_done_ сконвертирована повторно: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(onlySplit, "big_2.txt")); err != nil {
+		t.Fatalf("нарезка не прошла: %v", err)
+	}
+	// OnlyConvert: .sql сконвертирован, big.txt не нарезан.
+	if _, err := os.Stat(filepath.Join(onlyConvert, "users.csv")); err != nil {
+		t.Fatalf("конверт не прошёл: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(onlyConvert, "big_2.txt")); !os.IsNotExist(err) {
+		t.Fatalf("папка из _splitter_passed_ нарезана: %v", err)
+	}
+	assertFile(t, marks.Path(root, marks.ConvertDone), "OnlySplit\nOnlyConvert\n")
+	assertFile(t, marks.Path(root, marks.SplitDone), "OnlySplit\n")
+	assertFile(t, marks.Path(root, marks.SplitPassed), "OnlyConvert\n")
+	if strings.Contains(console.String(), "OnlySplit") || strings.Contains(console.String(), "OnlyConvert") {
+		t.Fatalf("папки из списков в консоли:\n%s", console.String())
+	}
+	logFile, err := os.ReadFile(filepath.Join(root, marks.LogName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"=== ", "папка обработана: OnlySplit", "папка обработана: OnlyConvert"} {
+		if !strings.Contains(string(logFile), want) {
+			t.Fatalf("в _log.txt нет %q:\n%s", want, logFile)
+		}
+	}
+}
+
+// _log.txt копит запуски: каждый с заголовком, ошибки и итоги как в консоли.
+// Служебные файлы и readme.txt не обрабатываются.
+func TestLogFileAccumulatesRuns(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.sql"), []byte(
+		"INSERT INTO users (email) VALUES ('a@example.test');\nINSERT INTO users (email) VALUES ('x' 'y');\n",
+	), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("1\n2\n3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := Run(logx.New(io.Discard), root); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile(filepath.Join(root, marks.LogName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	log := string(raw)
+	if strings.Count(log, "=== ") != 2 {
+		t.Fatalf("ожидалось два заголовка запуска:\n%s", log)
+	}
+	if strings.Count(log, "error: ") != 1 || !strings.Contains(log, "между значениями нет запятой") {
+		t.Fatalf("ошибка первого запуска должна быть в логе:\n%s", log)
+	}
+	if strings.Contains(log, "папка в обработке") {
+		t.Fatalf("строка прогресса не пишется в файл:\n%s", log)
+	}
+	if strings.Contains(log, "readme") {
+		t.Fatalf("readme.txt не обрабатывается:\n%s", log)
+	}
 }
