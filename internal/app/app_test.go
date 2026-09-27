@@ -1257,6 +1257,25 @@ func TestDeleteSourceOnlyAfterCSV(t *testing.T) {
 	}
 }
 
+func TestRemoveSourceLogsFailureAndLeavesPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.sql")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "keep"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	removeSource(logx.New(&buf), path)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("path should remain after failed removal: %v", err)
+	}
+	if !strings.Contains(buf.String(), "не удалось удалить") {
+		t.Fatalf("removal failure was not logged: %q", buf.String())
+	}
+}
+
 func TestSQLExcelSQLSameTargetNeverMixesStreams(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "Alpha")
