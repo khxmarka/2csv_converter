@@ -7,3 +7,6 @@
 .idea/workspace.xml
 .claude/settings.local.json
 .serena/
+.claude/
+CLAUDE.md
+/graft/
