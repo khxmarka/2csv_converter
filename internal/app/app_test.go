@@ -313,7 +313,7 @@ func TestSecondRunSkipsExcelInCompletedTopFolder(t *testing.T) {
 	}
 }
 
-func TestCompletedFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
+func TestCompletedConvertFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows filesystem semantics")
 	}
@@ -322,7 +322,8 @@ func TestCompletedFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "dump.sql"), []byte(
+	source := filepath.Join(dir, "dump.sql")
+	if err := os.WriteFile(source, []byte(
 		"INSERT INTO users (email) VALUES ('must-not-run@example.test');\n",
 	), 0o644); err != nil {
 		t.Fatal(err)
@@ -335,11 +336,17 @@ func TestCompletedFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.CSV != 0 || len(res.Scan.Files) != 0 {
-		t.Fatalf("готовая папка обработана повторно: %+v", res)
+	if res.CSV != 0 {
+		t.Fatalf("готовая стадия конвертации выполнена повторно: %+v", res)
+	}
+	if len(res.Scan.Files) != 1 || res.Scan.Files[0].Path != source {
+		t.Fatalf("папка должна сканироваться для независимой стадии нарезки: %+v", res.Scan)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "users.csv")); !os.IsNotExist(err) {
 		t.Fatalf("users.csv не должен создаваться, err=%v", err)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("исходник завершённой стадии конвертации должен остаться: %v", err)
 	}
 	raw, err := os.ReadFile(marks.Path(root, marks.ConvertDone))
 	if err != nil {
