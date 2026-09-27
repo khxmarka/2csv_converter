@@ -322,7 +322,8 @@ func TestCompletedFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "dump.sql"), []byte(
+	sqlPath := filepath.Join(dir, "dump.sql")
+	if err := os.WriteFile(sqlPath, []byte(
 		"INSERT INTO users (email) VALUES ('must-not-run@example.test');\n",
 	), 0o644); err != nil {
 		t.Fatal(err)
@@ -335,8 +336,11 @@ func TestCompletedFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.CSV != 0 || len(res.Scan.Files) != 0 {
+	if res.InsertOK != 0 || res.CSV != 0 {
 		t.Fatalf("готовая папка обработана повторно: %+v", res)
+	}
+	if _, err := os.Stat(sqlPath); err != nil {
+		t.Fatalf("исходный SQL готовой папки должен сохраниться: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "users.csv")); !os.IsNotExist(err) {
 		t.Fatalf("users.csv не должен создаваться, err=%v", err)
