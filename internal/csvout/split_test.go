@@ -2,9 +2,11 @@ package csvout
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -536,4 +538,40 @@ func TestSplitTextRejectsConvertedAndCSVModeOnTxt(t *testing.T) {
 	if _, err := splitFile(txt, SplitWithHeader, 1, 1, nil); err == nil {
 		t.Fatal(".txt режется только построчно")
 	}
+}
+
+func FuzzRecordReaderPreservesBytes(f *testing.F) {
+	for _, seed := range []struct {
+		data  []byte
+		plain bool
+	}{
+		{data: nil},
+		{data: []byte("a\nb\r\nc\r")},
+		{data: []byte("\"a\n\"\"b\"\",c\r\n")},
+		{data: []byte("open,\"quote\nwithout end")},
+		{data: []byte{0x00, 0xFF, '\r', '\n'}, plain: true},
+	} {
+		f.Add(seed.data, seed.plain)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte, plain bool) {
+		r := recordReader{
+			br:    bufio.NewReaderSize(bytes.NewReader(data), 256*1024),
+			plain: plain,
+		}
+		var got []byte
+		for {
+			rec, err := r.next()
+			got = append(got, rec...)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("recordReader.next: %v", err)
+			}
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("recordReader changed bytes:\n got %q\nwant %q", got, data)
+		}
+	})
 }
