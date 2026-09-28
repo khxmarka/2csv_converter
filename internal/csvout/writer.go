@@ -18,6 +18,12 @@ const (
 
 var tempMu sync.Mutex
 
+var (
+	syncOutputFile    = (*os.File).Sync
+	closeOutputFile   = (*os.File).Close
+	publishOutputFile = replaceFile
+)
+
 func CleanupTemps(dir string) error {
 	tempMu.Lock()
 	defer tempMu.Unlock()
@@ -271,12 +277,12 @@ func (w *Writer) Commit() (Result, error) {
 		return empty, err
 	}
 	tmpName := w.tmp.Name()
-	if err := w.tmp.Sync(); err != nil {
+	if err := syncOutputFile(w.tmp); err != nil {
 		w.closed = true
 		w.removeTmp()
 		return empty, err
 	}
-	if err := w.tmp.Close(); err != nil {
+	if err := closeOutputFile(w.tmp); err != nil {
 		w.closed = true
 		w.tmp = nil
 		_ = removeTemp(tmpName)
@@ -315,7 +321,7 @@ func (w *Writer) place(tmpName string) (string, error) {
 	if w.reg.isWritten(path) {
 		return "", fmt.Errorf("%w: %s", ErrNameTaken, filepath.Base(path))
 	}
-	if err := replaceFile(tmpName, path); err != nil {
+	if err := publishOutputFile(tmpName, path); err != nil {
 		return "", err
 	}
 	w.reg.addOutput(w.dir, path, w.wroteHeader)
@@ -352,9 +358,9 @@ func appendTo(dst string, write func(io.Writer) error) error {
 		writeErr = bw.Flush()
 	}
 	if writeErr == nil {
-		writeErr = out.Sync()
+		writeErr = syncOutputFile(out)
 	}
-	closeErr := out.Close()
+	closeErr := closeOutputFile(out)
 	if writeErr != nil || closeErr != nil {
 		rollbackErr := os.Truncate(dst, originalSize)
 		return errors.Join(writeErr, closeErr, rollbackErr)

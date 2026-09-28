@@ -308,7 +308,7 @@ func (a *accumulator) recordListsLocked(topFolder string, convert, split, conver
 		return true
 	}
 	add := func(l marks.List) bool {
-		if err := marks.Append(a.root, l, topFolder); err != nil {
+		if err := appendState(a.root, l, topFolder); err != nil {
 			a.log.Errorf("не удалось дописать %s: %v", marks.Path(a.root, l), err)
 			a.filesFail++
 			return false
@@ -637,9 +637,10 @@ func producedCSV(out fileOutcome) bool {
 	return out.created > 0 || out.csv > 0
 }
 
-func removeSource(path string) error {
-	return os.Remove(path)
-}
+var (
+	appendState  = marks.Append
+	removeSource = os.Remove
+)
 
 func fileRank(f scan.SQLFile) int {
 	switch {

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -207,6 +208,64 @@ func TestSplitFailureKeepsMonolithAndPreexistingParts(t *testing.T) {
 		t.Fatalf("лежавшая до прогона users_3.csv уничтожена: %v", err)
 	}
 	assertNoTemps(t, dir)
+}
+
+func TestSplitFailureBeforePublishKeepsMonolith(t *testing.T) {
+	injected := errors.New("injected output failure")
+	for _, tt := range outputFailureCases(injected) {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "users.csv")
+			const body = "\"a\"\n\"b\"\n\"c\"\n"
+			writeRaw(t, path, body)
+			tt.install(t)
+
+			if _, err := splitFile(path, SplitNoHeader, 2, 2, nil); !errors.Is(err, injected) {
+				t.Fatalf("split error = %v, want %v", err, injected)
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != body {
+				t.Fatalf("monolith changed after failed %s: %q, err=%v", tt.name, got, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "users_2.csv")); !os.IsNotExist(err) {
+				t.Fatalf("part remains after failed %s: %v", tt.name, err)
+			}
+			assertNoTemps(t, dir)
+		})
+	}
+}
+
+func TestSplitPublishFailureRollsBackNewParts(t *testing.T) {
+	injected := errors.New("injected publish failure")
+	for failAt := 1; failAt <= 4; failAt++ {
+		t.Run(fmt.Sprintf("publish_%d", failAt), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "users.csv")
+			const body = "\"a\"\n\"b\"\n\"c\"\n\"d\"\n\"e\"\n\"f\"\n\"g\"\n"
+			writeRaw(t, path, body)
+			calls := 0
+			setOutputOps(t, nil, nil, func(src, dst string) error {
+				calls++
+				if calls == failAt {
+					return injected
+				}
+				return replaceFile(src, dst)
+			})
+
+			if _, err := splitFile(path, SplitNoHeader, 2, 2, nil); !errors.Is(err, injected) {
+				t.Fatalf("split error = %v, want %v", err, injected)
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != body {
+				t.Fatalf("monolith changed: %q, err=%v", got, err)
+			}
+			for part := 2; part <= 4; part++ {
+				partPath := filepath.Join(dir, fmt.Sprintf("users_%d.csv", part))
+				if _, err := os.Stat(partPath); !os.IsNotExist(err) {
+					t.Fatalf("published part was not rolled back: %s, err=%v", partPath, err)
+				}
+			}
+			assertNoTemps(t, dir)
+		})
+	}
 }
 
 // Незакрытая кавычка в чужом CSV превращала остаток файла в одну запись
