@@ -291,32 +291,38 @@ func csvRecordEmpty(raw []byte) bool {
 
 func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(string) bool) ([]string, int64, error) {
 	dir := filepath.Dir(path)
+	occupied, err := existingPart(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	if occupied != "" {
+		return nil, 0, fmt.Errorf("%w: %s", ErrNameTaken, filepath.Base(occupied))
+	}
 	var (
-		names []string
-		temps []string
-		// created — части, которых до прогона не было. Только их можно убрать
-		// при провале: лежавший раньше {stem}_N.csv §14 не уничтожает.
-		created  []string
-		open     *os.File
-		buf      *bufio.Writer
-		header   []byte
-		rows     int
-		dataRows int64
-		success  bool
+		names     []string
+		temps     []string
+		published []string
+		open      *os.File
+		buf       *bufio.Writer
+		header    []byte
+		rows      int
+		dataRows  int64
+		success   bool
 	)
 	defer func() {
+		defer func() { _ = pruneTempDir(dir) }()
 		if open != nil {
 			name := open.Name()
 			_ = open.Close()
-			_ = os.Remove(name)
+			_ = removeTemp(name)
 		}
 		for _, t := range temps {
 			if t != "" {
-				_ = os.Remove(t)
+				_ = removeTemp(t)
 			}
 		}
 		if !success {
-			for _, p := range created {
+			for _, p := range published {
 				_ = os.Remove(p)
 			}
 		}
@@ -327,9 +333,12 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 			if err := buf.Flush(); err != nil {
 				return err
 			}
+			if err := open.Sync(); err != nil {
+				return err
+			}
 			name := open.Name()
 			if err := open.Close(); err != nil {
-				_ = os.Remove(name)
+				_ = removeTemp(name)
 				open = nil
 				buf = nil
 				return err
@@ -346,7 +355,7 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 			}
 		}
 		names = append(names, next)
-		f, err := os.CreateTemp(dir, tmpPattern)
+		f, err := createTemp(dir)
 		if err != nil {
 			return err
 		}
@@ -361,7 +370,7 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 		return nil
 	}
 
-	err := walkRecords(path, mode, func(rec []byte, isHeader bool) error {
+	err = walkRecords(path, mode, func(rec []byte, isHeader bool) error {
 		if isHeader {
 			header = append([]byte(nil), rec...)
 			return nil
@@ -387,9 +396,12 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 	if err := buf.Flush(); err != nil {
 		return nil, 0, err
 	}
+	if err := open.Sync(); err != nil {
+		return nil, 0, err
+	}
 	last := open.Name()
 	if err := open.Close(); err != nil {
-		_ = os.Remove(last)
+		_ = removeTemp(last)
 		open = nil
 		buf = nil
 		return nil, 0, err
@@ -402,17 +414,11 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 	}
 
 	for i := 1; i < len(names); i++ {
-		existed, err := fileExists(names[i])
-		if err != nil {
-			return nil, 0, err
-		}
 		if err := replaceFile(temps[i], names[i]); err != nil {
 			return nil, 0, err
 		}
 		temps[i] = ""
-		if !existed {
-			created = append(created, names[i])
-		}
+		published = append(published, names[i])
 	}
 	if err := replaceFile(temps[0], names[0]); err != nil {
 		return nil, 0, err
@@ -422,22 +428,39 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 	return names, dataRows, nil
 }
 
-// partName — имя n-й части (n ≥ 2) по §14: {stem}_n.csv от собственного stem
-// файла. Лежащий на диске файл с этим именем заменяется частью.
+func existingPart(path string) (string, error) {
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	prefix := stem + "_"
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.EqualFold(filepath.Ext(name), ext) {
+			continue
+		}
+		nameStem := strings.TrimSuffix(name, filepath.Ext(name))
+		if len(nameStem) <= len(prefix) || !strings.EqualFold(nameStem[:len(prefix)], prefix) {
+			continue
+		}
+		n, err := strconv.Atoi(nameStem[len(prefix):])
+		if err == nil && n >= 2 {
+			return filepath.Join(filepath.Dir(path), name), nil
+		}
+	}
+	return "", nil
+}
+
+// partName returns the n-th part (n >= 2) using the input file's own stem.
 func partName(path string, n int) string {
 	base := filepath.Base(path)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 	ext := filepath.Ext(base)
 	return filepath.Join(filepath.Dir(path), limitCSVBaseSuffix(stem, "_"+strconv.Itoa(n))+ext)
-}
-
-func fileExists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	if err == nil {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return false, err
 }

@@ -8,8 +8,16 @@ import (
 	"strings"
 )
 
-// MaxSheets — больше этого числа листов книгу целиком пропускаем (§13).
-const MaxSheets = 5
+const (
+	// MaxSheets skips workbooks with more sheets than this limit.
+	MaxSheets = 5
+	// MaxXLSBytes bounds memory use of the non-streaming BIFF reader.
+	MaxXLSBytes int64 = 256 << 20
+	// MaxXLSXUnpackedBytes limits decompressed workbook data.
+	MaxXLSXUnpackedBytes int64 = 4 << 30
+	// MaxXLSXXMLMemoryBytes spills larger worksheet XML to temporary files.
+	MaxXLSXXMLMemoryBytes int64 = 16 << 20
+)
 
 var errNeedRegistry = errors.New("xlsconv: нужен Registry")
 
