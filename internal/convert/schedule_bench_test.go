@@ -14,7 +14,7 @@ import (
 	"sql2csv/internal/scan"
 )
 
-// benchPool — пул воркеров как в app: submit кладёт задание в канал.
+// benchPool matches the worker pool used by app.
 func benchPool() (submit func(func()), stop func()) {
 	jobs := make(chan func())
 	var wg sync.WaitGroup
@@ -26,6 +26,29 @@ func benchPool() (submit func(func()), stop func()) {
 		})
 	}
 	return func(fn func()) { jobs <- fn }, func() { close(jobs); wg.Wait() }
+}
+
+func benchTabularSQL(rows, columns int) string {
+	var b strings.Builder
+	b.WriteString("email,phone")
+	for col := 2; col < columns; col++ {
+		b.WriteString(",field_")
+		b.WriteString(strconv.Itoa(col))
+	}
+	b.WriteByte('\n')
+	for row := range rows {
+		n := strconv.Itoa(row)
+		b.WriteString("user")
+		b.WriteString(n)
+		b.WriteString("@example.test,555")
+		b.WriteString(n)
+		for col := 2; col < columns; col++ {
+			b.WriteString(",value_")
+			b.WriteString(n)
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 func benchSQL(inserts, rowsPerInsert int) string {
@@ -42,6 +65,41 @@ func benchSQL(inserts, rowsPerInsert int) string {
 		b.WriteString(";\n")
 	}
 	return b.String()
+}
+
+func BenchmarkScheduleTabular(b *testing.B) {
+	cases := []struct {
+		name          string
+		rows, columns int
+	}{
+		{"long=100000x4", 100_000, 4},
+		{"wide=20000x64", 20_000, 64},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			dir := b.TempDir()
+			path := filepath.Join(dir, "users.sql")
+			table := benchTabularSQL(c.rows, c.columns)
+			if err := os.WriteFile(path, []byte(table), 0o644); err != nil {
+				b.Fatal(err)
+			}
+			output := filepath.Join(dir, "users.csv")
+			log := logx.New(&discardLog{})
+			b.SetBytes(int64(len(table)))
+			b.ReportAllocs()
+			for b.Loop() {
+				res := Schedule(log, csvout.NewRegistry(), scan.SQLFile{Path: path}, nil)
+				if res.CSV != 1 || res.Failed {
+					b.Fatalf("%+v", res)
+				}
+				b.StopTimer()
+				if err := os.Remove(output); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+			}
+		})
+	}
 }
 
 func BenchmarkSchedule(b *testing.B) {
