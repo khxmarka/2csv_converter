@@ -3,6 +3,7 @@ package csvout
 import (
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -34,7 +35,7 @@ type slot struct {
 }
 
 func (s *slot) appendTo(write func(io.Writer) error) error {
-	return appendTo(s.path, write)
+	return appendFile(s.path, write, false)
 }
 
 type output struct {
@@ -139,6 +140,27 @@ func (r *Registry) OutputsIn(dir string) []Output {
 		out[i] = Output{Path: o.path, HasHeader: o.hasHeader}
 	}
 	return out
+}
+
+// SyncFiles makes deferred INSERT appends durable before their source is completed.
+func SyncFiles(paths []string) error {
+	seen := make(map[string]struct{})
+	for _, path := range paths {
+		key := canonicalPath(path)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		if err := errors.Join(syncOutputFile(f), closeOutputFile(f)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Registry) lockDir(dir string) *sync.Mutex {

@@ -692,7 +692,7 @@ func TestSlotAppendRollsBackAndContinues(t *testing.T) {
 	}
 }
 
-func TestAppendSyncAndCloseFailureRollBack(t *testing.T) {
+func TestDurableAppendSyncAndCloseFailureRollBack(t *testing.T) {
 	injected := errors.New("injected append failure")
 	for _, tt := range outputFailureCases(injected) {
 		t.Run(tt.name, func(t *testing.T) {
@@ -704,7 +704,7 @@ func TestAppendSyncAndCloseFailureRollBack(t *testing.T) {
 			defer s.mu.Unlock()
 			tt.install(t)
 
-			err := s.appendTo(func(w io.Writer) error {
+			err := appendTo(s.path, func(w io.Writer) error {
 				_, err := io.WriteString(w, "\"2\"\n")
 				return err
 			})
@@ -715,6 +715,47 @@ func TestAppendSyncAndCloseFailureRollBack(t *testing.T) {
 				t.Fatalf("CSV changed after failed %s: %q", tt.name, got)
 			}
 		})
+	}
+}
+
+func TestSlotAppendDefersSync(t *testing.T) {
+	dir := t.TempDir()
+	reg := NewRegistry()
+	commitInsert(t, reg, dir, "t", []string{"id"}, []string{"1"})
+	s := reg.acquire(dir, "t")
+	defer s.mu.Unlock()
+
+	syncs := 0
+	setOutputOps(t, func(*os.File) error {
+		syncs++
+		return nil
+	}, nil, nil)
+	if err := s.appendTo(func(w io.Writer) error {
+		_, err := io.WriteString(w, "\"2\"\n")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 0 {
+		t.Fatalf("syncs = %d, want 0", syncs)
+	}
+}
+
+func TestSyncFilesDeduplicatesPaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "out.csv")
+	if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	syncs := 0
+	setOutputOps(t, func(f *os.File) error {
+		syncs++
+		return f.Sync()
+	}, nil, nil)
+	if err := SyncFiles([]string{path, path}); err != nil {
+		t.Fatal(err)
+	}
+	if syncs != 1 {
+		t.Fatalf("syncs = %d, want 1", syncs)
 	}
 }
 
