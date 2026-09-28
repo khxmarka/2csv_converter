@@ -34,6 +34,9 @@ func File(reg *csvout.Registry, path string) Result {
 }
 
 func fileXLS(reg *csvout.Registry, path string) Result {
+	xlsMemoryMu.Lock()
+	defer xlsMemoryMu.Unlock()
+
 	book, tooMany, err := openXLS(path)
 	if err != nil {
 		return Result{OpenErr: err}
