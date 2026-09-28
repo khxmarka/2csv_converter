@@ -16,6 +16,24 @@ func TestReadUnsupportedExt(t *testing.T) {
 	}
 }
 
+func TestReadRejectsOversizedXLS(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.xls")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(MaxXLSBytes + 1); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Read(path); err == nil {
+		t.Fatal("ожидалась ошибка размера .xls")
+	}
+}
+
 func TestReadOneSheetXLS(t *testing.T) {
 	path := writeXLS(t, []specSheet{{
 		Name: "Only",

@@ -91,6 +91,11 @@ type topAcc struct {
 	splitFail   bool
 	// splitDone — нарезан хотя бы один файл (свежий CSV или лежавший .csv/.txt).
 	splitDone bool
+	sources   []string
+}
+
+func (st *topAcc) convertFailed() bool {
+	return st.openErr > 0 || st.writeErr > 0 || st.failed > 0 || st.unitFail > 0
 }
 
 func newAccumulator(log *logx.Logger, root string, files []scan.SQLFile, blocked map[string]struct{}) *accumulator {
@@ -186,9 +191,16 @@ func (a *accumulator) markSplit(file scan.SQLFile, failed, split bool) {
 	}
 	if failed {
 		st.splitFail = true
-		st.unitFail++
 		a.filesFail++
 	}
+}
+
+func (a *accumulator) markGroupFailure(file scan.SQLFile) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	st := a.ensureTop(folderKey(file))
+	st.unitFail++
+	a.filesFail++
 }
 
 func (a *accumulator) recordLocked(file scan.SQLFile, out fileOutcome) {
@@ -233,6 +245,9 @@ func (a *accumulator) recordLocked(file scan.SQLFile, out fileOutcome) {
 	st.created += out.created
 	st.piiSkip += out.piiSkip
 	st.unitFail += out.unitFail
+	if producedCSV(out) {
+		st.sources = append(st.sources, file.Path)
+	}
 }
 
 func (a *accumulator) finishFileLocked(file scan.SQLFile) {
@@ -252,7 +267,16 @@ func (a *accumulator) finishTopLocked(key, name, topFolder string) {
 		return
 	}
 	convert, split := a.phases(topFolder)
-	a.recordListsLocked(topFolder, convert, split, st.csv > 0, st.splitDone)
+	stagesOK := !st.convertFailed() && !st.splitFail
+	stateOK := stagesOK && a.recordListsLocked(topFolder, convert, split, st.csv > 0, st.splitDone)
+	if stateOK {
+		for _, path := range st.sources {
+			if err := removeSource(path); err != nil {
+				a.filesFail++
+				a.log.Errorf("%s: не удалось удалить: %v", path, err)
+			}
+		}
+	}
 	say, sayErr := a.log.Linef, a.log.Errorf
 	if !convert || !split {
 		// Папка уже в одном из списков: итог только в _log.txt.
@@ -260,6 +284,10 @@ func (a *accumulator) finishTopLocked(key, name, topFolder string) {
 	}
 	if st.splitFail {
 		sayErr("папка %s: не нарезать", name)
+		return
+	}
+	if st.convertFailed() {
+		sayErr("папка %s: обработана с ошибками", name)
 		return
 	}
 	if st.csv > 0 || st.splitDone {
@@ -273,36 +301,42 @@ func (a *accumulator) finishTopLocked(key, name, topFolder string) {
 	sayErr("папка %s: не создано ни одного CSV: %s", name, st.failReason())
 }
 
-// recordListsLocked дописывает верхнюю папку в списки этапов, которые шли в
-// этом запуске: done — есть результат, passed — прошла без результата
-// (нечего делать или не вышло; повторно не открывается).
-func (a *accumulator) recordListsLocked(topFolder string, convert, split, converted, splitDone bool) {
+// recordListsLocked persists only stages that completed without errors.
+// A done list has output; a passed list means that the stage had no work.
+func (a *accumulator) recordListsLocked(topFolder string, convert, split, converted, splitDone bool) bool {
 	if topFolder == "" {
-		return
+		return true
 	}
-	add := func(l marks.List) {
+	add := func(l marks.List) bool {
 		if err := marks.Append(a.root, l, topFolder); err != nil {
 			a.log.Errorf("не удалось дописать %s: %v", marks.Path(a.root, l), err)
-			return
+			a.filesFail++
+			return false
 		}
 		if l == marks.ConvertDone || l == marks.SplitDone {
 			a.tops[topFolder] = struct{}{}
 		}
-	}
-	if convert {
-		if converted {
-			add(marks.ConvertDone)
-		} else {
-			add(marks.ConvertPassed)
-		}
+		return true
 	}
 	if split {
+		list := marks.SplitPassed
 		if splitDone {
-			add(marks.SplitDone)
-		} else {
-			add(marks.SplitPassed)
+			list = marks.SplitDone
+		}
+		if !add(list) {
+			return false
 		}
 	}
+	if convert {
+		list := marks.ConvertPassed
+		if converted {
+			list = marks.ConvertDone
+		}
+		if !add(list) {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *accumulator) refreshHang() {
@@ -535,8 +569,13 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 	}
 	dir := filepath.Dir(group[0].Path)
 	defer func() {
+		if err := csvout.CleanupTemps(dir); err != nil {
+			log.Errorf("%s: не удалось удалить временные CSV: %v", dir, err)
+			acc.markGroupFailure(group[0])
+		}
 		if rec := recover(); rec != nil {
 			log.Errorf("%s: сбой обработки (%v), папка пропущена", dir, rec)
+			acc.markGroupFailure(group[0])
 		}
 		acc.finishFiles(group)
 	}()
@@ -564,22 +603,15 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 	if !doSplit {
 		csvs = nil
 	}
-	var produced []scan.SQLFile
 	for _, file := range sqls {
 		acc.start(file)
 		out := outcomeFromConvert(convert.Schedule(log, reg, file, submit))
 		acc.record(file, out)
-		if producedCSV(out) {
-			produced = append(produced, file)
-		}
 	}
 	for _, file := range excels {
 		acc.start(file)
 		out := convertExcel(log, reg, file)
 		acc.record(file, out)
-		if producedCSV(out) {
-			produced = append(produced, file)
-		}
 	}
 	// CSV этого запуска режутся всегда: это часть их создания (§5).
 	failed, splitAny := splitWritten(log, reg, dir)
@@ -593,9 +625,6 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 		}
 		acc.record(file, splitForeignCSV(log, reg, file))
 	}
-	for _, file := range produced {
-		removeSource(log, file.Path)
-	}
 }
 
 // producedCSV — исходник можно удалить (§15): CSV получен и ни одна единица
@@ -608,10 +637,8 @@ func producedCSV(out fileOutcome) bool {
 	return out.created > 0 || out.csv > 0
 }
 
-func removeSource(log *logx.Logger, path string) {
-	if err := os.Remove(path); err != nil {
-		log.Errorf("%s: не удалось удалить: %v", path, err)
-	}
+func removeSource(path string) error {
+	return os.Remove(path)
 }
 
 func fileRank(f scan.SQLFile) int {

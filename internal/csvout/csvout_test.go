@@ -198,19 +198,43 @@ func TestReplaceFailureKeepsExistingDestination(t *testing.T) {
 
 func TestCleanupTempsRemovesOnlyConverterTemps(t *testing.T) {
 	dir := t.TempDir()
-	stale := filepath.Join(dir, ".2csv-stale.tmp")
+	foreign := filepath.Join(dir, ".2csv-stale.tmp")
 	keep := filepath.Join(dir, "keep.tmp")
-	if err := os.WriteFile(stale, []byte("partial"), 0o644); err != nil {
+	if err := os.WriteFile(foreign, []byte("foreign"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	stale, err := createTemp(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalePath := stale.Name()
+	if _, err := stale.WriteString("partial"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stale.Close(); err != nil {
+		t.Fatal(err)
+	}
+	insideForeign := filepath.Join(dir, tmpDirName, "keep.bin")
+	if err := os.WriteFile(insideForeign, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := CleanupTemps(dir); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+	if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
 		t.Fatalf("stale temp не удалён, err=%v", err)
+	}
+	if got := readCSV(t, foreign); got != "foreign" {
+		t.Fatalf("посторонний файл изменён: %q", got)
+	}
+	if got := readCSV(t, insideForeign); got != "keep" {
+		t.Fatalf("посторонний файл в служебном каталоге изменён: %q", got)
+	}
+	if got := readCSV(t, filepath.Join(dir, tmpDirName, ".owner")); got != tmpOwner {
+		t.Fatalf("маркер владельца потерян: %q", got)
 	}
 	if got := readCSV(t, keep); got != "keep" {
 		t.Fatalf("посторонний temp изменён: %q", got)
@@ -517,7 +541,7 @@ func TestCreatePlainDoesNotOverwriteCSVOfThisRun(t *testing.T) {
 	if got := readCSV(t, sql.Path); got != "\"id\"\n\"1\"\n" {
 		t.Fatalf("CSV SQL затёрт: %q", got)
 	}
-	matches, err := filepath.Glob(filepath.Join(dir, tmpPattern))
+	matches, err := filepath.Glob(filepath.Join(dir, tmpDirName, tmpPattern))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -558,8 +582,7 @@ func TestCreatePlainAbortKeepsFirst(t *testing.T) {
 	}
 }
 
-// Провал дописывания через кэшированный дескриптор откатывает CSV к прежнему
-// размеру; следующая дописка идёт в конец уже откаченного файла.
+// A failed append restores the previous size; the next append starts there.
 func TestSlotAppendRollsBackAndContinues(t *testing.T) {
 	dir := t.TempDir()
 	reg := NewRegistry()
@@ -581,9 +604,6 @@ func TestSlotAppendRollsBackAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.mu.Unlock()
-	if err := reg.CloseDir(dir); err != nil {
-		t.Fatal(err)
-	}
 	if got := readCSV(t, res.Path); got != "\"id\"\n\"1\"\n\"2\"\n" {
 		t.Fatalf("CSV после отката: %q", got)
 	}

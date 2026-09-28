@@ -179,7 +179,7 @@ func (d *DataFile) write(p []byte) error {
 }
 
 func (d *DataFile) spill() error {
-	f, err := os.CreateTemp(d.dir, tmpPattern)
+	f, err := createTemp(d.dir)
 	if err != nil {
 		return err
 	}
@@ -195,7 +195,10 @@ func (d *DataFile) Finish() error {
 	if d == nil || d.f == nil {
 		return nil
 	}
-	return d.buf.Flush()
+	if err := d.buf.Flush(); err != nil {
+		return err
+	}
+	return d.f.Sync()
 }
 
 // open отдаёт записанные строки с начала.
@@ -218,7 +221,7 @@ func (d *DataFile) Abort() {
 	if d.f != nil {
 		name := d.f.Name()
 		_ = d.f.Close()
-		_ = os.Remove(name)
+		_ = removeTemp(name)
 		d.f = nil
 	}
 }

@@ -7,24 +7,113 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
-const tmpPattern = ".2csv-*.tmp"
+const (
+	tmpDirName = ".2csv-tmp"
+	tmpPattern = "output-*.tmp"
+	tmpOwner   = "2csv temporary files\n"
+)
 
-// CleanupTemps удаляет незавершённые временные файлы прошлого аварийного
-// запуска в конкретной рабочей директории.
+var tempMu sync.Mutex
+
 func CleanupTemps(dir string) error {
-	paths, err := filepath.Glob(filepath.Join(dir, tmpPattern))
+	tempMu.Lock()
+	defer tempMu.Unlock()
+	root := filepath.Join(dir, tmpDirName)
+	info, err := os.Lstat(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("csvout: %s занят не каталогом", root)
+	}
+	owner, err := os.ReadFile(filepath.Join(root, ".owner"))
+	if err != nil || string(owner) != tmpOwner {
+		return fmt.Errorf("csvout: %s не принадлежит 2csv", root)
+	}
+	paths, err := filepath.Glob(filepath.Join(root, tmpPattern))
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, path := range paths {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		entry, err := os.Lstat(path)
+		if err == nil && entry.Mode().IsRegular() {
+			err = os.Remove(path)
+		}
+		if err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
 		}
 	}
+	if len(errs) == 0 {
+		entries, readErr := os.ReadDir(root)
+		if readErr != nil {
+			errs = append(errs, readErr)
+		} else if len(entries) == 1 && entries[0].Name() == ".owner" {
+			if err := os.Remove(filepath.Join(root, ".owner")); err != nil {
+				errs = append(errs, err)
+			} else if err := os.Remove(root); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
 	return errors.Join(errs...)
+}
+
+func createTemp(dir string) (*os.File, error) {
+	tempMu.Lock()
+	defer tempMu.Unlock()
+	root := filepath.Join(dir, tmpDirName)
+	created := false
+	if err := os.Mkdir(root, 0o700); err == nil {
+		created = true
+	} else if !os.IsExist(err) {
+		return nil, err
+	}
+	ownerPath := filepath.Join(root, ".owner")
+	if created {
+		if err := os.WriteFile(ownerPath, []byte(tmpOwner), 0o600); err != nil {
+			_ = os.Remove(root)
+			return nil, err
+		}
+	} else {
+		owner, err := os.ReadFile(ownerPath)
+		if err != nil || string(owner) != tmpOwner {
+			return nil, fmt.Errorf("csvout: %s не принадлежит 2csv", root)
+		}
+	}
+	return os.CreateTemp(root, tmpPattern)
+}
+
+func removeTemp(path string) error {
+	err := os.Remove(path)
+	_ = pruneTempDir(filepath.Dir(filepath.Dir(path)))
+	return err
+}
+
+func pruneTempDir(dir string) error {
+	tempMu.Lock()
+	defer tempMu.Unlock()
+	root := filepath.Join(dir, tmpDirName)
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len(entries) != 1 || entries[0].Name() != ".owner" {
+		return nil
+	}
+	if err := os.Remove(filepath.Join(root, ".owner")); err != nil {
+		return err
+	}
+	return os.Remove(root)
 }
 
 // Writer пишет один INSERT во временный файл. После Commit: если CSV ключа
@@ -70,7 +159,7 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 // newWriter открывает temp для уже захваченного слота s. При ошибке слот
 // отпускается.
 func newWriter(reg *Registry, s *slot, dir, base string, columns []string) (*Writer, error) {
-	tmp, err := os.CreateTemp(dir, tmpPattern)
+	tmp, err := createTemp(dir)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("временный CSV: %w", err)
@@ -117,7 +206,7 @@ func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, er
 		base = "table"
 	}
 	s := reg.acquireUnique()
-	tmp, err := os.CreateTemp(dir, tmpPattern)
+	tmp, err := createTemp(dir)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("временный CSV: %w", err)
@@ -182,10 +271,15 @@ func (w *Writer) Commit() (Result, error) {
 		return empty, err
 	}
 	tmpName := w.tmp.Name()
+	if err := w.tmp.Sync(); err != nil {
+		w.closed = true
+		w.removeTmp()
+		return empty, err
+	}
 	if err := w.tmp.Close(); err != nil {
 		w.closed = true
 		w.tmp = nil
-		_ = os.Remove(tmpName)
+		_ = removeTemp(tmpName)
 		return empty, err
 	}
 	w.tmp = nil
@@ -193,7 +287,7 @@ func (w *Writer) Commit() (Result, error) {
 
 	if w.appending {
 		err := appendCopy(w.slot.path, tmpName)
-		_ = os.Remove(tmpName)
+		_ = removeTemp(tmpName)
 		if err != nil {
 			return empty, err
 		}
@@ -202,9 +296,10 @@ func (w *Writer) Commit() (Result, error) {
 
 	final, err := w.place(tmpName)
 	if err != nil {
-		_ = os.Remove(tmpName)
+		_ = removeTemp(tmpName)
 		return empty, err
 	}
+	_ = pruneTempDir(w.dir)
 	w.slot.path = final
 	w.slot.nCol = w.nCol
 	w.slot.hasHeader = w.wroteHeader
@@ -256,6 +351,9 @@ func appendTo(dst string, write func(io.Writer) error) error {
 	if writeErr == nil {
 		writeErr = bw.Flush()
 	}
+	if writeErr == nil {
+		writeErr = out.Sync()
+	}
 	closeErr := out.Close()
 	if writeErr != nil || closeErr != nil {
 		rollbackErr := os.Truncate(dst, originalSize)
@@ -280,7 +378,7 @@ func (w *Writer) removeTmp() {
 	_ = w.tmp.Close()
 	w.tmp = nil
 	if name != "" {
-		_ = os.Remove(name)
+		_ = removeTemp(name)
 	}
 }
 
@@ -299,7 +397,7 @@ func (w *Writer) Abort() error {
 		w.tmp = nil
 	}
 	if name != "" {
-		return os.Remove(name)
+		return removeTemp(name)
 	}
 	return nil
 }

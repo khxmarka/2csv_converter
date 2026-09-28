@@ -132,27 +132,22 @@ func TestSplitForeignFirstNonEmptyIsHeader(t *testing.T) {
 	}
 }
 
-// §14: уже лежащий {stem}_2.csv становится слотом части и заменяется.
-// Поэтому повторная нарезка после обрыва не плодит дубли в _3, _4.
-func TestSplitReplacesOccupiedPartName(t *testing.T) {
+func TestSplitRejectsOccupiedPartName(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "users.csv")
-	writeRaw(t, path, "\"a\"\n\"b\"\n\"c\"\n")
-	writeRaw(t, filepath.Join(dir, "users_2.csv"), "STALE\n")
+	const body = "\"a\"\n\"b\"\n\"c\"\n"
+	writeRaw(t, path, body)
+	part := filepath.Join(dir, "users_2.csv")
+	writeRaw(t, part, "KEEP\n")
 
-	res, err := splitFile(path, SplitNoHeader, 2, 2, nil)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := splitFile(path, SplitNoHeader, 2, 2, nil); !errors.Is(err, ErrNameTaken) {
+		t.Fatalf("ожидался ErrNameTaken, получено %v", err)
 	}
-	assertPartBytes(t, res.Parts, []string{
-		"\"a\"\n\"b\"\n",
-		"\"c\"\n",
-	})
-	if filepath.Base(res.Parts[1]) != "users_2.csv" {
-		t.Fatalf("часть: %s", res.Parts[1])
+	if got, err := os.ReadFile(path); err != nil || string(got) != body {
+		t.Fatalf("монолит изменён: %q, err=%v", got, err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "users_3.csv")); !os.IsNotExist(err) {
-		t.Fatalf("лишняя часть users_3.csv: %v", err)
+	if got, err := os.ReadFile(part); err != nil || string(got) != "KEEP\n" {
+		t.Fatalf("занятая часть изменена: %q, err=%v", got, err)
 	}
 }
 
@@ -188,24 +183,15 @@ func TestSplitPartNamesUseOwnStem(t *testing.T) {
 	}
 }
 
-// §14: провал нарезки оставляет монолит как был; части, лежавшие до прогона,
-// не уничтожаются, новые части этого прогона убираются.
+// Any preexisting part stops splitting before new files are published.
 func TestSplitFailureKeepsMonolithAndPreexistingParts(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "users.csv")
 	const body = "\"a\"\n\"b\"\n\"c\"\n\"d\"\n\"e\"\n\"f\"\n\"g\"\n"
 	writeRaw(t, path, body)
 	writeRaw(t, filepath.Join(dir, "users_3.csv"), "OLD\n")
-	// Каталог на месте четвёртой части: её публикация падает.
-	if err := os.Mkdir(filepath.Join(dir, "users_4.csv"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "users_4.csv", "x"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	if _, err := splitFile(path, SplitNoHeader, 2, 2, nil); err == nil {
-		t.Fatal("ожидалась ошибка публикации части")
+		t.Fatal("ожидалась ошибка занятой части")
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -492,7 +478,7 @@ func assertPartBytes(t *testing.T, parts, want []string) {
 
 func assertNoTemps(t *testing.T, dir string) {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dir, ".2csv-*.tmp"))
+	matches, err := filepath.Glob(filepath.Join(dir, tmpDirName, tmpPattern))
 	if err != nil {
 		t.Fatal(err)
 	}
