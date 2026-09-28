@@ -352,7 +352,7 @@ func appendTo(dst string, write func(io.Writer) error) error {
 		return errors.Join(err, out.Close())
 	}
 	originalSize := info.Size()
-	bw := bufio.NewWriterSize(out, 64*1024)
+	bw := bufio.NewWriter(out)
 	writeErr := write(bw)
 	if writeErr == nil {
 		writeErr = bw.Flush()
