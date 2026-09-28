@@ -182,6 +182,40 @@ func TestExistingFileIsOverwritten(t *testing.T) {
 	}
 }
 
+func TestCommitFailureBeforePublishKeepsExistingDestination(t *testing.T) {
+	injected := errors.New("injected output failure")
+	tests := append(outputFailureCases(injected), outputFailureCase{
+		name: "publish",
+		install: func(t *testing.T) {
+			setOutputOps(t, nil, nil, func(string, string) error { return injected })
+		},
+	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dst := filepath.Join(dir, "users.csv")
+			if err := os.WriteFile(dst, []byte("KEEP"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			w, err := Create(NewRegistry(), dir, "users", []string{"email"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Row([]string{"a@example.test"}); err != nil {
+				t.Fatal(err)
+			}
+			tt.install(t)
+			if _, err := w.Commit(); !errors.Is(err, injected) {
+				t.Fatalf("Commit error = %v, want %v", err, injected)
+			}
+			if got := readCSV(t, dst); got != "KEEP" {
+				t.Fatalf("destination changed after failed %s: %q", tt.name, got)
+			}
+			assertNoTemps(t, dir)
+		})
+	}
+}
+
 func TestReplaceFailureKeepsExistingDestination(t *testing.T) {
 	dir := t.TempDir()
 	dst := filepath.Join(dir, "target.csv")
@@ -311,6 +345,55 @@ func readCSV(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(raw)
+}
+
+func setOutputOps(
+	t *testing.T,
+	syncFile func(*os.File) error,
+	closeFile func(*os.File) error,
+	publishFile func(string, string) error,
+) {
+	t.Helper()
+	oldSync, oldClose, oldPublish := syncOutputFile, closeOutputFile, publishOutputFile
+	if syncFile != nil {
+		syncOutputFile = syncFile
+	}
+	if closeFile != nil {
+		closeOutputFile = closeFile
+	}
+	if publishFile != nil {
+		publishOutputFile = publishFile
+	}
+	t.Cleanup(func() {
+		syncOutputFile, closeOutputFile, publishOutputFile = oldSync, oldClose, oldPublish
+	})
+}
+
+type outputFailureCase struct {
+	name    string
+	install func(*testing.T)
+}
+
+func outputFailureCases(injected error) []outputFailureCase {
+	return []outputFailureCase{
+		{
+			name: "sync",
+			install: func(t *testing.T) {
+				setOutputOps(t, func(*os.File) error { return injected }, nil, nil)
+			},
+		},
+		{
+			name: "close",
+			install: func(t *testing.T) {
+				setOutputOps(t, nil, func(f *os.File) error {
+					if err := f.Close(); err != nil {
+						return err
+					}
+					return injected
+				}, nil)
+			},
+		},
+	}
 }
 
 func TestMergeTwoInsertsSameKeyOneFile(t *testing.T) {
@@ -606,6 +689,32 @@ func TestSlotAppendRollsBackAndContinues(t *testing.T) {
 	s.mu.Unlock()
 	if got := readCSV(t, res.Path); got != "\"id\"\n\"1\"\n\"2\"\n" {
 		t.Fatalf("CSV после отката: %q", got)
+	}
+}
+
+func TestAppendSyncAndCloseFailureRollBack(t *testing.T) {
+	injected := errors.New("injected append failure")
+	for _, tt := range outputFailureCases(injected) {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			reg := NewRegistry()
+			res := commitInsert(t, reg, dir, "t", []string{"id"}, []string{"1"})
+			before := readCSV(t, res.Path)
+			s := reg.acquire(dir, "t")
+			defer s.mu.Unlock()
+			tt.install(t)
+
+			err := s.appendTo(func(w io.Writer) error {
+				_, err := io.WriteString(w, "\"2\"\n")
+				return err
+			})
+			if !errors.Is(err, injected) {
+				t.Fatalf("append error = %v, want %v", err, injected)
+			}
+			if got := readCSV(t, res.Path); got != before {
+				t.Fatalf("CSV changed after failed %s: %q", tt.name, got)
+			}
+		})
 	}
 }
 

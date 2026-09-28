@@ -333,11 +333,11 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 			if err := buf.Flush(); err != nil {
 				return err
 			}
-			if err := open.Sync(); err != nil {
+			if err := syncOutputFile(open); err != nil {
 				return err
 			}
 			name := open.Name()
-			if err := open.Close(); err != nil {
+			if err := closeOutputFile(open); err != nil {
 				_ = removeTemp(name)
 				open = nil
 				buf = nil
@@ -396,11 +396,11 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 	if err := buf.Flush(); err != nil {
 		return nil, 0, err
 	}
-	if err := open.Sync(); err != nil {
+	if err := syncOutputFile(open); err != nil {
 		return nil, 0, err
 	}
 	last := open.Name()
-	if err := open.Close(); err != nil {
+	if err := closeOutputFile(open); err != nil {
 		_ = removeTemp(last)
 		open = nil
 		buf = nil
@@ -414,13 +414,13 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 	}
 
 	for i := 1; i < len(names); i++ {
-		if err := replaceFile(temps[i], names[i]); err != nil {
+		if err := publishOutputFile(temps[i], names[i]); err != nil {
 			return nil, 0, err
 		}
 		temps[i] = ""
 		published = append(published, names[i])
 	}
-	if err := replaceFile(temps[0], names[0]); err != nil {
+	if err := publishOutputFile(temps[0], names[0]); err != nil {
 		return nil, 0, err
 	}
 	temps[0] = ""

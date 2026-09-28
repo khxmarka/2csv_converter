@@ -1295,6 +1295,85 @@ func TestRemoveSourceLogsFailureAndLeavesPath(t *testing.T) {
 	}
 }
 
+func TestStateWriteFailureKeepsSourceAndRetries(t *testing.T) {
+	injected := errors.New("injected state failure")
+	for _, failedList := range []marks.List{marks.SplitPassed, marks.ConvertDone} {
+		t.Run(string(failedList), func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "Alpha")
+			source := filepath.Join(dir, "dump.sql")
+			copySQLFixture(t, "14_two_columns_ok.sql", source)
+			oldAppend := appendState
+			appendState = func(root string, list marks.List, name string) error {
+				if list == failedList {
+					return injected
+				}
+				return marks.Append(root, list, name)
+			}
+			t.Cleanup(func() { appendState = oldAppend })
+
+			result, err := Run(logx.New(io.Discard), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.FilesFail == 0 || len(result.SuccessTops) != 0 {
+				t.Fatalf("state failure must keep folder unfinished: %+v", result)
+			}
+			if _, err := os.Stat(source); err != nil {
+				t.Fatalf("source removed after state failure: %v", err)
+			}
+			failed, err := marks.Read(root, failedList)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := failed["Alpha"]; ok {
+				t.Fatalf("failed state was persisted in %s", failedList)
+			}
+
+			appendState = oldAppend
+			result, err = Run(logx.New(io.Discard), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.FilesFail != 0 {
+				t.Fatalf("retry failed: %+v", result)
+			}
+			if _, err := os.Stat(source); !os.IsNotExist(err) {
+				t.Fatalf("successful retry did not remove source: %v", err)
+			}
+		})
+	}
+}
+
+func TestSourceRemovalFailureIsReportedAfterState(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	source := filepath.Join(dir, "dump.sql")
+	copySQLFixture(t, "14_two_columns_ok.sql", source)
+	injected := errors.New("injected remove failure")
+	oldRemove := removeSource
+	removeSource = func(string) error { return injected }
+	t.Cleanup(func() { removeSource = oldRemove })
+
+	result, err := Run(logx.New(io.Discard), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FilesFail == 0 {
+		t.Fatalf("source removal failure was not reported: %+v", result)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("source missing after failed removal: %v", err)
+	}
+	done, err := marks.Read(root, marks.ConvertDone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := done["Alpha"]; !ok {
+		t.Fatalf("published output was not recorded before source removal: %v", done)
+	}
+}
+
 func TestSQLExcelSQLSameTargetNeverMixesStreams(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "Alpha")
