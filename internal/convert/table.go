@@ -318,6 +318,11 @@ func convertTable(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, h *t
 	out := Result{}
 	wrote, badParse, tooMany := 0, 0, 0
 	tr := tableReader{r: r}
+	var recordReader strings.Reader
+	cr := csv.NewReader(&recordReader)
+	cr.Comma = h.delim
+	cr.FieldsPerRecord = -1
+	cr.ReuseRecord = true
 	for {
 		rec, ok, err := tr.next()
 		if err != nil {
@@ -331,7 +336,9 @@ func convertTable(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, h *t
 		if strings.TrimSpace(rec) == "" {
 			continue
 		}
-		fields, splitErr := splitFields(rec, h.delim)
+		// Reuse the CSV reader to avoid allocating its buffer for every row.
+		recordReader.Reset(rec)
+		fields, splitErr := cr.Read()
 		if splitErr != nil {
 			badParse++
 			continue
