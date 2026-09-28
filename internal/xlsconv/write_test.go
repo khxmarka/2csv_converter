@@ -8,11 +8,45 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"sql2csv/internal/csvout"
 
 	"github.com/xuri/excelize/v2"
 )
+
+func TestXLSSerializesReads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.xls")
+	tests := map[string]func(){
+		"File": func() { _ = File(csvout.NewRegistry(), path) },
+		"Read": func() { _, _ = Read(path) },
+	}
+	for name, run := range tests {
+		t.Run(name, func(t *testing.T) {
+			xlsMemoryMu.Lock()
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				run()
+			}()
+
+			select {
+			case <-done:
+				xlsMemoryMu.Unlock()
+				t.Fatal("второе чтение .xls не ожидало освобождения памяти первого")
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			xlsMemoryMu.Unlock()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("чтение .xls не продолжилось после освобождения ограничения")
+			}
+		})
+	}
+}
 
 func csvFiles(t *testing.T, dir string) []string {
 	t.Helper()

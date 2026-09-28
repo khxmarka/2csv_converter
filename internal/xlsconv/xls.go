@@ -3,11 +3,17 @@ package xlsconv
 import (
 	"fmt"
 	"os"
+	"sync"
 
 	"github.com/nkiri/xls"
 )
 
+var xlsMemoryMu sync.Mutex
+
 func readXLS(path string) (Book, error) {
+	xlsMemoryMu.Lock()
+	defer xlsMemoryMu.Unlock()
+
 	wb, tooMany, err := openXLS(path)
 	if err != nil {
 		return Book{}, err
