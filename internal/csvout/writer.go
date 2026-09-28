@@ -343,6 +343,10 @@ func appendCopy(dst, src string) error {
 // appendTo дописывает в конец dst то, что пишет write. Провал откатывает
 // dst к исходному размеру: уже записанный CSV ключа не портится (§6).
 func appendTo(dst string, write func(io.Writer) error) error {
+	return appendFile(dst, write, true)
+}
+
+func appendFile(dst string, write func(io.Writer) error, durable bool) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -357,7 +361,7 @@ func appendTo(dst string, write func(io.Writer) error) error {
 	if writeErr == nil {
 		writeErr = bw.Flush()
 	}
-	if writeErr == nil {
+	if writeErr == nil && durable {
 		writeErr = syncOutputFile(out)
 	}
 	closeErr := closeOutputFile(out)

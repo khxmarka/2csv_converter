@@ -62,6 +62,10 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 	defer func() {
 		q.close()
 		<-done
+		if err := syncCSVOutputs(st.dirty); err != nil {
+			st.failed = true
+			st.log.Errorf("%s: не удалось синхронизировать CSV: %v", st.sql.Path, err)
+		}
 		out = Result{
 			Created:  st.created,
 			CSV:      st.csvNew,
@@ -120,6 +124,8 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 	}
 	return out
 }
+
+var syncCSVOutputs = csvout.SyncFiles
 
 type prepared struct {
 	data    *csvout.DataFile
@@ -270,6 +276,9 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 	}
 	s.created++
 	s.paths = append(s.paths, res.Path)
+	if res.Appended {
+		s.dirty = append(s.dirty, res.Path)
+	}
 	if !res.Appended {
 		s.csvNew++
 	}

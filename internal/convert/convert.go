@@ -34,6 +34,7 @@ type session struct {
 	unitFail int
 	failed   bool
 	paths    []string
+	dirty    []string
 }
 
 func skipQuiet(reason string) bool {
