@@ -211,6 +211,15 @@ func writeXLSXSheet(reg *csvout.Registry, book *excelize.File, dir, stem, name s
 	return res.Path, nil
 }
 
+func rowEmpty(row []string) bool {
+	for _, value := range row {
+		if value != "" {
+			return false
+		}
+	}
+	return true
+}
+
 func bookStem(path string) string {
 	base := filepath.Base(path)
 	return strings.TrimSuffix(base, filepath.Ext(base))
