@@ -10,8 +10,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	"sql2csv/internal/insert"
 )
 
 func TestEncodeRowSnapshot(t *testing.T) {
@@ -85,33 +83,6 @@ func TestSQLKeysDifferingAfterNameLimitStaySeparate(t *testing.T) {
 	}
 	if got := readCSV(t, second.Path); got != "\"email\"\n\"B\"\n" {
 		t.Fatalf("второй CSV=%q", got)
-	}
-}
-
-func TestNormalizeRow(t *testing.T) {
-	cells := []insert.Cell{
-		{Kind: insert.Text, Text: "1"},
-		{Kind: insert.Null},
-		{Kind: insert.Missing},
-	}
-	row, padded, err := NormalizeRow(cells, 5)
-	if err != nil || !padded {
-		t.Fatalf("padded=%v err=%v", padded, err)
-	}
-	want := []string{"1", "", "", "", ""}
-	if len(row) != 5 || row[0] != "1" || row[1] != "" || row[4] != "" {
-		t.Fatalf("row=%q want=%q", row, want)
-	}
-	_, _, err = NormalizeRow(cells, 2)
-	if err != ErrTooManyValues {
-		t.Fatalf("лишние значения: %v", err)
-	}
-	row, padded, err = NormalizeRow(cells, 0)
-	if err != nil || padded {
-		t.Fatalf("nCol=0: padded=%v err=%v", padded, err)
-	}
-	if len(row) != 3 || row[0] != "1" || row[1] != "" || row[2] != "" {
-		t.Fatalf("nCol=0 row=%q", row)
 	}
 }
 
@@ -480,8 +451,8 @@ func TestMergeSecondInsertTooManySkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w.NCol() != 2 {
-		t.Fatalf("ширина заголовка=%d", w.NCol())
+	if w.nCol != 2 {
+		t.Fatalf("ширина заголовка=%d", w.nCol)
 	}
 	if err := w.Row([]string{"2", "x", "y"}); err != ErrTooManyValues {
 		_ = w.Abort()
@@ -590,8 +561,8 @@ func TestCreateNoHeaderFromEmptyColumns(t *testing.T) {
 	if err := w.Row([]string{"334", "10", "genre", "Action"}); err != nil {
 		t.Fatal(err)
 	}
-	if w.NCol() != 4 {
-		t.Fatalf("ширина после первой строки: %d", w.NCol())
+	if w.nCol != 4 {
+		t.Fatalf("ширина после первой строки: %d", w.nCol)
 	}
 	if err := w.Row([]string{"335", "10", "genre", "Adventure"}); err != nil {
 		t.Fatal(err)

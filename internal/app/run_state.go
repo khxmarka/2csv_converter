@@ -147,13 +147,6 @@ func (a *accumulator) setActiveLocked(key, name string) {
 	a.refreshHang()
 }
 
-func (a *accumulator) add(file scan.SQLFile, out fileOutcome) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.recordLocked(file, out)
-	a.finishFileLocked(file)
-}
-
 func (a *accumulator) record(file scan.SQLFile, out fileOutcome) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

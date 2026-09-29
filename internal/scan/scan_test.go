@@ -19,7 +19,7 @@ func TestValidateRootMissing(t *testing.T) {
 
 func TestFindMissingRootReturnsBlockingSkip(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "нет-такой-папки")
-	result, err := Find(missing)
+	result, err := FindSkipping(missing, nil)
 	if err != nil {
 		t.Fatalf("ошибка обхода должна быть частью Result: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestValidateRootDir(t *testing.T) {
 func TestFindOnFixtureTree(t *testing.T) {
 	root := filepath.Join("testdata", "tree")
 
-	result, err := Find(root)
+	result, err := FindSkipping(root, nil)
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestFindDoesNotFollowSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := Find(root)
+	result, err := FindSkipping(root, nil)
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestFindDoesNotFollowJunctions(t *testing.T) {
 		t.Skipf("не удалось создать junction: %v (%s)", err, out)
 	}
 
-	result, err := Find(root)
+	result, err := FindSkipping(root, nil)
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestFindDoesNotFollowJunctions(t *testing.T) {
 
 func TestFindIgnoresNonSQL(t *testing.T) {
 	root := filepath.Join("testdata", "tree")
-	result, err := Find(root)
+	result, err := FindSkipping(root, nil)
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
@@ -218,7 +218,7 @@ func TestFindCollectsExcelIgnoresOtherTables(t *testing.T) {
 		}
 	}
 
-	result, err := Find(root)
+	result, err := FindSkipping(root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func TestFindLeavesUnreadableSQLForConverterToReport(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
 
-	result, err := Find(root)
+	result, err := FindSkipping(root, nil)
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestFindCollectsCSVSkipsTempsAndConverted(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	result, err := Find(root)
+	result, err := FindSkipping(root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestFindCollectsCSVSkipsTempsAndConverted(t *testing.T) {
 }
 
 func TestFindOnEmptyDir(t *testing.T) {
-	result, err := Find(t.TempDir())
+	result, err := FindSkipping(t.TempDir(), nil)
 	if err != nil {
 		t.Fatalf("Find: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestFindIgnoresReadmeAtAnyDepth(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	result, err := Find(root)
+	result, err := FindSkipping(root, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -716,7 +716,8 @@ func TestBlockedScanPreventsFolderCompletion(t *testing.T) {
 		map[string]struct{}{"Alpha": {}},
 	)
 	acc.start(file)
-	acc.add(file, fileOutcome{created: 1, csv: 1})
+	acc.record(file, fileOutcome{created: 1, csv: 1})
+	acc.finishFiles([]scan.SQLFile{file})
 
 	if _, err := os.Stat(marks.Path(root, marks.ConvertDone)); !os.IsNotExist(err) {
 		t.Fatalf("заблокированную папку нельзя записывать в converted.txt, err=%v", err)
@@ -735,7 +736,8 @@ func TestAccumulatorCountsCriticalConversionFailure(t *testing.T) {
 	file := scan.SQLFile{Path: filepath.Join(root, "Alpha", "bad.sql"), TopFolder: "Alpha"}
 	acc := newAccumulator(logx.New(io.Discard), root, []scan.SQLFile{file}, nil)
 	acc.start(file)
-	acc.add(file, fileOutcome{skipped: 1, failed: true})
+	acc.record(file, fileOutcome{skipped: 1, failed: true})
+	acc.finishFiles([]scan.SQLFile{file})
 	_, skipped, _, filesFail, tops := acc.snapshot()
 	if skipped != 1 || filesFail != 1 {
 		t.Fatalf("skipped=%d filesFail=%d", skipped, filesFail)
