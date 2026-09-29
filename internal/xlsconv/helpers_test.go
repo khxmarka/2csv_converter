@@ -66,30 +66,3 @@ func writeXLSX(t *testing.T, sheets []specSheet) string {
 	}
 	return path
 }
-
-func assertSheetNames(t *testing.T, book Book, want ...string) {
-	t.Helper()
-	if book.SkipTooMany {
-		t.Fatal("не ожидали SkipTooMany")
-	}
-	if len(book.Sheets) != len(want) {
-		t.Fatalf("листов: %d, ожидалось %d", len(book.Sheets), len(want))
-	}
-	for i, name := range want {
-		if book.Sheets[i].Name != name {
-			t.Fatalf("лист %d: имя %q, ожидалось %q", i, book.Sheets[i].Name, name)
-		}
-	}
-}
-
-func cell(t *testing.T, sh Sheet, row, col int) string {
-	t.Helper()
-	if row < 0 || row >= len(sh.Rows) {
-		t.Fatalf("лист %q: нет строки %d (строк %d)", sh.Name, row, len(sh.Rows))
-	}
-	r := sh.Rows[row]
-	if col < 0 || col >= len(r) {
-		return ""
-	}
-	return r[col]
-}

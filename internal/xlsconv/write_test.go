@@ -15,36 +15,46 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-func TestXLSSerializesReads(t *testing.T) {
+func TestXLSSerializesFileReads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "missing.xls")
-	tests := map[string]func(){
-		"File": func() { _ = File(csvout.NewRegistry(), path) },
-		"Read": func() { _, _ = Read(path) },
+	xlsMemoryMu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = File(csvout.NewRegistry(), path)
+	}()
+
+	select {
+	case <-done:
+		xlsMemoryMu.Unlock()
+		t.Fatal("второе чтение .xls не ожидало освобождения памяти первого")
+	case <-time.After(50 * time.Millisecond):
 	}
-	for name, run := range tests {
-		t.Run(name, func(t *testing.T) {
-			xlsMemoryMu.Lock()
 
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				run()
-			}()
+	xlsMemoryMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("чтение .xls не продолжилось после освобождения ограничения")
+	}
+}
 
-			select {
-			case <-done:
-				xlsMemoryMu.Unlock()
-				t.Fatal("второе чтение .xls не ожидало освобождения памяти первого")
-			case <-time.After(50 * time.Millisecond):
-			}
-
-			xlsMemoryMu.Unlock()
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-				t.Fatal("чтение .xls не продолжилось после освобождения ограничения")
-			}
-		})
+func TestFileRejectsOversizedXLS(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.xls")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(MaxXLSBytes + 1); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if res := File(csvout.NewRegistry(), path); res.OpenErr == nil {
+		t.Fatal("ожидалась ошибка размера .xls")
 	}
 }
 
