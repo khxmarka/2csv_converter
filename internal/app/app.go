@@ -3,9 +3,10 @@ package app
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"time"
 
 	"sql2csv/internal/logx"
@@ -69,7 +70,7 @@ func Run(log *logx.Logger, root string) (Result, error) {
 		InsertSkip:  insertSkip,
 		CSV:         csvCount,
 		FilesFail:   filesFail + scanFails,
-		SuccessTops: mapsKeys(tops),
+		SuccessTops: slices.Sorted(maps.Keys(tops)),
 	}
 	log.Hang("")
 	if err := log.FileErr(); err != nil {
@@ -116,12 +117,8 @@ func readLists(log *logx.Logger, root string) map[marks.List]map[string]struct{}
 
 func union(a, b map[string]struct{}) map[string]struct{} {
 	out := make(map[string]struct{}, len(a)+len(b))
-	for k := range a {
-		out[k] = struct{}{}
-	}
-	for k := range b {
-		out[k] = struct{}{}
-	}
+	maps.Copy(out, a)
+	maps.Copy(out, b)
 	return out
 }
 
@@ -132,14 +129,5 @@ func intersect(a, b map[string]struct{}) map[string]struct{} {
 			out[k] = struct{}{}
 		}
 	}
-	return out
-}
-
-func mapsKeys(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
 	return out
 }
