@@ -18,6 +18,9 @@ const (
 
 var tempMu sync.Mutex
 
+// ErrTooManyValues reports that a VALUES row is wider than its header.
+var ErrTooManyValues = errors.New("значений больше, чем колонок")
+
 var (
 	syncOutputFile    = (*os.File).Sync
 	closeOutputFile   = (*os.File).Close
@@ -232,14 +235,6 @@ func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, er
 		return nil, err
 	}
 	return w, nil
-}
-
-// NCol — ширина заголовка, с которой сверяется арность VALUES.
-func (w *Writer) NCol() int {
-	if w == nil {
-		return 0
-	}
-	return w.nCol
 }
 
 // Row пишет одну строку данных. values уже нормализованы до nCol элементов.

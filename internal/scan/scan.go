@@ -72,15 +72,8 @@ func ValidateRoot(path string) error {
 	return nil
 }
 
-// Find рекурсивно обходит root и собирает пути *.sql, *.xlsx, *.xls, *.csv и *.txt без учёта регистра.
-// Symlink-и не раскрываются: и ссылки на каталоги, и ссылки на файлы попадают в Skips.
-// Ошибки чтения каталогов возвращаются как блокирующие Skips и не роняют обход.
-func Find(root string) (Result, error) {
-	return FindSkipping(root, nil)
-}
-
-// FindSkipping работает как Find, но целиком исключает уже завершённые верхние
-// папки до открытия находящихся в них файлов.
+// FindSkipping recursively scans root while excluding completed top-level directories.
+// It reports unreadable entries and links as blocking skips instead of following them.
 func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 	var res Result
 	completed = marks.FoldSet(completed)
