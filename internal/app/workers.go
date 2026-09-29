@@ -11,12 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"sql2csv/internal/convert"
 	"sql2csv/internal/csvout"
 	"sql2csv/internal/logx"
 	"sql2csv/internal/marks"
 	"sql2csv/internal/scan"
-	"sql2csv/internal/xlsconv"
 )
 
 const maxWorkers = 16
@@ -535,34 +533,6 @@ type fileOutcome struct {
 	split       bool // лежавший .csv/.txt нарезан
 }
 
-func outcomeFromConvert(fr convert.Result) fileOutcome {
-	return fileOutcome{
-		openErr:  fr.OpenErr,
-		created:  fr.Created,
-		skipped:  fr.Skipped,
-		csv:      fr.CSV,
-		failed:   fr.Failed,
-		piiSkip:  fr.PIISkip,
-		unitFail: fr.UnitFail,
-	}
-}
-
-func convertExcel(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (out fileOutcome) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			log.Errorf("%s: сбой обработки (%v), файл пропущен", file.Path, rec)
-			out = fileOutcome{skipped: 1, failed: true}
-		}
-	}()
-	xr := xlsconv.File(reg, file.Path)
-	return fileOutcome{
-		openErr:     xr.OpenErr,
-		writeErr:    xr.WriteErr,
-		csv:         xr.CSV,
-		skipTooMany: xr.SkipTooMany,
-	}
-}
-
 // testDirEnter — крюк теста. В бою nil. Вызывается до файлов директории.
 var testDirEnter func(scan.SQLFile)
 
@@ -606,28 +576,9 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 	if !doSplit {
 		csvs = nil
 	}
-	for _, file := range sqls {
-		acc.start(file)
-		out := outcomeFromConvert(convert.Schedule(log, reg, file, submit))
-		acc.record(file, out)
-	}
-	for _, file := range excels {
-		acc.start(file)
-		out := convertExcel(log, reg, file)
-		acc.record(file, out)
-	}
+	convertDirFiles(acc, log, reg, submit, sqls, excels)
 	// CSV этого запуска режутся всегда: это часть их создания (§5).
-	failed, splitAny := splitWritten(log, reg, dir)
-	acc.markSplit(group[0], failed, splitAny)
-	ours := outputPaths(reg, dir)
-	for _, file := range csvs {
-		acc.start(file)
-		if _, ok := ours[foldPath(file.Path)]; ok {
-			acc.record(file, fileOutcome{})
-			continue
-		}
-		acc.record(file, splitForeignCSV(log, reg, file))
-	}
+	splitDirFiles(acc, log, reg, dir, group[0], csvs)
 }
 
 // producedCSV — исходник можно удалить (§15): CSV получен и ни одна единица

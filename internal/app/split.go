@@ -29,6 +29,27 @@ func splitWritten(log *logx.Logger, reg *csvout.Registry, dir string) (failed, s
 	return failed, split
 }
 
+func splitDirFiles(
+	acc *accumulator,
+	log *logx.Logger,
+	reg *csvout.Registry,
+	dir string,
+	groupFile scan.SQLFile,
+	csvs []scan.SQLFile,
+) {
+	failed, splitAny := splitWritten(log, reg, dir)
+	acc.markSplit(groupFile, failed, splitAny)
+	ours := outputPaths(reg, dir)
+	for _, file := range csvs {
+		acc.start(file)
+		if _, ok := ours[foldPath(file.Path)]; ok {
+			acc.record(file, fileOutcome{})
+			continue
+		}
+		acc.record(file, splitForeignCSV(log, reg, file))
+	}
+}
+
 // splitForeignCSV режет лежавший заранее файл: .csv — с шапкой из первой
 // непустой строки (§14), .txt — построчно, без шапки и без CSV-кавычек.
 func splitForeignCSV(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) fileOutcome {
