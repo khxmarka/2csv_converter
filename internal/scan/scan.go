@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 
@@ -84,7 +83,7 @@ func Find(root string) (Result, error) {
 // папки до открытия находящихся в них файлов.
 func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 	var res Result
-	completed = foldTopNames(completed)
+	completed = marks.FoldSet(completed)
 
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -148,7 +147,7 @@ func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 	return res, nil
 }
 
-// isCompletedTop: completed уже приведён foldTopNames, поиск — O(1).
+// isCompletedTop: completed уже приведён marks.FoldSet, поиск — O(1).
 func isCompletedTop(root, path string, completed map[string]struct{}) bool {
 	if len(completed) == 0 {
 		return false
@@ -157,27 +156,8 @@ func isCompletedTop(root, path string, completed map[string]struct{}) bool {
 	if err != nil || rel == "." || filepath.Dir(rel) != "." {
 		return false
 	}
-	_, ok := completed[foldTopName(rel)]
+	_, ok := completed[marks.Fold(rel)]
 	return ok
-}
-
-// foldTopName — ключ сравнения имени верхней папки: на Windows без учёта
-// регистра (§7), как canonicalPath в csvout.
-func foldTopName(name string) string {
-	if runtime.GOOS == "windows" {
-		return strings.ToLower(name)
-	}
-	return name
-}
-
-// foldTopNames строит множество ключей один раз на обход: иначе на Windows
-// каждая верхняя папка сравнивалась бы со всем списком (O(n²)).
-func foldTopNames(names map[string]struct{}) map[string]struct{} {
-	out := make(map[string]struct{}, len(names))
-	for name := range names {
-		out[foldTopName(name)] = struct{}{}
-	}
-	return out
 }
 
 func directTopDir(root, path string) (string, bool) {
