@@ -20,7 +20,7 @@ func TestSplitExactThresholdUntouched(t *testing.T) {
 	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", SplitThreshold)
 	before := fileSHA(t, path)
 
-	res, err := SplitIfNeeded(path, SplitWithHeader)
+	res, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestSplitJustOverThreshold(t *testing.T) {
 	const rows = SplitThreshold + 1
 	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", rows)
 
-	res, err := SplitIfNeeded(path, SplitWithHeader)
+	res, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,7 @@ func TestSplit1200001Distribution(t *testing.T) {
 	const rows = 1_200_001
 	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", rows)
 
-	res, err := SplitIfNeeded(path, SplitWithHeader)
+	res, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestSplitForeignFirstNonEmptyIsHeader(t *testing.T) {
 	const raw = "\n\"h\"\r\n\"a\"\r\n\r\n"
 	writeRaw(t, kept, raw)
 	before := fileSHA(t, kept)
-	out, err := SplitIfNeeded(kept, SplitWithHeader)
+	out, err := NewRegistry().SplitIfNeeded(kept, SplitWithHeader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +331,7 @@ func TestSplitRejectsConvertedAndNonCSV(t *testing.T) {
 		path := filepath.Join(dir, name)
 		writeRaw(t, path, "\"a\"\n\"b\"\n")
 		before := fileSHA(t, path)
-		if _, err := SplitIfNeeded(path, SplitWithHeader); err == nil {
+		if _, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader); err == nil {
 			t.Fatalf("%s принят", name)
 		}
 		if fileSHA(t, path) != before {
@@ -342,7 +342,7 @@ func TestSplitRejectsConvertedAndNonCSV(t *testing.T) {
 	csvPath := filepath.Join(dir, "DATA.CSV")
 	writeRaw(t, csvPath, "\"h\"\n\"a\"\n")
 	before := fileSHA(t, csvPath)
-	res, err := SplitIfNeeded(csvPath, SplitWithHeader)
+	res, err := NewRegistry().SplitIfNeeded(csvPath, SplitWithHeader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestSplitRecordTooLargeKeepsOriginal(t *testing.T) {
 	b.WriteString("\"\n\"a\"\n\"b\"\n\"c\"\n")
 	writeRaw(t, path, b.String())
 	before := fileSHA(t, path)
-	_, err := SplitIfNeeded(path, SplitWithHeader)
+	_, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader)
 	if err == nil || !errors.Is(err, ErrRecordTooLarge) {
 		t.Fatalf("ожидался ErrRecordTooLarge, got %v", err)
 	}
