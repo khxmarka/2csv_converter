@@ -68,15 +68,9 @@ func SetMaxRecordBytes(n int) (restore func()) {
 	return func() { splitLimitRecord = prev }
 }
 
-// SplitIfNeeded режет path, если строк данных больше SplitThreshold.
-// Файл с порогом и ниже не открывается на запись.
-func SplitIfNeeded(path string, mode HeaderMode) (SplitResult, error) {
-	return splitFile(path, mode, splitLimitThreshold, splitLimitChunk, nil)
-}
-
-// SplitIfNeeded режет path как csvout.SplitIfNeeded, но часть не может занять
-// CSV, который этот запуск записал для другого ключа (таблица users_2 при
-// нарезке users): такая нарезка — ошибка, монолит остаётся как был.
+// SplitIfNeeded режет path, если строк данных больше SplitThreshold, но часть
+// не может занять CSV, который этот запуск записал для другого ключа (таблица
+// users_2 при нарезке users): такая нарезка — ошибка, монолит остаётся как был.
 func (r *Registry) SplitIfNeeded(path string, mode HeaderMode) (SplitResult, error) {
 	return splitFile(path, mode, splitLimitThreshold, splitLimitChunk, r.isWritten)
 }

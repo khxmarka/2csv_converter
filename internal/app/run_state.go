@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -406,11 +407,7 @@ func (a *accumulator) startHangTicker() func() {
 func (a *accumulator) snapshot() (insertOK, insertSkip, csv, filesFail int, tops map[string]struct{}) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	cloned := make(map[string]struct{}, len(a.tops))
-	for k := range a.tops {
-		cloned[k] = struct{}{}
-	}
-	return a.insertOK, a.insertSkip, a.csv, a.filesFail, cloned
+	return a.insertOK, a.insertSkip, a.csv, a.filesFail, maps.Clone(a.tops)
 }
 
 func (a *accumulator) completeEmptyTops(topDirs []string) {
