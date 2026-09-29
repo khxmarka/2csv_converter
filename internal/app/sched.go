@@ -49,16 +49,17 @@ func (h *jobHeap) Pop() any {
 // Свободный воркер открывает следующую директорию только когда в очереди нет готового INSERT.
 // В одной директории по-прежнему один .sql за раз.
 type runner struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	jobs     jobHeap
-	seq      uint64
-	dirs     []dirWork
-	next     int
-	scanners int
-	limit    int
-	done     bool
-	wg       sync.WaitGroup
+	mu        sync.Mutex
+	cond      *sync.Cond
+	jobs      jobHeap
+	seq       uint64
+	dirs      []dirWork
+	next      int
+	scanners  int
+	limit     int
+	scanLimit int
+	done      bool
+	wg        sync.WaitGroup
 
 	acc *accumulator
 	log *logx.Logger
@@ -85,11 +86,12 @@ func runDirs(acc *accumulator, log *logx.Logger, reg *csvout.Registry, files []s
 	}
 	n := poolSize()
 	r := &runner{
-		dirs:  dirs,
-		limit: n,
-		acc:   acc,
-		log:   log,
-		reg:   reg,
+		dirs:      dirs,
+		limit:     n,
+		scanLimit: min(n, maxConcurrentDirs),
+		acc:       acc,
+		log:       log,
+		reg:       reg,
 	}
 	r.cond = sync.NewCond(&r.mu)
 	for range n {
@@ -116,7 +118,7 @@ func (r *runner) submit(top int, fn func()) {
 }
 
 func (r *runner) fillLocked() {
-	for !r.done && len(r.jobs) == 0 && r.next < len(r.dirs) && r.scanners < r.limit {
+	for !r.done && len(r.jobs) == 0 && r.next < len(r.dirs) && r.scanners < r.scanLimit {
 		dw := r.dirs[r.next]
 		r.next++
 		r.scanners++

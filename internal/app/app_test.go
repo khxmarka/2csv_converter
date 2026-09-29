@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -971,6 +972,60 @@ func TestSecondTopStartsBeforeFirstFinishes(t *testing.T) {
 		if !strings.Contains(string(raw), top+"@example.test") {
 			t.Fatalf("%s: %q", top, raw)
 		}
+	}
+}
+
+func TestConcurrentDirectoryLimit(t *testing.T) {
+	root := t.TempDir()
+	for i := range maxConcurrentDirs + 2 {
+		dir := filepath.Join(root, "Top"+strconv.Itoa(i))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(dir, "dump.sql"),
+			[]byte("INSERT INTO users (email) VALUES ('user@example.test');\n"),
+			0o644,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entered := make(chan struct{}, maxConcurrentDirs+2)
+	releaseCh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	defer release()
+	testDirEnter = func(scan.SQLFile) {
+		entered <- struct{}{}
+		<-releaseCh
+	}
+	t.Cleanup(func() { testDirEnter = nil })
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := Run(logx.New(io.Discard), root)
+		errc <- err
+	}()
+	for range maxConcurrentDirs {
+		select {
+		case <-entered:
+		case err := <-errc:
+			t.Fatalf("прогон закончился до заполнения лимита: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("директории не заполнили лимит")
+		}
+	}
+	select {
+	case <-entered:
+		t.Fatalf("одновременно открыто больше %d директорий", maxConcurrentDirs)
+	case err := <-errc:
+		t.Fatalf("прогон закончился до освобождения директорий: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-errc; err != nil {
+		t.Fatal(err)
 	}
 }
 

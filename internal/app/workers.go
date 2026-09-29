@@ -21,6 +21,9 @@ import (
 
 const maxWorkers = 16
 
+// maxConcurrentDirs bounds concurrent workbook and splitter memory without reducing INSERT workers.
+const maxConcurrentDirs = 4
+
 // poolSize — N воркеров на весь запуск: min(GOMAXPROCS, 16), не меньше 1 (§9).
 // Числом файлов не ограничивается: INSERT одного файла тоже идут в этот пул.
 func poolSize() int {
