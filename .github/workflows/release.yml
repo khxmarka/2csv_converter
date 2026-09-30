@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Test
+        run: go test -count=1 -race -shuffle=on ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        id: build
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must match vX.Y.Z" >&2
+            exit 1
+          fi
+
+          version="${GITHUB_REF_NAME#v}"
+          filename="2csv_${version}_windows_amd64.exe"
+
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
+            go build -trimpath -o "dist/${filename}" .
+
+          (
+            cd dist
+            sha256sum "${filename}" > SHA256SUMS.txt
+            sha256sum -c SHA256SUMS.txt
+          )
+
+          echo "filename=${filename}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FILENAME: ${{ steps.build.outputs.filename }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/${FILENAME}" \
+            dist/SHA256SUMS.txt \
+            --verify-tag \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME"

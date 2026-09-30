@@ -17,6 +17,19 @@ PII-матчер регистронезависимый, многоязычны�
 
 Нужен [Go](https://go.dev/dl/) не ниже версии из `go.mod`; при необходимости Go автоматически загрузит указанный toolchain. На новой машине достаточно один раз запустить `setup.ps1` — см. блок ниже.
 
+## Готовая сборка
+
+Готовый Windows-бинарник публикуется в разделе [Releases](https://github.com/khxmarka/2csv_converter/releases). Выпуск `v1.0.0` содержит `2csv_1.0.0_windows_amd64.exe` и `SHA256SUMS.txt`; последующие выпуски используют тот же формат имени со своей версией.
+
+Проверка SHA-256 в PowerShell:
+
+```powershell
+$File = ".\2csv_1.0.0_windows_amd64.exe"
+$Expected = (Get-Content .\SHA256SUMS.txt).Split(" ")[0]
+$Actual = (Get-FileHash $File -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($Actual -ne $Expected) { throw "SHA-256 не совпадает" }
+```
+
 ## Новое устройство
 
 Один раз в каталоге проекта. Политику выполнения меняем **только для текущего процесса**, не для всей машины:
