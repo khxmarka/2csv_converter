@@ -175,10 +175,17 @@ func BenchmarkRunParallelInputs(b *testing.B) {
 		{"txt", ".txt", "", "1\n"},
 	} {
 		b.Run("split-"+c.name, func(b *testing.B) {
+			const (
+				rows      = 1 << 20
+				threshold = rows - 1
+				chunkRows = rows / 2
+			)
+			restore := csvout.SetSplitLimits(threshold, chunkRows)
+			b.Cleanup(restore)
 			fixture := filepath.Join(b.TempDir(), "fixture")
 			for i := range 8 {
 				path := filepath.Join(fixture, c.name+"-"+strconv.Itoa(i), "big"+c.ext)
-				benchmarkWriteRows(b, path, c.header, c.row, csvout.SplitThreshold+1)
+				benchmarkWriteRows(b, path, c.header, c.row, rows)
 			}
 			benchmarkRunFixture(b, fixture, 8)
 		})

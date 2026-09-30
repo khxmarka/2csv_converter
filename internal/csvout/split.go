@@ -15,9 +15,9 @@ import (
 
 const (
 	// SplitThreshold is the maximum number of data records kept in one unsplit file.
-	SplitThreshold = 1_000_000
+	SplitThreshold = 4_000_000
 	// SplitChunkRows is the maximum number of data records in each split part.
-	SplitChunkRows = 500_000
+	SplitChunkRows = 2_000_000
 	// MaxRecordBytes bounds one logical CSV record to prevent unbounded allocation.
 	MaxRecordBytes = 64 << 20
 )

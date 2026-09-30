@@ -14,17 +14,24 @@ import (
 	"testing"
 )
 
+func TestSplitProductionLimits(t *testing.T) {
+	if SplitThreshold != 4_000_000 || SplitChunkRows != 2_000_000 {
+		t.Fatalf("split limits = %d/%d", SplitThreshold, SplitChunkRows)
+	}
+}
+
 func TestSplitExactThresholdUntouched(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rows.csv")
-	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", SplitThreshold)
+	const threshold = 4
+	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", threshold)
 	before := fileSHA(t, path)
 
-	res, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader)
+	res, err := splitFile(path, SplitWithHeader, threshold, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Split || res.DataRows != SplitThreshold {
+	if res.Split || res.DataRows != threshold {
 		t.Fatalf("split=%v rows=%d", res.Split, res.DataRows)
 	}
 	if fileSHA(t, path) != before {
@@ -39,31 +46,31 @@ func TestSplitExactThresholdUntouched(t *testing.T) {
 func TestSplitJustOverThreshold(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rows.csv")
-	const rows = SplitThreshold + 1
+	const rows = 5
 	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", rows)
 
-	res, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader)
+	res, err := splitFile(path, SplitWithHeader, 4, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !res.Split || res.DataRows != rows {
 		t.Fatalf("split=%v rows=%d", res.Split, res.DataRows)
 	}
-	assertPartData(t, res.Parts, SplitWithHeader, []int64{SplitChunkRows, SplitChunkRows, 1})
+	assertPartData(t, res.Parts, SplitWithHeader, []int64{2, 2, 1})
 	assertNoTemps(t, dir)
 }
 
-func TestSplit1200001Distribution(t *testing.T) {
+func TestSplitDistribution(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rows.csv")
-	const rows = 1_200_001
+	const rows = 9
 	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", rows)
 
-	res, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader)
+	res, err := splitFile(path, SplitWithHeader, 8, 4, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertPartData(t, res.Parts, SplitWithHeader, []int64{500_000, 500_000, 200_001})
+	assertPartData(t, res.Parts, SplitWithHeader, []int64{4, 4, 1})
 	for _, p := range res.Parts {
 		raw := readHead(t, p, len("\"id\"\n"))
 		if string(raw) != "\"id\"\n" {
@@ -512,9 +519,6 @@ func assertPartData(t *testing.T, parts []string, mode HeaderMode, want []int64)
 		}
 		if n != want[i] {
 			t.Fatalf("%s: строк %d, ожидалось %d", p, n, want[i])
-		}
-		if n > SplitChunkRows {
-			t.Fatalf("%s: кусок больше %d", p, SplitChunkRows)
 		}
 	}
 }

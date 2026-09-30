@@ -1643,13 +1643,16 @@ func TestTabularSQLWithInsertAndExcelSameRun(t *testing.T) {
 }
 
 func TestForeignCSVSplitLeavesSmallFileAndMarksFolder(t *testing.T) {
+	restore := csvout.SetSplitLimits(4, 2)
+	defer restore()
+
 	root := t.TempDir()
 	dir := filepath.Join(root, "Alpha")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	big := filepath.Join(dir, "big.csv")
-	writeRepeatedRows(t, big, "\"h\"\n", "\"a\"\n", csvout.SplitThreshold+1)
+	writeRepeatedRows(t, big, "\"h\"\n", "\"a\"\n", 5)
 	small := filepath.Join(dir, "small.csv")
 	const smallBody = "\"h\"\n\"b\"\n"
 	if err := os.WriteFile(small, []byte(smallBody), 0o644); err != nil {
