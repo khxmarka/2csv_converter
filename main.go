@@ -1,4 +1,3 @@
-// Команда 2csv: консольный конвертер INSERT-ов из .sql и листов Excel в CSV.
 package main
 
 import (

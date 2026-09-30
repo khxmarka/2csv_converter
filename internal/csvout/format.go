@@ -6,9 +6,8 @@ func encodeRow(cols []string) string {
 	return string(appendRow(nil, cols))
 }
 
-// appendRow дописывает к dst строку CSV по §6: все ячейки в кавычках, `"` →
-// `""`, LF. Байт '"' в UTF-8 не встречается внутри многобайтовых символов,
-// поэтому экранирование побайтовое.
+// appendRow writes a fully quoted CSV record with LF endings. Byte-wise quote
+// escaping is safe because '"' cannot occur inside a multibyte UTF-8 sequence.
 func appendRow(dst []byte, cols []string) []byte {
 	for i, c := range cols {
 		if i > 0 {

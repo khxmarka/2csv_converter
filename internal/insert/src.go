@@ -54,8 +54,8 @@ func (s *src) next() (byte, error) {
 	return b, nil
 }
 
-// plainRun — уже прочитанные в буфер байты до первого quote или '\\'.
-// Срез действителен до следующего чтения; сдвиг — через advance.
+// plainRun returns buffered bytes before the next quote or backslash. The slice
+// remains valid only until the next read and must be consumed with advance.
 func (s *src) plainRun(quote byte) []byte {
 	if s.br.Buffered() == 0 {
 		if _, err := s.br.Peek(1); err != nil {
@@ -73,7 +73,7 @@ func (s *src) plainRun(quote byte) []byte {
 	return buf[:end]
 }
 
-// advance пропускает chunk, только что полученный из plainRun.
+// advance consumes a chunk returned by plainRun.
 func (s *src) advance(chunk []byte) {
 	s.pos += int64(len(chunk))
 	s.line += bytes.Count(chunk, []byte{'\n'})
@@ -235,9 +235,8 @@ func (s *src) skipBlockCommentStrict() error {
 	}
 }
 
-// skipQuoted пропускает литерал. Обратный слэш экранирует и в '…', и в "…" —
-// так же, как readString при разборе ячеек: иначе сканер и парсер находят
-// конец statement в разных местах и следующий INSERT теряется.
+// skipQuoted skips a quoted literal. Backslash escaping matches cell parsing so
+// the scanner and parser agree on the statement boundary.
 func (s *src) skipQuoted(quote byte) error {
 	if _, err := s.next(); err != nil {
 		return err
@@ -269,8 +268,8 @@ func (s *src) skipQuoted(quote byte) error {
 
 const maxDollarTag = 64
 
-// dollarTag возвращает открывающий тег Postgres-строки ($$ или $tag$), если
-// с текущего байта начинается такой литерал. $1 и одиночный $ — не литерал.
+// dollarTag returns a Postgres dollar-quote opener such as $$ or $tag$.
+// Positional parameters and a lone dollar sign are not literals.
 func (s *src) dollarTag() (string, bool) {
 	for i := 1; i <= maxDollarTag; i++ {
 		c, ok := s.peekByte(i)
@@ -288,8 +287,8 @@ func (s *src) dollarTag() (string, bool) {
 	return "", false
 }
 
-// skipDollarQuoted пропускает $tag$…$tag$ целиком: тела функций Postgres
-// содержат INSERT, которые не являются данными дампа. Не литерал — один '$'.
+// skipDollarQuoted skips a complete Postgres dollar-quoted body so INSERT text
+// inside functions is not treated as dump data. A non-literal consumes one '$'.
 func (s *src) skipDollarQuoted() error {
 	tag, ok := s.dollarTag()
 	if !ok {
@@ -481,8 +480,7 @@ func (s *src) skipUntilSemicolon(stopAtStmt, strictComments bool) error {
 				return err
 			}
 		case identStart(b):
-			// Слово съедается целиком: '$' внутри имени (a$b$c) не должен
-			// открывать $$-литерал.
+			// Consume the whole word so '$' inside an identifier cannot open a literal.
 			word, _, err := s.peekUnquotedWord()
 			if err != nil {
 				return err

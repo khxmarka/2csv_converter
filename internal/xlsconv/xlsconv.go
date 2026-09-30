@@ -1,4 +1,4 @@
-// Package xlsconv читает листы Excel (.xlsx / .xls) и пишет CSV рядом с книгой (§13).
+// Package xlsconv converts XLSX and XLS worksheets to CSV beside each workbook.
 package xlsconv
 
 import "errors"

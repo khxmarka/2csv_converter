@@ -10,21 +10,21 @@ import (
 	"sync"
 )
 
-// Registry держит слоты склейки: ключ = (директория .sql, FileBase таблицы).
-// Слот сериализует первое создание файла и последующие дописывания.
+// Registry serializes initial publication and later appends for each
+// (SQL directory, table FileBase) merge key.
 type Registry struct {
 	mu    sync.Mutex
 	byKey map[string]*slot
 	byDir map[string]*sync.Mutex
-	// outs — CSV этого запуска по canonicalPath директории. Map, а не общий
-	// список: иначе каждый новый CSV сканировал бы все CSV запуска (O(n²)).
+	// outs indexes this run's CSV outputs by canonical directory path to avoid
+	// scanning every prior output for each new file.
 	outs map[string][]output
-	// written — canonicalPath каждого CSV, записанного в этом запуске.
+	// written tracks the canonical path of every CSV published in this run.
 	written map[string]struct{}
 }
 
-// ErrNameTaken — целевое имя уже занято CSV этого запуска от другого ключа.
-// Замена затёрла бы результат, исходник которого потом удаляется (§15).
+// ErrNameTaken reports that another key already owns the target path. Replacing
+// it could erase output whose successful source is later deleted.
 var ErrNameTaken = errors.New("имя CSV уже занято другим источником в этом запуске")
 
 type slot struct {
@@ -44,7 +44,7 @@ type output struct {
 	hasHeader bool
 }
 
-// Output — CSV, записанный в этом запуске.
+// Output describes a CSV published during the current run.
 type Output struct {
 	Path      string
 	HasHeader bool
@@ -91,7 +91,7 @@ func (r *Registry) acquire(dir, base string) *slot {
 	return s
 }
 
-// acquireUnique — отдельный слот без склейки INSERT. Имя файла сериализует lockDir.
+// acquireUnique reserves a non-merge output path under the directory lock.
 func (r *Registry) acquireUnique() *slot {
 	s := new(slot)
 	s.mu.Lock()
@@ -126,7 +126,7 @@ func (r *Registry) isWritten(path string) bool {
 	return ok
 }
 
-// OutputsIn возвращает CSV, которые этот запуск записал в dir.
+// OutputsIn returns CSV files published in dir during this run.
 func (r *Registry) OutputsIn(dir string) []Output {
 	if r == nil {
 		return nil

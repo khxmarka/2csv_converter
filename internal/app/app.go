@@ -1,4 +1,4 @@
-// Package app — сценарий запуска. CLI только разбирает флаги.
+// Package app orchestrates discovery, conversion, splitting, and persistent state.
 package app
 
 import (
@@ -14,17 +14,17 @@ import (
 	"sql2csv/internal/scan"
 )
 
-// Result — итог запуска после записи списков состояний.
+// Result summarizes a run after persistent stage lists have been updated.
 type Result struct {
 	Scan        scan.Result
 	InsertOK    int
 	InsertSkip  int
 	CSV         int
 	FilesFail   int
-	SuccessTops []string // верхние папки, попавшие в _convert_done_ или _splitter_done_
+	SuccessTops []string // Top-level folders added to a done list.
 }
 
-// Run проверяет корень, находит .sql/.xlsx/.xls/.csv, пишет CSV рядом с исходниками и нарезает большие CSV.
+// Run processes supported files below root and writes results beside their sources.
 func Run(log *logx.Logger, root string) (Result, error) {
 	var empty Result
 	if err := scan.ValidateRoot(root); err != nil {
@@ -42,7 +42,7 @@ func Run(log *logx.Logger, root string) (Result, error) {
 	lists := readLists(log, root)
 	convSkip := union(lists[marks.ConvertDone], lists[marks.ConvertPassed])
 	splitSkip := union(lists[marks.SplitDone], lists[marks.SplitPassed])
-	// Папку целиком не открываем, только если оба этапа для неё закрыты.
+	// A folder is skipped entirely only after both independent stages are complete.
 	found, err := scan.FindSkipping(root, intersect(convSkip, splitSkip))
 	if err != nil {
 		return empty, err
@@ -82,8 +82,8 @@ func Run(log *logx.Logger, root string) (Result, error) {
 	return out, nil
 }
 
-// openLogFile дописывает лог запуска в {корень}\_log.txt с заголовком
-// времени. Не открылся — работа идёт, лог только в консоли.
+// openLogFile appends a timestamped run to root\_log.txt. Failure leaves
+// console logging available and does not stop processing.
 func openLogFile(log *logx.Logger, root string) (closeFn func()) {
 	path := filepath.Join(root, marks.LogName)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -101,7 +101,7 @@ func openLogFile(log *logx.Logger, root string) (closeFn func()) {
 	}
 }
 
-// readLists читает списки состояний. Нечитаемый список — пустой, с ошибкой.
+// readLists loads persistent stage state. An unreadable list is returned as empty with its error.
 func readLists(log *logx.Logger, root string) map[marks.List]map[string]struct{} {
 	out := make(map[marks.List]map[string]struct{}, len(marks.Lists))
 	for _, l := range marks.Lists {

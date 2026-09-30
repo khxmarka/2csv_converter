@@ -8,33 +8,29 @@ import (
 	"os"
 )
 
-// dataMemLimit — сколько байт строк одного INSERT держать в памяти. Типичный
-// INSERT (одна строка или пачка mysqldump) целиком в памяти: без временного
-// файла на каждый INSERT. Больше — выгрузка во временный файл (§9).
+// dataMemLimit keeps typical INSERT batches in memory and spills larger batches
+// to a temporary file, avoiding one file per small INSERT.
 const dataMemLimit = 1 << 20
 
-// DataFile — строки данных одного INSERT, без заголовка, уже в формате §6.
-// Строки хранятся без дополнения: ширину ключа (§6) применяет CommitPrepared.
-// Ячейку можно писать потоком (BeginRow/Write*Cell/EndRow): огромное значение
-// не собирается в памяти, а после dataMemLimit уходит во временный файл.
+// DataFile stages CSV-formatted rows for one INSERT without a header or width
+// padding. Cells can be streamed so large values do not need to fit in memory;
+// data exceeding dataMemLimit spills to disk.
 type DataFile struct {
 	dir     string
 	mem     bytes.Buffer
 	f       *os.File
 	buf     *bufio.Writer
-	size    int64 // байт строк записано (память + файл)
+	size    int64 // Row bytes staged in memory and on disk.
 	scratch []byte
 	rows    int
-	// Ширина первой, самой узкой и самой широкой строки: по ним Commit
-	// решает, копировать байты как есть или перечитывать строки.
+	// Row widths let Commit choose between direct copying and record normalization.
 	first, minCells, maxCells int
 	rowMark                   int64
 	rowCells                  int
-	esc                       quoteEscaper // готовый io.Writer: без упаковки на каждую ячейку
+	esc                       quoteEscaper // Reused writer avoids wrapping every cell.
 }
 
-// CreateData готовит приёмник строк. Временный файл в dir появится, только
-// если строки не поместятся в dataMemLimit.
+// CreateData prepares row staging and creates a temporary file in dir only after spilling.
 func CreateData(dir string) *DataFile {
 	d := &DataFile{dir: dir}
 	d.esc.d = d
@@ -48,8 +44,8 @@ func (d *DataFile) Rows() int {
 	return d.rows
 }
 
-// Row пишет одну строку данных как есть. Пустая строка VALUES () становится
-// одной пустой ячейкой: пустую запись CSV-ридер при Commit пропустил бы.
+// Row stages one record. An empty VALUES tuple becomes one empty cell because an
+// empty CSV record would otherwise be skipped during Commit.
 func (d *DataFile) Row(values []string) error {
 	if len(values) == 0 {
 		values = []string{""}
@@ -62,20 +58,19 @@ func (d *DataFile) Row(values []string) error {
 	return nil
 }
 
-// BeginRow начинает потоковую строку; RollbackRow вернёт данные к этой точке.
+// BeginRow starts a streamed record and saves the rollback position.
 func (d *DataFile) BeginRow() error {
 	d.rowMark = d.size
 	d.rowCells = 0
 	return nil
 }
 
-// WriteNullCell пишет пустую ячейку "" (NULL и пропуск, §6).
+// WriteNullCell writes an empty quoted cell for NULL or a missing value.
 func (d *DataFile) WriteNullCell() error {
 	return d.WriteTextCellStream(func(io.Writer) error { return nil })
 }
 
-// WriteTextCellStream пишет ячейку, чей текст write отдаёт кусками;
-// кавычки экранируются на лету (§6).
+// WriteTextCellStream writes cell text in chunks while escaping quotes incrementally.
 func (d *DataFile) WriteTextCellStream(write func(io.Writer) error) error {
 	if d.rowCells > 0 {
 		if err := d.write([]byte{','}); err != nil {
@@ -95,7 +90,7 @@ func (d *DataFile) WriteTextCellStream(write func(io.Writer) error) error {
 	return nil
 }
 
-// EndRow завершает потоковую строку.
+// EndRow commits the current streamed record to staged data.
 func (d *DataFile) EndRow() error {
 	n := d.rowCells
 	if n == 0 {
@@ -111,7 +106,7 @@ func (d *DataFile) EndRow() error {
 	return nil
 }
 
-// RollbackRow отбрасывает начатую строку (лишние значения, битый литерал).
+// RollbackRow discards the current record after a surplus value or malformed literal.
 func (d *DataFile) RollbackRow() error {
 	d.rowCells = 0
 	if d.f == nil {
@@ -132,8 +127,8 @@ func (d *DataFile) RollbackRow() error {
 	return nil
 }
 
-// quoteEscaper удваивает '"' внутри ячейки. Байт '"' в UTF-8 не встречается
-// внутри многобайтовых символов, поэтому куски можно резать где угодно.
+// quoteEscaper doubles quotes. Chunk boundaries are safe because '"' cannot
+// occur inside a multibyte UTF-8 sequence.
 type quoteEscaper struct{ d *DataFile }
 
 func (q *quoteEscaper) Write(p []byte) (int, error) {
@@ -190,7 +185,7 @@ func (d *DataFile) spill() error {
 	return err
 }
 
-// Finish сбрасывает буфер временного файла, если он есть.
+// Finish flushes spilled data when a temporary file exists.
 func (d *DataFile) Finish() error {
 	if d == nil || d.f == nil {
 		return nil
@@ -201,7 +196,7 @@ func (d *DataFile) Finish() error {
 	return d.f.Sync()
 }
 
-// open отдаёт записанные строки с начала.
+// open returns staged rows from the beginning.
 func (d *DataFile) open() (io.Reader, error) {
 	if d.f == nil {
 		return bytes.NewReader(d.mem.Bytes()), nil
@@ -212,7 +207,7 @@ func (d *DataFile) open() (io.Reader, error) {
 	return bufio.NewReaderSize(d.f, 256*1024), nil
 }
 
-// Abort освобождает память и удаляет временный файл, если он был.
+// Abort releases staged data and removes its temporary file, if any.
 func (d *DataFile) Abort() {
 	if d == nil {
 		return
@@ -226,11 +221,10 @@ func (d *DataFile) Abort() {
 	}
 }
 
-// CommitPrepared вливает подготовленные строки данных в ключ склейки.
-// Заголовок берётся из columns только если это первый успешный INSERT ключа.
-// Строки шире ключа пропускаются по одной (§6), их число — Result.SkippedRows.
-// Если не осталось ни одной строки — CSV не трогается, ErrTooManyValues.
-// Если все строки ровно по ширине ключа, байты копируются без повторного разбора.
+// CommitPrepared merges staged rows into a key. columns becomes the header only
+// for the first successful INSERT. Rows wider than the established width are
+// skipped individually; if none remain, the output stays unchanged and
+// ErrTooManyValues is returned. Uniform rows are copied without reparsing.
 func CommitPrepared(reg *Registry, dir, table string, columns []string, data *DataFile) (Result, error) {
 	var empty Result
 	base := limitCSVBase(FileBase(table))
@@ -258,8 +252,7 @@ func CommitPrepared(reg *Registry, dir, table string, columns []string, data *Da
 	if err != nil {
 		return empty, err
 	}
-	// newWriter держит слот. Паника или выход без Commit/Abort оставили бы
-	// ключ заблокированным навсегда — следующая запись в таблицу зависла бы.
+	// newWriter owns the slot; ensure panic or early return cannot leave the key locked.
 	defer func() { _ = w.Abort() }()
 	if w.nCol == 0 {
 		w.nCol = data.first
@@ -280,10 +273,9 @@ func CommitPrepared(reg *Registry, dir, table string, columns []string, data *Da
 	return res, err
 }
 
-// CommitPlain публикует таблицу листа: header — первая строка, data —
-// остальные. Ширина = максимум колонок среди шапки и строк (§13), всё
-// короче дополняется "" . Ширина известна только после всех строк, поэтому
-// лист читается один раз в data, а шапка дописывается в конце.
+// CommitPlain publishes a tabular sheet. The output width is the widest header
+// or data row, and shorter rows are padded with empty cells. Because the width
+// is known only after reading the sheet, data is staged before writing the header.
 func CommitPlain(reg *Registry, dir, base string, header []string, data *DataFile) (Result, error) {
 	var empty Result
 	width := len(header)
@@ -316,9 +308,8 @@ func padTo(row []string, n int) []string {
 	return out
 }
 
-// copyRows переносит строки data в dst по ширине width. Все строки ровно
-// width — байты как есть. Иначе строки перечитываются: короче — дополняются
-// пустыми ячейками, шире — пропускаются (skipped).
+// copyRows writes staged records at width. Uniform records are copied directly;
+// shorter records are padded and wider records are skipped.
 func copyRows(dst io.Writer, src io.Reader, width int, data *DataFile) (wrote, skipped int, err error) {
 	if data.minCells == width && data.maxCells == width {
 		_, err := io.Copy(dst, src)

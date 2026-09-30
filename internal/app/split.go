@@ -10,8 +10,7 @@ import (
 	"sql2csv/internal/scan"
 )
 
-// splitWritten режет CSV, записанные этим запуском в dir. Возвращает, была
-// ли ошибка и нарезан ли хоть один файл.
+// splitWritten splits CSV files produced in dir during this run.
 func splitWritten(log *logx.Logger, reg *csvout.Registry, dir string) (failed, split bool) {
 	for _, out := range reg.OutputsIn(dir) {
 		mode := csvout.SplitNoHeader
@@ -50,8 +49,8 @@ func splitDirFiles(
 	}
 }
 
-// splitForeignCSV режет лежавший заранее файл: .csv — с шапкой из первой
-// непустой строки (§14), .txt — построчно, без шапки и без CSV-кавычек.
+// splitForeignCSV splits a pre-existing CSV using its first non-empty record as
+// the header. Text files are split by line without CSV quote semantics.
 func splitForeignCSV(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) fileOutcome {
 	mode := csvout.SplitWithHeader
 	if file.Kind == scan.KindTXT {
