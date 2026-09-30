@@ -1,4 +1,4 @@
-// Package scan проверяет корень и находит рабочие файлы (§3 политики).
+// Package scan validates an input root and discovers supported files.
 package scan
 
 import (
@@ -12,7 +12,7 @@ import (
 	"sql2csv/internal/marks"
 )
 
-// Kind — тип рабочего файла.
+// Kind identifies a supported input file type.
 type Kind int
 
 const (
@@ -20,29 +20,27 @@ const (
 	KindXLSX
 	KindXLS
 	KindCSV
-	// KindTXT — .txt только для построчной нарезки (readme.txt и служебные
-	// списки программы исключены).
+	// KindTXT marks text files for line-based splitting only.
 	KindTXT
 )
 
-// SQLFile — найденный .sql / .xlsx / .xls / .csv / .txt и его место в дереве относительно корня.
+// SQLFile describes a discovered input and its location relative to the root.
 type SQLFile struct {
 	Path string
 	Kind Kind
 
-	// TopFolder — первый сегмент пути относительно корня.
-	// Пусто для файлов, лежащих прямо в корне: они обрабатываются при
-	// каждом запуске и в списки состояний не попадают.
+	// TopFolder is the first path segment below the root. It is empty for files
+	// stored directly in the root, which are processed on every run.
 	TopFolder string
 }
 
-// IsExcel — книга .xlsx или .xls.
+// IsExcel reports whether the input is an XLSX or XLS workbook.
 func (f SQLFile) IsExcel() bool { return f.Kind == KindXLSX || f.Kind == KindXLS }
 
-// IsCSV — файл только для нарезки: .csv или .txt, конвертировать нечего.
+// IsCSV reports whether the input is handled only by the splitting stage.
 func (f SQLFile) IsCSV() bool { return f.Kind == KindCSV || f.Kind == KindTXT }
 
-// Skip — единица, пропущенная при обходе: symlink или недоступный каталог.
+// Skip describes an inaccessible entry or a link rejected during discovery.
 type Skip struct {
 	Path             string
 	Reason           string
@@ -50,14 +48,14 @@ type Skip struct {
 	BlocksCompletion bool
 }
 
-// Result — итог обхода: найденные файлы (отсортированы по пути) и пропуски.
+// Result contains path-sorted inputs and blocking discovery skips.
 type Result struct {
 	Files   []SQLFile
 	Skips   []Skip
 	TopDirs []string
 }
 
-// ValidateRoot проверяет, что корень существует и является директорией.
+// ValidateRoot verifies that root exists and is a directory.
 func ValidateRoot(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -125,7 +123,7 @@ func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 		top, err := topFolder(root, path)
 		if err != nil {
 			res.Skips = append(res.Skips, Skip{Path: path, Reason: err.Error()})
-			return nil //nolint:nilerr // ошибка файла — пропуск в Skips, обход продолжается (§8)
+			return nil //nolint:nilerr // The error is recorded in Skips so discovery can continue.
 		}
 		res.Files = append(res.Files, SQLFile{Path: path, Kind: kind, TopFolder: top})
 		return nil
@@ -140,7 +138,7 @@ func FindSkipping(root string, completed map[string]struct{}) (Result, error) {
 	return res, nil
 }
 
-// isCompletedTop: completed уже приведён marks.FoldSet, поиск — O(1).
+// isCompletedTop expects completed to contain FoldSet keys for constant-time lookup.
 func isCompletedTop(root, path string, completed map[string]struct{}) bool {
 	if len(completed) == 0 {
 		return false
@@ -182,13 +180,12 @@ func skipTopFolder(root, path string, isDir bool) string {
 	return parts[0]
 }
 
-// isLink отсекает symlink-и и прочие reparse point-ы Windows (junction, mount point).
+// isLink rejects symbolic links and Windows reparse points such as junctions and mount points.
 func isLink(mode fs.FileMode) bool {
 	return mode&(fs.ModeSymlink|fs.ModeIrregular) != 0
 }
 
-// IsIgnored — файл не обрабатывается ни на какой глубине: readme.txt и
-// служебные файлы программы (_log.txt, _*_done_.txt, _*_passed_.txt).
+// IsIgnored reports whether a file is metadata or application state at any depth.
 func IsIgnored(base string) bool {
 	return strings.EqualFold(base, "readme.txt") || marks.IsService(base)
 }

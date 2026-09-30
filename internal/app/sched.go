@@ -9,8 +9,8 @@ import (
 	"sql2csv/internal/scan"
 )
 
-// dirWork — одна директория. top меньше у той верхней папки, которая встретилась раньше:
-// её INSERT забирают раньше, и её директории открываются раньше других папок.
+// dirWork groups one directory. Lower top values preserve discovery order so
+// earlier top-level folders submit INSERT work and open directories first.
 type dirWork struct {
 	top   int
 	group []scan.SQLFile
@@ -35,7 +35,7 @@ func (h jobHeap) Less(i, j int) bool {
 
 func (h jobHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
-func (h *jobHeap) Push(x any) { *h = append(*h, x.(schedJob)) } //nolint:forcetypeassert // container/heap: в кучу кладём только schedJob
+func (h *jobHeap) Push(x any) { *h = append(*h, x.(schedJob)) } //nolint:forcetypeassert // Only schedJob values enter this heap.
 
 func (h *jobHeap) Pop() any {
 	old := *h
@@ -45,9 +45,8 @@ func (h *jobHeap) Pop() any {
 	return item
 }
 
-// runner — один пул на весь запуск.
-// Свободный воркер открывает следующую директорию только когда в очереди нет готового INSERT.
-// В одной директории по-прежнему один .sql за раз.
+// runner owns one pool for the entire run. A free worker opens another directory
+// only when no INSERT is ready, and each directory still processes one SQL file at a time.
 type runner struct {
 	mu        sync.Mutex
 	cond      *sync.Cond
@@ -160,7 +159,7 @@ func (r *runner) worker() {
 			r.mu.Unlock()
 			return
 		}
-		item := heap.Pop(&r.jobs).(schedJob) //nolint:forcetypeassert // container/heap: в куче только schedJob
+		item := heap.Pop(&r.jobs).(schedJob) //nolint:forcetypeassert // Only schedJob values enter this heap.
 		if len(r.jobs) == 0 {
 			r.fillLocked()
 		}

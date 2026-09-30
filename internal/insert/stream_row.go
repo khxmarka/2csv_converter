@@ -6,8 +6,8 @@ import (
 	"strings"
 )
 
-// emitRow разбирает одну tuple (...) и отдаёт ячейки в cw.
-// maxCells > 0: лишние значения дочитываются и возвращается ErrRowSurplus.
+// emitRow parses one tuple into cw. When maxCells is positive, surplus values
+// are consumed before ErrRowSurplus is returned.
 func emitRow(s *src, cw CellWriter, maxCells int) error {
 	if err := s.skipSpaceAndComments(); err != nil {
 		return err
@@ -105,8 +105,8 @@ func emitValue(s *src, cw CellWriter) error {
 			return streamStringContent(s, b, w)
 		})
 	case 'N', 'n', 'E', 'e':
-		// N'…' (MSSQL, Unicode) и E'…' (Postgres) — тот же строковый литерал,
-		// префикс в ячейку не идёт. NOW(), NULL и прочие слова — не литерал.
+		// MSSQL N'…' and Postgres E'…' use ordinary string contents without the
+		// prefix. Other words such as NOW() and NULL are not string literals.
 		if q, ok := s.peekByte(1); ok && q == '\'' {
 			_, _ = s.next()
 			return cw.Text(func(w io.Writer) error {
@@ -126,7 +126,7 @@ func emitValue(s *src, cw CellWriter) error {
 		return cw.Null()
 	}
 
-	// Сырые значения (числа, выражения) короткие — буфер допустим.
+	// Raw numbers and expressions are expected to be short enough to buffer.
 	text, err := readRawValue(s)
 	if err != nil {
 		return err
@@ -140,8 +140,7 @@ func emitValue(s *src, cw CellWriter) error {
 	})
 }
 
-// discardCells — CellWriter для лишних значений строки: разбирает и выбрасывает,
-// не держа текст в памяти.
+// discardCells consumes surplus row values without retaining their text.
 type discardCells struct{}
 
 func (discardCells) Null() error    { return nil }
@@ -154,16 +153,15 @@ func skipValue(s *src) error {
 	return emitValue(s, discardCells{})
 }
 
-// streamStringContent читает SQL-строку (открывающая кавычка ещё не съедена)
-// и пишет декодированное содержимое в w.
+// streamStringContent decodes an SQL string whose opening quote has not yet been consumed.
 func streamStringContent(s *src, quote byte, w io.Writer) error {
 	if _, err := s.next(); err != nil {
 		return err
 	}
 	var one [1]byte
 	for {
-		// Обычный текст до кавычки или '\\' копируется из буфера одним куском:
-		// побайтовая запись через writer-цепочку в разы медленнее.
+		// Copy plain runs in chunks because byte-at-a-time writes through the writer
+		// chain are substantially slower.
 		if chunk := s.plainRun(quote); len(chunk) > 0 {
 			if _, err := w.Write(chunk); err != nil {
 				return err

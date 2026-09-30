@@ -13,12 +13,11 @@ type fileOutcome struct {
 	piiSkip     int
 	unitFail    int
 	splitFail   bool
-	split       bool // лежавший .csv/.txt нарезан
+	split       bool // A pre-existing CSV or text file was split.
 }
 
-// producedCSV — исходник можно удалить (§15): CSV получен и ни одна единица
-// файла не провалилась. Иначе удаление унесло бы INSERT или лист, которые
-// в CSV не попали (ошибка записи, лишние значения, занятое имя).
+// producedCSV permits source deletion only when output exists and every unit
+// succeeded. Otherwise deletion could discard an INSERT or sheet missing from CSV.
 func producedCSV(out fileOutcome) bool {
 	if out.writeErr != nil || out.failed || out.unitFail > 0 {
 		return false

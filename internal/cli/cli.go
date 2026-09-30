@@ -1,4 +1,4 @@
-// Package cli разбирает аргументы командной строки и вызывает app.
+// Package cli parses command-line arguments and runs the application.
 package cli
 
 import (
@@ -20,7 +20,7 @@ const (
 	exitPartial = 3
 )
 
-// Run выполняет запуск и возвращает код выхода процесса.
+// Run executes the command and returns its process exit code.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("2csv", flag.ContinueOnError)
 	flags.SetOutput(stderr)

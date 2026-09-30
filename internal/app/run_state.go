@@ -41,14 +41,13 @@ type accumulator struct {
 	log        *logx.Logger
 	root       string
 	byTop      map[string]*topAcc
-	// convSkip/splitSkip — верхние папки (ключи marks.Fold), уже записанные
-	// в списки конверта/нарезки: этот этап для них не выполняется.
+	// convSkip and splitSkip contain Fold keys already persisted for each stage.
 	convSkip  map[string]struct{}
 	splitSkip map[string]struct{}
 }
 
-// phases — какие этапы идут для верхней папки. Файлы прямо в корне
-// в списки не пишутся и обрабатываются каждый запуск.
+// phases selects stages for a top-level folder. Root-level files are never
+// persisted in stage lists and therefore run every time.
 func (a *accumulator) phases(topFolder string) (convert, split bool) {
 	if topFolder == "" {
 		return true, true
@@ -76,7 +75,7 @@ type topAcc struct {
 	sqlN        int
 	excelN      int
 	splitFail   bool
-	// splitDone — нарезан хотя бы один файл (свежий CSV или лежавший .csv/.txt).
+	// splitDone means at least one new or pre-existing CSV/text file was split.
 	splitDone bool
 	sources   []string
 }
@@ -132,7 +131,7 @@ func (st *topAcc) failReason() string {
 func (a *accumulator) start(file scan.SQLFile) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	// Папка уже в одном из списков — в строку прогресса не выводится.
+	// Folders already present in a stage list stay out of transient progress.
 	if convert, split := a.phases(file.TopFolder); !convert || !split {
 		return
 	}
@@ -161,7 +160,7 @@ func (a *accumulator) finishFiles(files []scan.SQLFile) {
 	}
 }
 
-// markSplit учитывает нарезку CSV, записанных этим запуском в директории.
+// markSplit records splitting of CSV files produced in dir during this run.
 func (a *accumulator) markSplit(file scan.SQLFile, failed, split bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -259,7 +258,7 @@ func (a *accumulator) finishTopLocked(key, name, topFolder string) {
 	}
 	say, sayErr := a.log.Linef, a.log.Errorf
 	if !convert || !split {
-		// Папка уже в одном из списков: итог только в _log.txt.
+		// Persisted folders report their summary only in _log.txt.
 		say, sayErr = a.log.FileLinef, a.log.FileErrorf
 	}
 	if st.splitFail {
@@ -340,15 +339,15 @@ func (a *accumulator) refreshHang() {
 	const prefix = "папка в обработке: "
 	line := prefix + strings.Join(parts, ", ")
 	if logx.DisplayWidth(line) > logx.HangWidth {
-		// §8: все не влезают — самая давняя. Строка длиннее экрана переносится,
-		// и \r затирает только её хвост: каждую секунду в консоли мусор.
+		// When all active folders do not fit, show the oldest one. Truncation keeps
+		// carriage-return updates on one terminal line instead of leaving fragments.
 		oldest := slices.MinFunc(folders, func(x, y activeFolder) int { return x.start.Compare(y.start) })
 		line = truncateWidth(prefix+label(oldest), logx.HangWidth)
 	}
 	a.log.Hang(line)
 }
 
-// truncateWidth обрезает s до width колонок, заменяя хвост на «…».
+// truncateWidth truncates s to width terminal columns and replaces its tail with an ellipsis.
 func truncateWidth(s string, width int) string {
 	if logx.DisplayWidth(s) <= width {
 		return s

@@ -41,8 +41,8 @@ var sqlStartWords = map[string]struct{}{
 	"EXECUTE":  {},
 	"MERGE":    {},
 	"USE":      {},
-	// START/COMMIT/ROLLBACK сюда не входят: «Start Date» — обычная шапка,
-	// а «COMMIT;» отсекает pickTableHeader по пустому хвосту после ';'.
+	// Transaction keywords are intentionally excluded: "Start Date" may be a
+	// header, while pickTableHeader rejects "COMMIT;" by its empty suffix.
 	"PRAGMA":   {},
 	"DECLARE":  {},
 	"IF":       {},
@@ -79,8 +79,8 @@ func sniffTable(f *os.File) (*tableHeader, *bufio.Reader, error) {
 		return nil, nil, err
 	}
 	for {
-		// ReadSlice, а не ReadString: однострочный дамп на гигабайты не должен
-		// попасть в память целиком (§2). Шапка длиннее буфера — это не шапка.
+		// ReadSlice prevents a multi-gigabyte single-line dump from being loaded in
+		// memory. A candidate longer than the buffer is not treated as a header.
 		raw, err := r.ReadSlice('\n')
 		if err == bufio.ErrBufferFull {
 			return nil, nil, nil
@@ -138,7 +138,7 @@ func looksLikeSQL(line string) bool {
 		if !ok {
 			return false
 		}
-		// Слово перед запятой — имя колонки шапки (desc,email), не оператор.
+		// A word followed by a comma is a header column, not an SQL statement.
 		if strings.HasPrefix(rest, ",") {
 			return false
 		}
@@ -172,9 +172,8 @@ func nextWord(s string) (word, rest string, ok bool) {
 	return s[:i], s[i:], true
 }
 
-// pickTableHeader считает только непустые поля: у «PRAGMA x=1;» после ';'
-// пустой хвост, это не вторая колонка. Пустое имя внутри шапки (индекс pandas)
-// остаётся колонкой.
+// pickTableHeader counts non-empty fields so a trailing delimiter in a statement
+// does not create a false second column. Empty fields inside a header still count.
 func pickTableHeader(line string) (*tableHeader, bool) {
 	bestN := 1
 	var best *tableHeader
@@ -226,20 +225,19 @@ func splitFields(line string, delim rune) ([]string, error) {
 	return out, nil
 }
 
-// maxTableRecord — предел склейки строк с незакрытой кавычкой. Поле в кавычках
-// может содержать перевод строки, но одна битая кавычка не должна съесть файл.
+// maxTableRecord bounds joining lines for a quoted field so one unmatched quote
+// cannot consume the rest of the file.
 const maxTableRecord = 1 << 20
 
-// tableReader отдаёт записи табличного .sql без перевода строки в конце.
-// Строка с нечётным числом кавычек склеивается со следующими, пока кавычки
-// не закроются. Не закрылись до maxTableRecord или EOF — запись только из
-// первой строки (она битая), прочитанные вперёд строки идут в разбор снова.
+// tableReader returns tabular SQL records without trailing line endings. Lines
+// with unmatched quotes are joined until closed. If the record exceeds
+// maxTableRecord or reaches EOF, only the first line is rejected and lookahead
+// lines are replayed.
 type tableReader struct {
 	r       *bufio.Reader
 	pending []string
-	// noJoin — сколько строк из pending отдать без склейки: они уже были
-	// хвостом неудачной склейки. Без этого файл, где кавычка нечётна в каждой
-	// строке, читался бы вперёд на maxTableRecord от каждой строки.
+	// noJoin counts lookahead lines to replay without joining. This avoids
+	// quadratic rescanning when every line contains an unmatched quote.
 	noJoin int
 	eof    bool
 }
@@ -354,8 +352,7 @@ func convertTable(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, h *t
 		}
 		wrote++
 	}
-	// Одна строка на файл, а не на каждую битую строку: иначе большой
-	// табличный дамп затапливает консоль (§8).
+	// Report malformed records once per file to avoid flooding the console.
 	if bad := badParse + tooMany; bad > 0 {
 		out.Skipped += bad
 		out.UnitFail += bad

@@ -1,4 +1,4 @@
-// Генератор ручных фикстур Excel. Из корня репозитория:
+// Generate manual Excel fixtures from the repository root:
 //
 //	go run ./testfiles/09_excel
 package main

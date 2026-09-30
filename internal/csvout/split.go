@@ -14,45 +14,45 @@ import (
 )
 
 const (
-	// SplitThreshold — максимум строк данных в одном файле без нарезки.
+	// SplitThreshold is the maximum number of data records kept in one unsplit file.
 	SplitThreshold = 1_000_000
-	// SplitChunkRows — максимум строк данных в одном куске после нарезки.
+	// SplitChunkRows is the maximum number of data records in each split part.
 	SplitChunkRows = 500_000
-	// MaxRecordBytes — потолок одной CSV-записи при нарезке (защита от OOM).
+	// MaxRecordBytes bounds one logical CSV record to prevent unbounded allocation.
 	MaxRecordBytes = 64 << 20
 )
 
-// ErrRecordTooLarge — одна запись CSV длиннее MaxRecordBytes.
+// ErrRecordTooLarge reports a logical CSV record exceeding MaxRecordBytes.
 var ErrRecordTooLarge = errors.New("запись CSV длиннее допустимого")
 
-// HeaderMode задаёт, есть ли в CSV строка заголовка.
+// HeaderMode defines record and header semantics for splitting.
 type HeaderMode int
 
 const (
-	// SplitNoHeader — все записи файла являются данными (INSERT без списка колонок).
+	// SplitNoHeader treats every CSV record as data.
 	SplitNoHeader HeaderMode = iota
-	// SplitWithHeader — первая непустая запись является заголовком и копируется в каждый кусок.
+	// SplitWithHeader copies the first non-empty record to every part.
 	SplitWithHeader
-	// SplitLines — .txt: запись = строка, шапки нет, кавычки — обычные символы.
+	// SplitLines treats each text line as data and quotes as ordinary characters.
 	SplitLines
 )
 
-// SplitResult — итог нарезки одного файла.
+// SplitResult describes the outcome of splitting one file.
 type SplitResult struct {
 	Split    bool
 	DataRows int64
-	// Parts — пути кусков в порядке записи. Заполнен только когда Split.
+	// Parts contains published part paths in order and is populated only when Split is true.
 	Parts []string
 }
 
-// Порог боя. Тесты подменяют его через SetSplitLimits и обязаны вернуть прежние значения.
+// Tests may temporarily replace production limits through SetSplitLimits.
 var (
 	splitLimitThreshold = SplitThreshold
 	splitLimitChunk     = SplitChunkRows
 	splitLimitRecord    = MaxRecordBytes
 )
 
-// SetSplitLimits подменяет порог и размер куска до вызова restore.
+// SetSplitLimits replaces split limits until the returned restore function is called.
 func SetSplitLimits(threshold, chunkRows int) (restore func()) {
 	prevT, prevC := splitLimitThreshold, splitLimitChunk
 	splitLimitThreshold, splitLimitChunk = threshold, chunkRows
@@ -61,21 +61,21 @@ func SetSplitLimits(threshold, chunkRows int) (restore func()) {
 	}
 }
 
-// SetMaxRecordBytes подменяет потолок записи для тестов.
+// SetMaxRecordBytes replaces the logical record limit until restore is called.
 func SetMaxRecordBytes(n int) (restore func()) {
 	prev := splitLimitRecord
 	splitLimitRecord = n
 	return func() { splitLimitRecord = prev }
 }
 
-// SplitIfNeeded режет path, если строк данных больше SplitThreshold, но часть
-// не может занять CSV, который этот запуск записал для другого ключа (таблица
-// users_2 при нарезке users): такая нарезка — ошибка, монолит остаётся как был.
+// SplitIfNeeded splits path when its data count exceeds SplitThreshold. A part
+// cannot replace an output owned by another key in the same run; on collision,
+// the original file remains unchanged.
 func (r *Registry) SplitIfNeeded(path string, mode HeaderMode) (SplitResult, error) {
 	return splitFile(path, mode, splitLimitThreshold, splitLimitChunk, r.isWritten)
 }
 
-// taken — занятые имена частей; nil — занятых нет.
+// taken contains part names already owned by outputs from this run.
 func splitFile(path string, mode HeaderMode, threshold, chunkRows int, taken func(string) bool) (SplitResult, error) {
 	if threshold < 1 || chunkRows < 1 {
 		return SplitResult{}, fmt.Errorf("csvout: неверный порог нарезки")
@@ -121,8 +121,8 @@ func rejectSplitPath(path string, mode HeaderMode) error {
 
 var errNeedSplit = errors.New("csvout: нужно нарезать")
 
-// countDataRowsUntil считает строки данных. Если limit ≥ 0, останавливается
-// сразу после limit+1 — для решения «резать / не резать» весь файл читать не нужно.
+// countDataRowsUntil stops after limit+1 data records when limit is non-negative,
+// avoiding a full scan when only the split decision is needed.
 func countDataRowsUntil(path string, mode HeaderMode, limit int64) (int64, bool, error) {
 	var n int64
 	err := walkRecords(path, mode, func(_ []byte, header bool) error {
@@ -144,9 +144,8 @@ func countDataRowsUntil(path string, mode HeaderMode, limit int64) (int64, bool,
 	return n, false, nil
 }
 
-// walkRecords отдаёт заголовок и строки данных. Пустые хвостовые записи не отдаёт.
-// Записи до первой непустой в режиме заголовка тоже пропускаются.
-// Срез rec действителен только на время вызова fn.
+// walkRecords emits the header and data records while omitting leading empty
+// records before a header and empty trailing records. rec is valid only during fn.
 func walkRecords(path string, mode HeaderMode, fn func(rec []byte, header bool) error) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -194,7 +193,7 @@ func walkRecords(path string, mode HeaderMode, fn func(rec []byte, header bool) 
 type recordReader struct {
 	br  *bufio.Reader
 	buf []byte
-	// plain — кавычки не открывают поле: запись кончается на первом '\n'.
+	// Plain-text mode ends records at newline and does not interpret quotes.
 	plain bool
 }
 

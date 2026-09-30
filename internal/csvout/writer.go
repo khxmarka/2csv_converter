@@ -125,9 +125,8 @@ func pruneTempDir(dir string) error {
 	return os.Remove(root)
 }
 
-// Writer пишет один INSERT во временный файл. После Commit: если CSV ключа
-// ещё нет — заменяет целевой {table}.csv содержимым temp;
-// если ключ уже открыт в этом запуске — дописывает только строки данных.
+// Writer stages one INSERT in a temporary file. Commit publishes the first file
+// for a merge key or appends only data rows to an output created in this run.
 type Writer struct {
 	reg         *Registry
 	slot        *slot
@@ -142,18 +141,17 @@ type Writer struct {
 	wroteHeader bool
 }
 
-// Result — итог успешного Commit.
+// Result describes a successful Commit.
 type Result struct {
 	Path        string
 	PaddedRows  int
 	Appended    bool
-	SkippedRows int // строки шире ключа, пропущенные при влитии
+	SkippedRows int // Rows skipped because they exceed the merge-key width.
 }
 
-// Create открывает временный файл в dir. Заголовок пишется только если это
-// первый успешный INSERT ключа (слот ещё без пути) и список колонок не пуст.
-// Иначе колонки игнорируются, ширина берётся из заголовка или первой строки
-// VALUES, в temp идут только строки данных.
+// Create stages one INSERT in dir. It writes a non-empty column list only for
+// the first successful INSERT of a merge key; later INSERT files contain data
+// rows only and use the established output width.
 func Create(reg *Registry, dir, table string, columns []string) (*Writer, error) {
 	if reg == nil {
 		return nil, fmt.Errorf("csvout: нужен Registry")
@@ -165,8 +163,7 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 	return newWriter(reg, reg.acquire(dir, base), dir, base, columns)
 }
 
-// newWriter открывает temp для уже захваченного слота s. При ошибке слот
-// отпускается.
+// newWriter opens staging output for an acquired slot and releases the slot on failure.
 func newWriter(reg *Registry, s *slot, dir, base string, columns []string) (*Writer, error) {
 	tmp, err := createTemp(dir)
 	if err != nil {
@@ -198,8 +195,8 @@ func newWriter(reg *Registry, s *slot, dir, base string, columns []string) (*Wri
 	return w, nil
 }
 
-// CreatePlain открывает CSV со строкой заголовка и без склейки с INSERT.
-// base уже санитайзнут; при Commit целевой {base}.csv заменяется.
+// CreatePlain stages a standalone CSV with a header. base must already be
+// sanitized; Commit replaces the target file.
 func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, error) {
 	if reg == nil {
 		return nil, fmt.Errorf("csvout: нужен Registry")
@@ -237,7 +234,7 @@ func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, er
 	return w, nil
 }
 
-// Row пишет одну строку данных. values уже нормализованы до nCol элементов.
+// Row writes values that have already been normalized to the output width.
 func (w *Writer) Row(values []string) error {
 	if w == nil || w.closed {
 		return fmt.Errorf("csvout: запись в закрытый Writer")
@@ -258,7 +255,7 @@ func (w *Writer) Row(values []string) error {
 	return err
 }
 
-// Commit вливает временный файл в итоговый CSV и снимает блокировку ключа.
+// Commit publishes staged data and releases the merge-key slot.
 func (w *Writer) Commit() (Result, error) {
 	var empty Result
 	if w == nil || w.closed {
@@ -307,8 +304,8 @@ func (w *Writer) Commit() (Result, error) {
 	return Result{Path: final, PaddedRows: w.padded}, nil
 }
 
-// place публикует первый CSV ключа. Проверка занятости и регистрация идут
-// под одним lockDir: иначе два ключа с одним именем проскочили бы оба.
+// place publishes the first CSV for a key. Collision checking and registration
+// share lockDir so two keys cannot concurrently claim the same filename.
 func (w *Writer) place(tmpName string) (string, error) {
 	dmu := w.reg.lockDir(w.dir)
 	defer dmu.Unlock()
@@ -335,8 +332,8 @@ func appendCopy(dst, src string) error {
 	})
 }
 
-// appendTo дописывает в конец dst то, что пишет write. Провал откатывает
-// dst к исходному размеру: уже записанный CSV ключа не портится (§6).
+// appendTo appends through write and truncates dst back to its original size on
+// failure, preserving previously committed rows.
 func appendTo(dst string, write func(io.Writer) error) error {
 	return appendFile(dst, write, true)
 }
@@ -387,8 +384,7 @@ func (w *Writer) removeTmp() {
 	}
 }
 
-// Abort удаляет временный файл и снимает блокировку ключа.
-// Уже записанный CSV ключа не трогает.
+// Abort removes staged data and releases the key without changing committed output.
 func (w *Writer) Abort() error {
 	if w == nil || w.closed {
 		return nil

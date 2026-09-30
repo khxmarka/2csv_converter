@@ -19,9 +19,8 @@ var stopNames = map[string]struct{}{
 
 var terms, termSet = buildTerms()
 
-// minColumns — сколько различных зачётных колонок нужно INSERT без PII-имени
-// таблицы. Одного признака мало: таблица с единственным email среди служебных
-// колонок персональных данных не несёт.
+// minColumns is the number of distinct qualifying columns required when the
+// table name has no PII term. One matching column among technical fields is insufficient.
 const minColumns = 2
 
 // Match reports whether name contains an approved PII term.
@@ -82,7 +81,7 @@ func compact(s string) string {
 	}, s)
 }
 
-// idSuffixes — окончания ссылочных колонок. Плюрал ids сюда не входит.
+// idSuffixes contains reference-column suffixes; plural "ids" is intentionally excluded.
 var idSuffixes = []string{"identifier", "uuid", "guid", "id"}
 
 // isTechnicalIdentifier reports whether name is a reference column such as
@@ -140,8 +139,8 @@ func hasCompactIDSuffix(part string) bool {
 	return false
 }
 
-// hasDocumentIdentifier reports whether name refers to a государственный or
-// document identifier, which stays personal data even with an id suffix.
+// hasDocumentIdentifier reports whether name refers to a government or document
+// identifier, which remains personal data even with an id suffix.
 // Long terms are matched as substrings; short acronyms only as whole segments
 // or right before the identifier suffix, so company_id and settings_id stay
 // technical despite containing pan and tin.
@@ -264,8 +263,8 @@ func buildTerms() ([]string, map[string]struct{}) {
 	return out, set
 }
 
-// documentIdentifiers — документные и государственные идентификаторы,
-// достаточно длинные, чтобы искать их подстрокой в слитной форме имени.
+// documentIdentifiers contains government and document identifiers long enough
+// for substring matching in compact names.
 var documentIdentifiers = []string{
 	"passport", "pasaporte", "passaporte", "passeport", "passaporto",
 	"reisepass", "paspor", "pasport", "паспорт", "护照", "護照", "huzhao",
@@ -276,9 +275,9 @@ var documentIdentifiers = []string{
 	"снилс", "огрн", "рнокпп", "rnokpp",
 }
 
-// documentAcronyms — короткие аббревиатуры документов. Их ищут только целым
-// сегментом имени или прямо перед идентификаторным окончанием, иначе
-// company_id и settings_id перестали бы считаться техническими.
+// documentAcronyms contains short document abbreviations matched only as whole
+// name segments or immediately before an identifier suffix. This keeps names
+// such as company_id and settings_id classified as technical.
 var documentAcronyms = map[string]struct{}{
 	"ssn": {}, "tin": {}, "itin": {}, "ein": {}, "nino": {}, "nhs": {},
 	"pan": {}, "nik": {}, "ktp": {}, "npwp": {}, "sim": {}, "visa": {},

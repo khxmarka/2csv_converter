@@ -15,14 +15,14 @@ const maxWorkers = 16
 // maxConcurrentDirs bounds concurrent workbook and splitter memory without reducing INSERT workers.
 const maxConcurrentDirs = 4
 
-// poolSize — N воркеров на весь запуск: min(GOMAXPROCS, 16), не меньше 1 (§9).
-// Числом файлов не ограничивается: INSERT одного файла тоже идут в этот пул.
+// poolSize caps the run-wide worker pool at min(GOMAXPROCS, 16), with at least
+// one worker. INSERT units from one file share the same pool as other files.
 func poolSize() int {
 	return min(max(runtime.GOMAXPROCS(0), 1), maxWorkers)
 }
 
-// processFiles обрабатывает файлы запуска. convSkip/splitSkip — верхние
-// папки (ключи marks.Fold), для которых этап конверта/нарезки уже закрыт.
+// processFiles handles discovered inputs. convSkip and splitSkip contain Fold
+// keys for top-level folders whose corresponding stage is already complete.
 func processFiles(log *logx.Logger, root string, files []scan.SQLFile, blocked, convSkip, splitSkip map[string]struct{}) *accumulator {
 	acc := newAccumulator(log, root, files, blocked)
 	if convSkip != nil {
@@ -59,11 +59,9 @@ func groupByTop(files []scan.SQLFile) [][]scan.SQLFile {
 	return groups
 }
 
-// groupByDir собирает файлы одной директории в группу. SQL-файлы идут единым
-// непрерывным потоком раньше Excel и сортируются по пути: так SQL-ключ не может
-// быть вытеснен Excel-файлом между двумя INSERT и ошибочно дописаться в Excel CSV.
-// Excel идёт после SQL, заранее лежавшие CSV — после Excel. Внутри ранга файлы
-// сортируются по пути.
+// groupByDir keeps each directory together and orders inputs by ownership risk:
+// path-sorted SQL files first, then Excel, then pre-existing CSV. Keeping SQL
+// contiguous prevents an Excel output from taking an SQL merge key mid-stream.
 func groupByDir(files []scan.SQLFile) [][]scan.SQLFile {
 	order := make([]string, 0)
 	byDir := make(map[string][]scan.SQLFile)
@@ -88,7 +86,7 @@ func groupByDir(files []scan.SQLFile) [][]scan.SQLFile {
 	return groups
 }
 
-// testDirEnter — крюк теста. В бою nil. Вызывается до файлов директории.
+// testDirEnter is a test hook called before a directory's files; it is nil in production.
 var testDirEnter func(scan.SQLFile)
 
 func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, submit func(func()), group []scan.SQLFile) {
@@ -132,7 +130,7 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 		csvs = nil
 	}
 	convertDirFiles(acc, log, reg, submit, sqls, excels)
-	// CSV этого запуска режутся всегда: это часть их создания (§5).
+	// Newly produced CSV files are always split as part of publishing their result.
 	splitDirFiles(acc, log, reg, dir, group[0], csvs)
 }
 

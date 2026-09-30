@@ -1,6 +1,5 @@
-// Package marks ведёт накопительные списки верхних папок в корне обхода:
-// что уже сконвертировано и что уже нарезано. Конверт и нарезка — разные
-// состояния: папку можно убрать из одного списка и повторить только этот этап.
+// Package marks maintains persistent conversion and splitting state for
+// top-level input folders. Each stage can be reset independently.
 package marks
 
 import (
@@ -14,29 +13,27 @@ import (
 	"sync"
 )
 
-// List — файл-список верхних папок в корне.
+// List identifies a persistent top-level folder state file.
 type List string
 
 const (
-	// ConvertDone — из .sql/Excel папки получен хотя бы один CSV.
+	// ConvertDone records folders where SQL or Excel conversion produced CSV.
 	ConvertDone List = "_convert_done_.txt"
-	// ConvertPassed — конверт папку прошёл без результата: конвертировать
-	// нечего, всё отсеял фильтр или не разобралось. Повторно не открывается.
+	// ConvertPassed records folders that completed conversion without output.
 	ConvertPassed List = "_convert_passed_.txt"
-	// SplitDone — в папке нарезан хотя бы один .csv/.txt.
+	// SplitDone records folders where at least one CSV or text file was split.
 	SplitDone List = "_splitter_done_.txt"
-	// SplitPassed — нарезка папку проверила, резать нечего или не вышло.
+	// SplitPassed records folders that completed splitting without output.
 	SplitPassed List = "_splitter_passed_.txt"
 )
 
-// LogName — подробный лог запусков в корне.
+// LogName is the cumulative run log stored in each input root.
 const LogName = "_log.txt"
 
-// Lists — все списки состояний.
+// Lists contains every persistent stage list.
 var Lists = []List{ConvertDone, ConvertPassed, SplitDone, SplitPassed}
 
-// IsService сообщает, что имя файла — служебный файл программы в корне:
-// такие файлы не конвертируются и не режутся.
+// IsService reports whether name belongs to application state and must not be processed.
 func IsService(base string) bool {
 	if strings.EqualFold(base, LogName) {
 		return true
@@ -49,7 +46,7 @@ func IsService(base string) bool {
 	return false
 }
 
-// Fold — ключ сравнения имени папки: на Windows без учёта регистра.
+// Fold returns the case-insensitive comparison key used for Windows folder names.
 func Fold(name string) string {
 	if runtime.GOOS == "windows" {
 		return strings.ToLower(name)
@@ -57,7 +54,7 @@ func Fold(name string) string {
 	return name
 }
 
-// FoldSet приводит набор имён к ключам Fold.
+// FoldSet converts folder names to Fold comparison keys.
 func FoldSet(names map[string]struct{}) map[string]struct{} {
 	out := make(map[string]struct{}, len(names))
 	for name := range names {
@@ -68,12 +65,12 @@ func FoldSet(names map[string]struct{}) map[string]struct{} {
 
 var fileMu sync.Mutex
 
-// Path возвращает путь списка l в корне root.
+// Path returns the path of list l within root.
 func Path(root string, l List) string {
 	return filepath.Join(root, string(l))
 }
 
-// Read читает имена папок из списка l. Отсутствующий файл — пустой набор.
+// Read loads folder names from list l. A missing list is treated as empty.
 func Read(root string, l List) (map[string]struct{}, error) {
 	fileMu.Lock()
 	defer fileMu.Unlock()
@@ -101,8 +98,7 @@ func decode(raw []byte) map[string]struct{} {
 	return out
 }
 
-// Append дописывает имя верхней папки в список l, не перезаписывая уже
-// накопленное. Повторное имя не добавляется.
+// Append adds a top-level folder to list l without duplicating existing entries.
 func Append(root string, l List, name string) error {
 	if name == "" || strings.ContainsAny(name, "\r\n") {
 		return fmt.Errorf("некорректное имя верхней папки %q", name)

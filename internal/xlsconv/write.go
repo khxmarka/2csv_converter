@@ -11,7 +11,7 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-// Result — итог записи CSV одного Excel-файла. CSV на диск — только здесь.
+// Result summarizes CSV publication for one Excel workbook.
 type Result struct {
 	SkipTooMany bool
 	CSV         int
@@ -20,9 +20,9 @@ type Result struct {
 	WriteErr    error
 }
 
-// File читает книгу как таблицы листов (не SQL/INSERT) и пишет CSV
-// с заголовком из первой строки листа. Книгу с >5 листами не трогает.
-// Провал одного листа не удаляет уже записанные.
+// File converts worksheets as tables whose first row is the CSV header. A
+// workbook exceeding MaxSheets is left untouched, and one sheet failure does
+// not remove outputs already published for other sheets.
 func File(reg *csvout.Registry, path string) Result {
 	if reg == nil {
 		return Result{OpenErr: errNeedRegistry}
@@ -149,9 +149,9 @@ func fileXLSX(reg *csvout.Registry, path string) Result {
 	return out
 }
 
-// writeXLSXSheet читает лист один раз: первая строка — шапка, остальные —
-// в DataFile без дополнения; ширину по всем строкам применяет CommitPlain.
-// Пустой лист CSV не даёт; хвостовые пустые строки не пишутся (§13).
+// writeXLSXSheet reads a worksheet once and stages rows without padding;
+// CommitPlain applies the widest row. Empty sheets and trailing empty rows do
+// not produce CSV records.
 func writeXLSXSheet(reg *csvout.Registry, book *excelize.File, dir, stem, name string) (string, error) {
 	rows, err := book.Rows(name)
 	if err != nil {
