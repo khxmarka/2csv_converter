@@ -14,45 +14,45 @@ import (
 )
 
 const (
-	// SplitThreshold — максимум строк данных в одном файле без нарезки.
-	SplitThreshold = 1_000_000
-	// SplitChunkRows — максимум строк данных в одном куске после нарезки.
-	SplitChunkRows = 500_000
-	// MaxRecordBytes — потолок одной CSV-записи при нарезке (защита от OOM).
+	// SplitThreshold is the maximum number of data records kept in one unsplit file.
+	SplitThreshold = 4_000_000
+	// SplitChunkRows is the maximum number of data records in each split part.
+	SplitChunkRows = 2_000_000
+	// MaxRecordBytes bounds one logical CSV record to prevent unbounded allocation.
 	MaxRecordBytes = 64 << 20
 )
 
-// ErrRecordTooLarge — одна запись CSV длиннее MaxRecordBytes.
+// ErrRecordTooLarge reports a logical CSV record exceeding MaxRecordBytes.
 var ErrRecordTooLarge = errors.New("запись CSV длиннее допустимого")
 
-// HeaderMode задаёт, есть ли в CSV строка заголовка.
+// HeaderMode defines record and header semantics for splitting.
 type HeaderMode int
 
 const (
-	// SplitNoHeader — все записи файла являются данными (INSERT без списка колонок).
+	// SplitNoHeader treats every CSV record as data.
 	SplitNoHeader HeaderMode = iota
-	// SplitWithHeader — первая непустая запись является заголовком и копируется в каждый кусок.
+	// SplitWithHeader copies the first non-empty record to every part.
 	SplitWithHeader
-	// SplitLines — .txt: запись = строка, шапки нет, кавычки — обычные символы.
+	// SplitLines treats each text line as data and quotes as ordinary characters.
 	SplitLines
 )
 
-// SplitResult — итог нарезки одного файла.
+// SplitResult describes the outcome of splitting one file.
 type SplitResult struct {
 	Split    bool
 	DataRows int64
-	// Parts — пути кусков в порядке записи. Заполнен только когда Split.
+	// Parts contains published part paths in order and is populated only when Split is true.
 	Parts []string
 }
 
-// Порог боя. Тесты подменяют его через SetSplitLimits и обязаны вернуть прежние значения.
+// Tests may temporarily replace production limits through SetSplitLimits.
 var (
 	splitLimitThreshold = SplitThreshold
 	splitLimitChunk     = SplitChunkRows
 	splitLimitRecord    = MaxRecordBytes
 )
 
-// SetSplitLimits подменяет порог и размер куска до вызова restore.
+// SetSplitLimits replaces split limits until the returned restore function is called.
 func SetSplitLimits(threshold, chunkRows int) (restore func()) {
 	prevT, prevC := splitLimitThreshold, splitLimitChunk
 	splitLimitThreshold, splitLimitChunk = threshold, chunkRows
@@ -61,27 +61,21 @@ func SetSplitLimits(threshold, chunkRows int) (restore func()) {
 	}
 }
 
-// SetMaxRecordBytes подменяет потолок записи для тестов.
+// SetMaxRecordBytes replaces the logical record limit until restore is called.
 func SetMaxRecordBytes(n int) (restore func()) {
 	prev := splitLimitRecord
 	splitLimitRecord = n
 	return func() { splitLimitRecord = prev }
 }
 
-// SplitIfNeeded режет path, если строк данных больше SplitThreshold.
-// Файл с порогом и ниже не открывается на запись.
-func SplitIfNeeded(path string, mode HeaderMode) (SplitResult, error) {
-	return splitFile(path, mode, splitLimitThreshold, splitLimitChunk, nil)
-}
-
-// SplitIfNeeded режет path как csvout.SplitIfNeeded, но часть не может занять
-// CSV, который этот запуск записал для другого ключа (таблица users_2 при
-// нарезке users): такая нарезка — ошибка, монолит остаётся как был.
+// SplitIfNeeded splits path when its data count exceeds SplitThreshold. A part
+// cannot replace an output owned by another key in the same run; on collision,
+// the original file remains unchanged.
 func (r *Registry) SplitIfNeeded(path string, mode HeaderMode) (SplitResult, error) {
 	return splitFile(path, mode, splitLimitThreshold, splitLimitChunk, r.isWritten)
 }
 
-// taken — занятые имена частей; nil — занятых нет.
+// taken contains part names already owned by outputs from this run.
 func splitFile(path string, mode HeaderMode, threshold, chunkRows int, taken func(string) bool) (SplitResult, error) {
 	if threshold < 1 || chunkRows < 1 {
 		return SplitResult{}, fmt.Errorf("csvout: неверный порог нарезки")
@@ -127,8 +121,8 @@ func rejectSplitPath(path string, mode HeaderMode) error {
 
 var errNeedSplit = errors.New("csvout: нужно нарезать")
 
-// countDataRowsUntil считает строки данных. Если limit ≥ 0, останавливается
-// сразу после limit+1 — для решения «резать / не резать» весь файл читать не нужно.
+// countDataRowsUntil stops after limit+1 data records when limit is non-negative,
+// avoiding a full scan when only the split decision is needed.
 func countDataRowsUntil(path string, mode HeaderMode, limit int64) (int64, bool, error) {
 	var n int64
 	err := walkRecords(path, mode, func(_ []byte, header bool) error {
@@ -150,9 +144,8 @@ func countDataRowsUntil(path string, mode HeaderMode, limit int64) (int64, bool,
 	return n, false, nil
 }
 
-// walkRecords отдаёт заголовок и строки данных. Пустые хвостовые записи не отдаёт.
-// Записи до первой непустой в режиме заголовка тоже пропускаются.
-// Срез rec действителен только на время вызова fn.
+// walkRecords emits the header and data records while omitting leading empty
+// records before a header and empty trailing records. rec is valid only during fn.
 func walkRecords(path string, mode HeaderMode, fn func(rec []byte, header bool) error) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -200,7 +193,7 @@ func walkRecords(path string, mode HeaderMode, fn func(rec []byte, header bool) 
 type recordReader struct {
 	br  *bufio.Reader
 	buf []byte
-	// plain — кавычки не открывают поле: запись кончается на первом '\n'.
+	// Plain-text mode ends records at newline and does not interpret quotes.
 	plain bool
 }
 
@@ -291,32 +284,38 @@ func csvRecordEmpty(raw []byte) bool {
 
 func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(string) bool) ([]string, int64, error) {
 	dir := filepath.Dir(path)
+	occupied, err := existingPart(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	if occupied != "" {
+		return nil, 0, fmt.Errorf("%w: %s", ErrNameTaken, filepath.Base(occupied))
+	}
 	var (
-		names []string
-		temps []string
-		// created — части, которых до прогона не было. Только их можно убрать
-		// при провале: лежавший раньше {stem}_N.csv §14 не уничтожает.
-		created  []string
-		open     *os.File
-		buf      *bufio.Writer
-		header   []byte
-		rows     int
-		dataRows int64
-		success  bool
+		names     []string
+		temps     []string
+		published []string
+		open      *os.File
+		buf       *bufio.Writer
+		header    []byte
+		rows      int
+		dataRows  int64
+		success   bool
 	)
 	defer func() {
+		defer func() { _ = pruneTempDir(dir) }()
 		if open != nil {
 			name := open.Name()
 			_ = open.Close()
-			_ = os.Remove(name)
+			_ = removeTemp(name)
 		}
 		for _, t := range temps {
 			if t != "" {
-				_ = os.Remove(t)
+				_ = removeTemp(t)
 			}
 		}
 		if !success {
-			for _, p := range created {
+			for _, p := range published {
 				_ = os.Remove(p)
 			}
 		}
@@ -327,9 +326,12 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 			if err := buf.Flush(); err != nil {
 				return err
 			}
+			if err := syncOutputFile(open); err != nil {
+				return err
+			}
 			name := open.Name()
-			if err := open.Close(); err != nil {
-				_ = os.Remove(name)
+			if err := closeOutputFile(open); err != nil {
+				_ = removeTemp(name)
 				open = nil
 				buf = nil
 				return err
@@ -346,7 +348,7 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 			}
 		}
 		names = append(names, next)
-		f, err := os.CreateTemp(dir, tmpPattern)
+		f, err := createTemp(dir)
 		if err != nil {
 			return err
 		}
@@ -361,7 +363,7 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 		return nil
 	}
 
-	err := walkRecords(path, mode, func(rec []byte, isHeader bool) error {
+	err = walkRecords(path, mode, func(rec []byte, isHeader bool) error {
 		if isHeader {
 			header = append([]byte(nil), rec...)
 			return nil
@@ -387,9 +389,12 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 	if err := buf.Flush(); err != nil {
 		return nil, 0, err
 	}
+	if err := syncOutputFile(open); err != nil {
+		return nil, 0, err
+	}
 	last := open.Name()
-	if err := open.Close(); err != nil {
-		_ = os.Remove(last)
+	if err := closeOutputFile(open); err != nil {
+		_ = removeTemp(last)
 		open = nil
 		buf = nil
 		return nil, 0, err
@@ -402,19 +407,13 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 	}
 
 	for i := 1; i < len(names); i++ {
-		existed, err := fileExists(names[i])
-		if err != nil {
-			return nil, 0, err
-		}
-		if err := replaceFile(temps[i], names[i]); err != nil {
+		if err := publishOutputFile(temps[i], names[i]); err != nil {
 			return nil, 0, err
 		}
 		temps[i] = ""
-		if !existed {
-			created = append(created, names[i])
-		}
+		published = append(published, names[i])
 	}
-	if err := replaceFile(temps[0], names[0]); err != nil {
+	if err := publishOutputFile(temps[0], names[0]); err != nil {
 		return nil, 0, err
 	}
 	temps[0] = ""
@@ -422,22 +421,39 @@ func writeAndPublish(path string, mode HeaderMode, chunkRows int, taken func(str
 	return names, dataRows, nil
 }
 
-// partName — имя n-й части (n ≥ 2) по §14: {stem}_n.csv от собственного stem
-// файла. Лежащий на диске файл с этим именем заменяется частью.
+func existingPart(path string) (string, error) {
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		return "", err
+	}
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	prefix := stem + "_"
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.EqualFold(filepath.Ext(name), ext) {
+			continue
+		}
+		nameStem := strings.TrimSuffix(name, filepath.Ext(name))
+		if len(nameStem) <= len(prefix) || !strings.EqualFold(nameStem[:len(prefix)], prefix) {
+			continue
+		}
+		n, err := strconv.Atoi(nameStem[len(prefix):])
+		if err == nil && n >= 2 {
+			return filepath.Join(filepath.Dir(path), name), nil
+		}
+	}
+	return "", nil
+}
+
+// partName returns the n-th part (n >= 2) using the input file's own stem.
 func partName(path string, n int) string {
 	base := filepath.Base(path)
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 	ext := filepath.Ext(base)
 	return filepath.Join(filepath.Dir(path), limitCSVBaseSuffix(stem, "_"+strconv.Itoa(n))+ext)
-}
-
-func fileExists(path string) (bool, error) {
-	_, err := os.Stat(path)
-	if err == nil {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return false, err
 }

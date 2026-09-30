@@ -2,13 +2,11 @@ package convert
 
 import "sync"
 
-// commitInFlight — сколько INSERT одного файла можно разобрать, пока первый
-// ещё не записан. Без потолка один медленный Commit оставляет на диске
-// десятки тысяч .2csv-*.tmp и процесс упирается в каталог/память.
+// commitInFlight limits parsed INSERT units waiting for an earlier commit. The
+// bound prevents a slow commit from accumulating unbounded .2csv-*.tmp files.
 const commitInFlight = 16
 
-// commitQ применяет функции строго в порядке Reserve/Enqueue.
-// Поздний слот может стать готовым раньше раннего и ждёт.
+// commitQ applies functions strictly in reservation order, even when a later slot becomes ready first.
 type commitQ struct {
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -25,9 +23,8 @@ func newCommitQ() *commitQ {
 	return q
 }
 
-// start запускает применение слотов. Паника одного слота не останавливает
-// очередь: она уходит в onPanic (в той же горутине, что и слоты), чтобы
-// сбой воркера попал в лог и файл не считался успешным (§8, §15).
+// start applies reserved slots. A slot panic is passed to onPanic in the same
+// goroutine so the queue continues and the source cannot be marked successful.
 func (q *commitQ) start(onPanic func(any)) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {

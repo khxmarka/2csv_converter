@@ -6,12 +6,23 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"sql2csv/internal/app"
 )
 
 type failingWriter struct{}
 
 func (failingWriter) Write([]byte) (int, error) {
 	return 0, errors.New("write failed")
+}
+
+func TestResultExitCode(t *testing.T) {
+	if code := resultExitCode(app.Result{}); code != exitOK {
+		t.Fatalf("успех: код=%d", code)
+	}
+	if code := resultExitCode(app.Result{FilesFail: 1}); code != exitPartial {
+		t.Fatalf("частичный провал: код=%d", code)
+	}
 }
 
 func TestRunHelp(t *testing.T) {
@@ -27,9 +38,10 @@ func TestRunHelp(t *testing.T) {
 	for _, want := range []string{
 		"PII", "двух колонках", "варианты (n) не создаются",
 		"табличный дамп", "{stem}.csv", "папка в обработке", "хотя бы один CSV",
-		"Пул воркеров", "500_000", "{имя}_2.csv", "уже лежавшие .csv / .txt", "удаляются",
+		"Пул воркеров", "4_000_000", "2_000_000", "{имя}_2.csv", "уже лежавшие .csv / .txt", "удаляются",
 		"_convert_done_.txt", "_convert_passed_.txt", "_splitter_done_.txt",
 		"_splitter_passed_.txt", "_log.txt", "readme.txt",
+		"Ошибка этап не закрывает", "3  обработка завершена",
 	} {
 		if !strings.Contains(stdout.String(), want) {
 			t.Fatalf("в справке нет %q: %q", want, stdout.String())

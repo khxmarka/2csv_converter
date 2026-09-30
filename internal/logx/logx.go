@@ -1,4 +1,4 @@
-// Package logx — лог в консоль. Файл лога не создаётся (§8).
+// Package logx writes synchronized console output and an optional cumulative log.
 package logx
 
 import (
@@ -9,25 +9,24 @@ import (
 	"sync"
 )
 
-// HangWidth — предел ширины строки статуса в колонках. Длиннее — строка
-// переносится, и \r затирает только её последний кусок.
+// HangWidth limits status text to one terminal line so carriage-return updates remain readable.
 const HangWidth = 79
 
-// Logger безопасен для одновременного использования из пула воркеров.
-// Hang держит одну строку статуса без перевода строки, пока её не сменят.
+// Logger is safe for concurrent use by workers. Hang maintains one replaceable
+// status line without writing it to the cumulative log.
 type Logger struct {
 	mu      sync.Mutex
 	w       io.Writer
 	hang    string
 	hangOff bool
 	err     error
-	// file — копия лога (_log.txt). Строка прогресса туда не пишется.
-	// Ошибка записи в файл не останавливает работу: консоль важнее.
+	// file receives persistent log lines but not transient progress. File write
+	// failures are reported without stopping the conversion.
 	file    io.Writer
 	fileErr error
 }
 
-// SetFile дублирует все строки лога (кроме строки прогресса) в w.
+// SetFile duplicates subsequent non-progress log lines to w.
 func (l *Logger) SetFile(w io.Writer) {
 	if l == nil {
 		return
@@ -37,7 +36,7 @@ func (l *Logger) SetFile(w io.Writer) {
 	l.file = w
 }
 
-// FileErr — первая ошибка записи в файл лога.
+// FileErr returns the first persistent-log write error.
 func (l *Logger) FileErr() error {
 	if l == nil {
 		return nil
@@ -47,8 +46,8 @@ func (l *Logger) FileErr() error {
 	return l.fileErr
 }
 
-// New пишет лог в w. Если w — файл, но не терминал (перенаправление в файл
-// или pipe), строка статуса отключается: там она копила бы \r и пробелы.
+// New writes console output to w. Replaceable status output is disabled when w
+// is not a terminal to avoid accumulating carriage-return updates in files and pipes.
 func New(w io.Writer) *Logger {
 	l := &Logger{w: w}
 	if f, ok := w.(*os.File); ok {
@@ -59,8 +58,8 @@ func New(w io.Writer) *Logger {
 	return l
 }
 
-// Hang показывает msg без '\n'. Повтор с тем же текстом ничего не пишет.
-// Пустая строка снимает статус.
+// Hang displays msg without a newline. Repeated text is suppressed, and an empty
+// message clears the current status line.
 func (l *Logger) Hang(msg string) {
 	if l == nil || l.hangOff {
 		return
@@ -90,8 +89,8 @@ func (l *Logger) Linef(format string, args ...any) {
 	l.line(fmt.Sprintf(format, args...))
 }
 
-// FileLinef пишет строку только в файл лога, не в консоль: итоги папок,
-// уже записанных в списки состояний, консоль не засоряют.
+// FileLinef writes only to the persistent log. It keeps already completed
+// folder summaries out of the console.
 func (l *Logger) FileLinef(format string, args ...any) {
 	if l == nil {
 		return
@@ -101,7 +100,7 @@ func (l *Logger) FileLinef(format string, args ...any) {
 	l.toFile(fmt.Sprintf(format, args...))
 }
 
-// FileErrorf — FileLinef для ошибки.
+// FileErrorf writes a formatted error only to the persistent log.
 func (l *Logger) FileErrorf(format string, args ...any) {
 	l.FileLinef("error: "+format, args...)
 }
@@ -137,8 +136,7 @@ func (l *Logger) clearHang() {
 	l.hang = ""
 }
 
-// DisplayWidth — ширина строки в колонках консоли: иероглифы, хангыль, кана
-// и полноширинные формы занимают две колонки, остальное — одну.
+// DisplayWidth returns terminal column width, counting CJK and full-width runes as two columns.
 func DisplayWidth(s string) int {
 	n := 0
 	for _, r := range s {
@@ -151,12 +149,12 @@ func DisplayWidth(s string) int {
 }
 
 func isWide(r rune) bool {
-	return (r >= 0x1100 && r <= 0x115F) || // хангыль чамо
-		(r >= 0x2E80 && r <= 0xA4CF) || // CJK, кана, радикалы
-		(r >= 0xAC00 && r <= 0xD7A3) || // хангыль слоги
-		(r >= 0xF900 && r <= 0xFAFF) || // CJK совместимые
+	return (r >= 0x1100 && r <= 0x115F) || // Hangul Jamo.
+		(r >= 0x2E80 && r <= 0xA4CF) || // CJK, kana, and radicals.
+		(r >= 0xAC00 && r <= 0xD7A3) || // Hangul syllables.
+		(r >= 0xF900 && r <= 0xFAFF) || // CJK compatibility ideographs.
 		(r >= 0xFE30 && r <= 0xFE4F) ||
-		(r >= 0xFF00 && r <= 0xFF60) || (r >= 0xFFE0 && r <= 0xFFE6) || // полноширинные
+		(r >= 0xFF00 && r <= 0xFF60) || (r >= 0xFFE0 && r <= 0xFFE6) || // Full-width forms.
 		(r >= 0x20000 && r <= 0x3FFFD)
 }
 
@@ -174,7 +172,7 @@ func (l *Logger) println(s string) {
 	_, l.err = fmt.Fprintln(l.w, s)
 }
 
-// Err возвращает первую ошибку записи в лог.
+// Err returns the first persistent-log write error.
 func (l *Logger) Err() error {
 	if l == nil {
 		return nil

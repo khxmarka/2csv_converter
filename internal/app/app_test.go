@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -322,7 +323,8 @@ func TestCompletedFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "dump.sql"), []byte(
+	sqlPath := filepath.Join(dir, "dump.sql")
+	if err := os.WriteFile(sqlPath, []byte(
 		"INSERT INTO users (email) VALUES ('must-not-run@example.test');\n",
 	), 0o644); err != nil {
 		t.Fatal(err)
@@ -335,8 +337,11 @@ func TestCompletedFolderMatchIsCaseInsensitiveOnWindows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.CSV != 0 || len(res.Scan.Files) != 0 {
+	if res.InsertOK != 0 || res.CSV != 0 {
 		t.Fatalf("готовая папка обработана повторно: %+v", res)
+	}
+	if _, err := os.Stat(sqlPath); err != nil {
+		t.Fatalf("исходный SQL готовой папки должен сохраниться: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "users.csv")); !os.IsNotExist(err) {
 		t.Fatalf("users.csv не должен создаваться, err=%v", err)
@@ -364,6 +369,17 @@ func TestUnfinishedFolderOverwritesStaleCSV(t *testing.T) {
 	if err := os.WriteFile(staleTemp, []byte("partial"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	tempDir := filepath.Join(dir, ".2csv-tmp")
+	if err := os.Mkdir(tempDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tempDir, ".owner"), []byte("2csv temporary files\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ownedTemp := filepath.Join(tempDir, "output-interrupted.tmp")
+	if err := os.WriteFile(ownedTemp, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "dump.sql"), []byte("INSERT INTO users (email) VALUES ('new@example.com');\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -381,8 +397,11 @@ func TestUnfinishedFolderOverwritesStaleCSV(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "users(1).csv")); !os.IsNotExist(err) {
 		t.Fatalf("users(1).csv не должен создаваться, err=%v", err)
 	}
-	if _, err := os.Stat(staleTemp); !os.IsNotExist(err) {
-		t.Fatalf("temp прошлого запуска не удалён, err=%v", err)
+	if got, err := os.ReadFile(staleTemp); err != nil || string(got) != "partial" {
+		t.Fatalf("посторонний похожий temp изменён: %q, err=%v", got, err)
+	}
+	if _, err := os.Stat(ownedTemp); !os.IsNotExist(err) {
+		t.Fatalf("служебный temp прошлого запуска не удалён, err=%v", err)
 	}
 }
 
@@ -625,7 +644,7 @@ func TestBrokenSQLDoesNotStopNextFile(t *testing.T) {
 	if strings.Contains(log, "папка обработана: A") {
 		t.Fatalf("A без CSV не обработана:\n%s", log)
 	}
-	if !strings.Contains(log, "error: папка A: не создано ни одного CSV:") {
+	if !strings.Contains(log, "error: папка A:") {
 		t.Fatalf("нужна причина 0 CSV у A:\n%s", log)
 	}
 	if strings.Contains(log, "воркеров:") || strings.Contains(log, "прогресс:") || strings.Contains(log, "сводка:") {
@@ -657,8 +676,11 @@ func TestSecondInsertTooManyKeepsCSVAndLogsReason(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "t(1).csv")); !os.IsNotExist(err) {
 		t.Fatalf("t(1).csv не должен создаваться, err=%v", err)
 	}
-	if strings.Join(res.SuccessTops, ",") != "Alpha" {
-		t.Fatalf("папка с CSV должна быть в списке: %v", res.SuccessTops)
+	if len(res.SuccessTops) != 0 {
+		t.Fatalf("папка с частичной ошибкой не должна закрываться: %v", res.SuccessTops)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "dump.sql")); err != nil {
+		t.Fatalf("исходник частичного результата должен остаться: %v", err)
 	}
 	log := buf.String()
 	if !strings.Contains(log, "таблица t") || !strings.Contains(log, "значений больше, чем колонок") {
@@ -667,8 +689,8 @@ func TestSecondInsertTooManyKeepsCSVAndLogsReason(t *testing.T) {
 	if strings.Contains(log, "VALUES") || strings.Contains(log, "'x'") {
 		t.Fatal("тело VALUES не должно попадать в лог")
 	}
-	if strings.Count(log, "папка обработана: Alpha") != 1 {
-		t.Fatalf("папка с CSV обработана:\n%s", log)
+	if strings.Contains(log, "папка обработана: Alpha") {
+		t.Fatalf("папка с ошибкой не должна считаться обработанной:\n%s", log)
 	}
 }
 
@@ -694,7 +716,8 @@ func TestBlockedScanPreventsFolderCompletion(t *testing.T) {
 		map[string]struct{}{"Alpha": {}},
 	)
 	acc.start(file)
-	acc.add(file, fileOutcome{created: 1, csv: 1})
+	acc.record(file, fileOutcome{created: 1, csv: 1})
+	acc.finishFiles([]scan.SQLFile{file})
 
 	if _, err := os.Stat(marks.Path(root, marks.ConvertDone)); !os.IsNotExist(err) {
 		t.Fatalf("заблокированную папку нельзя записывать в converted.txt, err=%v", err)
@@ -713,7 +736,8 @@ func TestAccumulatorCountsCriticalConversionFailure(t *testing.T) {
 	file := scan.SQLFile{Path: filepath.Join(root, "Alpha", "bad.sql"), TopFolder: "Alpha"}
 	acc := newAccumulator(logx.New(io.Discard), root, []scan.SQLFile{file}, nil)
 	acc.start(file)
-	acc.add(file, fileOutcome{skipped: 1, failed: true})
+	acc.record(file, fileOutcome{skipped: 1, failed: true})
+	acc.finishFiles([]scan.SQLFile{file})
 	_, skipped, _, filesFail, tops := acc.snapshot()
 	if skipped != 1 || filesFail != 1 {
 		t.Fatalf("skipped=%d filesFail=%d", skipped, filesFail)
@@ -950,6 +974,60 @@ func TestSecondTopStartsBeforeFirstFinishes(t *testing.T) {
 		if !strings.Contains(string(raw), top+"@example.test") {
 			t.Fatalf("%s: %q", top, raw)
 		}
+	}
+}
+
+func TestConcurrentDirectoryLimit(t *testing.T) {
+	root := t.TempDir()
+	for i := range maxConcurrentDirs + 2 {
+		dir := filepath.Join(root, "Top"+strconv.Itoa(i))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(dir, "dump.sql"),
+			[]byte("INSERT INTO users (email) VALUES ('user@example.test');\n"),
+			0o644,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	entered := make(chan struct{}, maxConcurrentDirs+2)
+	releaseCh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	defer release()
+	testDirEnter = func(scan.SQLFile) {
+		entered <- struct{}{}
+		<-releaseCh
+	}
+	t.Cleanup(func() { testDirEnter = nil })
+
+	errc := make(chan error, 1)
+	go func() {
+		_, err := Run(logx.New(io.Discard), root)
+		errc <- err
+	}()
+	for range maxConcurrentDirs {
+		select {
+		case <-entered:
+		case err := <-errc:
+			t.Fatalf("прогон закончился до заполнения лимита: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("директории не заполнили лимит")
+		}
+	}
+	select {
+	case <-entered:
+		t.Fatalf("одновременно открыто больше %d директорий", maxConcurrentDirs)
+	case err := <-errc:
+		t.Fatalf("прогон закончился до освобождения директорий: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	if err := <-errc; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1257,6 +1335,102 @@ func TestDeleteSourceOnlyAfterCSV(t *testing.T) {
 	}
 }
 
+func TestRemoveSourceLogsFailureAndLeavesPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.sql")
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "keep"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := removeSource(path); err == nil {
+		t.Fatal("ожидалась ошибка удаления")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("path should remain after failed removal: %v", err)
+	}
+}
+
+func TestStateWriteFailureKeepsSourceAndRetries(t *testing.T) {
+	injected := errors.New("injected state failure")
+	for _, failedList := range []marks.List{marks.SplitPassed, marks.ConvertDone} {
+		t.Run(string(failedList), func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "Alpha")
+			source := filepath.Join(dir, "dump.sql")
+			copySQLFixture(t, "14_two_columns_ok.sql", source)
+			oldAppend := appendState
+			appendState = func(root string, list marks.List, name string) error {
+				if list == failedList {
+					return injected
+				}
+				return marks.Append(root, list, name)
+			}
+			t.Cleanup(func() { appendState = oldAppend })
+
+			result, err := Run(logx.New(io.Discard), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.FilesFail == 0 || len(result.SuccessTops) != 0 {
+				t.Fatalf("state failure must keep folder unfinished: %+v", result)
+			}
+			if _, err := os.Stat(source); err != nil {
+				t.Fatalf("source removed after state failure: %v", err)
+			}
+			failed, err := marks.Read(root, failedList)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := failed["Alpha"]; ok {
+				t.Fatalf("failed state was persisted in %s", failedList)
+			}
+
+			appendState = oldAppend
+			result, err = Run(logx.New(io.Discard), root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.FilesFail != 0 {
+				t.Fatalf("retry failed: %+v", result)
+			}
+			if _, err := os.Stat(source); !os.IsNotExist(err) {
+				t.Fatalf("successful retry did not remove source: %v", err)
+			}
+		})
+	}
+}
+
+func TestSourceRemovalFailureIsReportedAfterState(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	source := filepath.Join(dir, "dump.sql")
+	copySQLFixture(t, "14_two_columns_ok.sql", source)
+	injected := errors.New("injected remove failure")
+	oldRemove := removeSource
+	removeSource = func(string) error { return injected }
+	t.Cleanup(func() { removeSource = oldRemove })
+
+	result, err := Run(logx.New(io.Discard), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FilesFail == 0 {
+		t.Fatalf("source removal failure was not reported: %+v", result)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("source missing after failed removal: %v", err)
+	}
+	done, err := marks.Read(root, marks.ConvertDone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := done["Alpha"]; !ok {
+		t.Fatalf("published output was not recorded before source removal: %v", done)
+	}
+}
+
 func TestSQLExcelSQLSameTargetNeverMixesStreams(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "Alpha")
@@ -1402,7 +1576,7 @@ func TestRunBrokenExcelLogsAndContinues(t *testing.T) {
 	if !strings.Contains(log, "не удалось открыть") {
 		t.Fatalf("ожидалась критическая ошибка открытия xlsx:\n%s", log)
 	}
-	if !strings.Contains(log, "error: папка A: не создано ни одного CSV:") {
+	if !strings.Contains(log, "error: папка A: обработана с ошибками") {
 		t.Fatalf("нужна причина 0 CSV у A:\n%s", log)
 	}
 }
@@ -1469,13 +1643,16 @@ func TestTabularSQLWithInsertAndExcelSameRun(t *testing.T) {
 }
 
 func TestForeignCSVSplitLeavesSmallFileAndMarksFolder(t *testing.T) {
+	restore := csvout.SetSplitLimits(4, 2)
+	defer restore()
+
 	root := t.TempDir()
 	dir := filepath.Join(root, "Alpha")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	big := filepath.Join(dir, "big.csv")
-	writeRepeatedRows(t, big, "\"h\"\n", "\"a\"\n", csvout.SplitThreshold+1)
+	writeRepeatedRows(t, big, "\"h\"\n", "\"a\"\n", 5)
 	small := filepath.Join(dir, "small.csv")
 	const smallBody = "\"h\"\n\"b\"\n"
 	if err := os.WriteFile(small, []byte(smallBody), 0o644); err != nil {
@@ -1568,9 +1745,8 @@ func TestSQLKeyIsMergedBeforeSplit(t *testing.T) {
 	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"email\"\n\"a\"\n\"b\"\n")
 }
 
-// Прошлый запуск оборвался после публикации части: users_2.csv лежит,
-// папки нет в converted.txt. Повторная нарезка занимает тот же слот, а не _3.
-func TestRerunAfterInterruptedSplitDoesNotDuplicateParts(t *testing.T) {
+// Without a manifest, users_2.csv cannot be proven to belong to users.csv.
+func TestRerunAfterInterruptedSplitKeepsUnknownPart(t *testing.T) {
 	restore := csvout.SetSplitLimits(2, 2)
 	defer restore()
 
@@ -1587,11 +1763,18 @@ func TestRerunAfterInterruptedSplitDoesNotDuplicateParts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Run(logx.New(io.Discard), root); err != nil {
+	res, err := Run(logx.New(io.Discard), root)
+	if err != nil {
 		t.Fatal(err)
 	}
-	assertFile(t, filepath.Join(dir, "users.csv"), "\"email\"\n\"a\"\n\"a\"\n")
+	if res.FilesFail == 0 || len(res.SuccessTops) != 0 {
+		t.Fatalf("занятая часть должна оставить папку незавершённой: %+v", res)
+	}
+	assertFile(t, filepath.Join(dir, "users.csv"), "\"email\"\n\"a\"\n\"a\"\n\"b\"\n")
 	assertFile(t, filepath.Join(dir, "users_2.csv"), "\"email\"\n\"b\"\n")
+	if _, err := os.Stat(filepath.Join(dir, "a.sql")); err != nil {
+		t.Fatalf("исходник должен остаться: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(dir, "users_3.csv")); !os.IsNotExist(err) {
 		t.Fatalf("дубль части users_3.csv: %v", err)
 	}
@@ -1769,8 +1952,8 @@ func TestSameTargetNameDoesNotOverwriteCSVOfThisRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFile(t, filepath.Join(dir, "report_Sheet1.csv"), "\"email\"\n\"from-xls@example.test\"\n")
-	if _, err := os.Stat(xls); !os.IsNotExist(err) {
-		t.Fatalf("report.xls дал CSV и должен быть удалён: %v", err)
+	if _, err := os.Stat(xls); err != nil {
+		t.Fatalf("при ошибке соседнего файла исходник должен остаться: %v", err)
 	}
 	if _, err := os.Stat(xlsx); err != nil {
 		t.Fatalf("report.xlsx без своего CSV должен остаться: %v", err)
@@ -1807,6 +1990,46 @@ func TestSplitDoesNotOverwriteCSVOfThisRun(t *testing.T) {
 	assertFile(t, filepath.Join(dir, "users.csv"), "\"email\"\n\"a\"\n\"b\"\n\"c\"\n")
 	if !strings.Contains(buf.String(), "не удалось нарезать") {
 		t.Fatalf("нужна ошибка нарезки:\n%s", buf.String())
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Fatalf("исходник должен остаться после ошибки нарезки: %v", err)
+	}
+	for _, list := range []marks.List{
+		marks.ConvertDone, marks.ConvertPassed, marks.SplitDone, marks.SplitPassed,
+	} {
+		if _, err := os.Stat(marks.Path(root, list)); !os.IsNotExist(err) {
+			t.Fatalf("ошибка не должна закрывать этап в %s: %v", list, err)
+		}
+	}
+}
+
+func TestDirectoryPanicKeepsSourceAndStagesOpen(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "Alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(dir, "dump.sql")
+	if err := os.WriteFile(source, []byte("INSERT INTO users (email) VALUES ('a@example.test');\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	testDirEnter = func(scan.SQLFile) { panic("test panic") }
+	t.Cleanup(func() { testDirEnter = nil })
+
+	result, err := Run(logx.New(io.Discard), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.FilesFail == 0 || len(result.SuccessTops) != 0 {
+		t.Fatalf("паника должна дать частичный провал: %+v", result)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("исходник должен остаться: %v", err)
+	}
+	for _, list := range marks.Lists {
+		if _, err := os.Stat(marks.Path(root, list)); !os.IsNotExist(err) {
+			t.Fatalf("паника не должна закрывать этап в %s: %v", list, err)
+		}
 	}
 }
 
@@ -2100,8 +2323,8 @@ func TestLogFileAccumulatesRuns(t *testing.T) {
 	if strings.Count(log, "=== ") != 2 {
 		t.Fatalf("ожидалось два заголовка запуска:\n%s", log)
 	}
-	if strings.Count(log, "error: ") != 1 || !strings.Contains(log, "между значениями нет запятой") {
-		t.Fatalf("ошибка первого запуска должна быть в логе:\n%s", log)
+	if strings.Count(log, "между значениями нет запятой") != 2 {
+		t.Fatalf("незавершённая папка должна повториться и сохранить обе ошибки:\n%s", log)
 	}
 	if strings.Contains(log, "папка в обработке") {
 		t.Fatalf("строка прогресса не пишется в файл:\n%s", log)

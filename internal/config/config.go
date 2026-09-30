@@ -1,4 +1,4 @@
-// Package config хранит константы, заданные CONSTRAINTS_AND_POLICY.md.
+// Package config defines the fixed input roots used by the command.
 package config
 
 import (
@@ -7,14 +7,14 @@ import (
 )
 
 const (
-	// RootDB — корень при ответе db на приглашение combo/db.
+	// RootDB is selected by the "db" prompt answer.
 	RootDB = `C:\Source\db`
-	// RootCombo — корень при ответе combo на приглашение combo/db.
+	// RootCombo is selected by the "combo" prompt answer.
 	RootCombo = `C:\Source\combo`
 )
 
-// RootFor возвращает жёсткий путь корня по ответу combo/db (пробелы по краям
-// отбрасываются, регистр не важен). CLI-флага пути политика не предусматривает.
+// RootFor maps a case-insensitive combo/db answer to its fixed input root.
+// Leading and trailing whitespace is ignored.
 func RootFor(choice string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(choice)) {
 	case "db":

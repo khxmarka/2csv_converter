@@ -8,7 +8,7 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
-// WriteXLSX пишет книгу excelize (для тестов и фикстур).
+// WriteXLSX creates an XLSX workbook for tests and fixtures.
 func WriteXLSX(path string, sheets []Sheet) error {
 	if len(sheets) == 0 {
 		return fmt.Errorf("xlsconv: нужен хотя бы один лист")

@@ -7,8 +7,7 @@ import (
 	"unicode/utf16"
 )
 
-// wrapOLEWorkbook упаковывает BIFF8-поток в OLE2 с единственным потоком Workbook.
-// Нужен только тестам: продакшен свой BIFF/OLE не пишет.
+// wrapOLEWorkbook packages a BIFF8 stream in an OLE2 container for test fixtures.
 func wrapOLEWorkbook(biffData []byte) ([]byte, error) {
 	w := oleWriter{}
 	w.add("Workbook", biffData)

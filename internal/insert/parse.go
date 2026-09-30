@@ -9,9 +9,9 @@ import (
 
 var errInvalidInsertModifier = errors.New("после OR ожидается REPLACE или IGNORE")
 
-// Parse читает r потоково и вызывает Handler на каждый INSERT ... VALUES.
-// Остальной SQL и отвергнутые INSERT не являются ошибкой: они уходят в Skip.
-// Ошибка возвращается только при сбое чтения или ошибке колбэка.
+// Parse streams r and emits Handler events for each INSERT ... VALUES statement.
+// Other SQL and rejected INSERT statements are reported through Skip. Only read
+// and callback failures are returned as errors.
 func Parse(r io.Reader, h Handler) error {
 	s := newSrc(r)
 	s.skipBOM()
@@ -106,8 +106,8 @@ func parseInsert(s *src, h Handler) error {
 		}
 		return err
 	}
-	// INTO необязателен в MySQL и MSSQL (INSERT users VALUES …). Без INTO и без
-	// идентификатора дальше (GRANT INSERT, UPDATE …) это не оператор данных.
+	// MySQL and MSSQL allow INSERT users VALUES without INTO. Without INTO, the
+	// next token must be an identifier to distinguish data from GRANT text.
 	if ok, err := s.tryKeyword("INTO"); err != nil {
 		return err
 	} else if !ok {
@@ -124,7 +124,7 @@ func parseInsert(s *src, h Handler) error {
 		if err == io.EOF {
 			return skip("незакрытый INSERT", "")
 		}
-		// Обычно это склеенная/повреждённая строка дампа: «INSERT INTO pre_ucente119.220…».
+		// This commonly indicates a concatenated or corrupted dump line.
 		return skip("битое имя таблицы после INSERT INTO: "+err.Error(), "")
 	}
 	if table == "" {
@@ -235,9 +235,8 @@ func parseInsert(s *src, h Handler) error {
 	return parseValueRows(s, h, meta)
 }
 
-// ParseValues разбирает уже вырезанный хвост одного INSERT ... VALUES.
-// Для io.SectionReader буфер не больше самого хвоста: однострочный INSERT
-// не должен выделять полный буфер чтения.
+// ParseValues parses an isolated INSERT VALUES body. Its buffer is capped by an
+// io.SectionReader body so a single-line INSERT does not allocate a full reader buffer.
 func ParseValues(r io.Reader, meta Meta, h Handler) error {
 	size := readBuf
 	if sized, ok := r.(interface{ Size() int64 }); ok && sized.Size() < int64(size) {
@@ -261,8 +260,7 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 	}
 	began := false
 	accepted := 0
-	// cut — INSERT оборван после принятых строк (обрезанный дамп): строки
-	// выше сохраняются, причина и строка файла уходят в Handler.Cut.
+	// A cut INSERT keeps complete rows and reports its reason and source line through Handler.Cut.
 	var cut string
 	cutLine := 0
 	expectRow := false
@@ -328,7 +326,7 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 					return err
 				}
 				if h.Row != nil {
-					// Ошибка Row, кроме ErrRowSurplus, — I/O потребителя: стоп разбора.
+					// Row errors other than ErrRowSurplus are consumer I/O failures and stop parsing.
 					if err = h.Row(cells); err != nil && !errors.Is(err, ErrRowSurplus) {
 						return err
 					}
@@ -339,17 +337,15 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		case errors.Is(err, ErrRowSurplus):
 			noteSurplus()
 		case err != nil && accepted > 0 && errors.Is(err, io.EOF):
-			// Дамп оборван посреди строки (кончился файл/хвост): целые строки
-			// выше сохраняем. Синтаксический мусор посреди файла — как раньше,
-			// весь INSERT в пропуск.
+			// EOF inside a row keeps preceding complete rows. Syntax corruption before
+			// the body boundary rejects the entire INSERT.
 			cut = "битая строка VALUES: " + err.Error()
 			cutLine = s.line
 			if err := s.skipUntilSemicolon(true, false); err != nil {
 				return err
 			}
 		case err != nil:
-			// Место ошибки — строка и байт файла: по ним видно, что в дампе
-			// (дамп INSERT часто одна строка на мегабайты).
+			// Report both source line and byte because one INSERT line may span megabytes.
 			reason := fmt.Sprintf("битый INSERT: %v (строка %d, байт %d)", err, s.line, meta.ValuesOffset+s.pos)
 			if errors.Is(err, io.EOF) {
 				reason = fmt.Sprintf("INSERT оборван концом файла, целых строк нет (строка %d)", s.line)
@@ -400,7 +396,7 @@ func parseValueRows(s *src, h Handler, meta Meta) error {
 		return nil
 	}
 	if accepted == 0 {
-		// Все строки отброшены по ширине: Skip сбросит начатый temp.
+		// When every row exceeds the schema width, Skip discards the pending output.
 		return skip("нет строк VALUES", table)
 	}
 	validTail, err := consumeTail(s)
@@ -494,8 +490,7 @@ func skipModifiers(s *src) error {
 	}
 }
 
-// parseTableName берёт последний сегмент имени: table, schema.table и
-// db.schema.table (MSSQL [shop].[dbo].[users]) дают одно имя таблицы.
+// parseTableName returns the final segment of table, schema.table, or db.schema.table.
 func parseTableName(s *src) (string, error) {
 	part, err := parseIdent(s)
 	if err != nil {
@@ -519,7 +514,7 @@ func parseTableName(s *src) (string, error) {
 	}
 }
 
-// startsIdent — байт может начинать имя таблицы: слово или обрамление.
+// startsIdent reports whether a byte can begin a bare or quoted table identifier.
 func startsIdent(b byte) bool {
 	return identStart(b) || b == '`' || b == '"' || b == '[' || b == '\''
 }
@@ -634,7 +629,7 @@ func parseColumnList(s *src) ([]string, error) {
 		if err := s.skipSpaceAndComments(); err != nil {
 			return nil, err
 		}
-		// schema.col — берём последний сегмент
+		// Keep only the final segment of schema.column.
 		if b, err := s.peek(); err == nil && b == '.' {
 			_, _ = s.next()
 			next, err := parseIdent(s)
@@ -685,15 +680,14 @@ func skipParenGroup(s *src) error {
 	}
 }
 
-// parseRow собирает одну строку VALUES в []Cell для обработчика Row.
-// Разбор тот же, что у потокового StreamRow: один код для обоих путей.
+// parseRow collects one VALUES tuple into []Cell while sharing parsing logic with StreamRow.
 func parseRow(s *src, maxCells int) ([]Cell, error) {
 	var c cellCollector
 	err := emitRow(s, &c, maxCells)
 	return c.cells, err
 }
 
-// cellCollector — CellWriter, который копит ячейки строки в память.
+// cellCollector materializes streamed cells for the Row callback.
 type cellCollector struct {
 	cells []Cell
 	b     strings.Builder

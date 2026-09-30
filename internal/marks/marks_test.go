@@ -110,6 +110,25 @@ func TestAppendRejectsInvalidName(t *testing.T) {
 	}
 }
 
+func TestAppendReturnsErrorWhenListPathIsDirectory(t *testing.T) {
+	root := t.TempDir()
+	path := Path(root, ConvertDone)
+	if err := os.Mkdir(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Append(root, ConvertDone, "Alpha"); err == nil {
+		t.Fatal("expected an error when the list path is a directory")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatal("Append replaced the existing directory")
+	}
+}
+
 func TestAppendConcurrentNamesRemainWholeAndUnique(t *testing.T) {
 	root := t.TempDir()
 	const unique = 20

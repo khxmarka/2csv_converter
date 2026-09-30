@@ -13,9 +13,9 @@ import (
 	"sql2csv/internal/scan"
 )
 
-// Schedule читает sql-файл. PII-отказ не разбирает VALUES.
-// Принятые INSERT отдаются в submit на разбор ячеек; Commit идёт по порядку обхода.
-// Табличный .sql выполняется на вызывающей стороне, без пула INSERT.
+// Schedule scans an SQL file without parsing VALUES rejected by the PII filter.
+// Accepted INSERT bodies are submitted for parallel parsing and committed in
+// discovery order. Tabular SQL is processed synchronously by the caller.
 func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit func(func())) (out Result) {
 	if submit == nil {
 		submit = func(fn func()) { fn() }
@@ -44,9 +44,8 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 		log.Errorf("%s: %v", sql.Path, err)
 		return Result{Skipped: 1, Failed: true}
 	}
-	// Воркеры читают хвосты INSERT через ReadAt по своему дескриптору: сканер
-	// идёт по f последовательно, а временных файлов на INSERT больше нет.
-	// Закрывается после q (defer ниже выполняется раньше).
+	// Workers read INSERT bodies through ReadAt on a separate descriptor while f
+	// remains the sequential scanner. body must close after the commit queue.
 	body, err := os.Open(sql.Path)
 	if err != nil {
 		return Result{OpenErr: err}
@@ -62,11 +61,9 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 	defer func() {
 		q.close()
 		<-done
-		// Дескрипторы дописывания CSV живут только пока пишет этот .sql:
-		// дальше Excel, нарезка и замена файлов этой директории.
-		if err := reg.CloseDir(st.dir); err != nil {
+		if err := syncCSVOutputs(st.dirty); err != nil {
 			st.failed = true
-			log.Errorf("%s: не удалось закрыть CSV: %v", sql.Path, err)
+			st.log.Errorf("%s: не удалось синхронизировать CSV: %v", st.sql.Path, err)
 		}
 		out = Result{
 			Created:  st.created,
@@ -127,13 +124,14 @@ func Schedule(log *logx.Logger, reg *csvout.Registry, sql scan.SQLFile, submit f
 	return out
 }
 
+var syncCSVOutputs = csvout.SyncFiles
+
 type prepared struct {
 	data    *csvout.DataFile
 	skip    *insert.Skip
 	err     error
 	surplus int
-	// cut — INSERT оборван после целых строк (обрезанный дамп): они пишутся,
-	// в лог — причина и строка файла cutLine.
+	// A cut INSERT keeps its complete rows while recording the reason and source line.
 	cut     string
 	cutLine int
 }
@@ -144,7 +142,7 @@ func prepareInsert(dir string, meta insert.Meta, body io.Reader) (out prepared) 
 	surplus := 0
 	var cut string
 	cutLine := 0
-	var cellw dataCellWriter // один на INSERT, не на строку
+	var cellw dataCellWriter // Reused across all rows in one INSERT.
 	defer func() {
 		if out.data == nil && data != nil {
 			data.Abort()
@@ -276,6 +274,9 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 	}
 	s.created++
 	s.paths = append(s.paths, res.Path)
+	if res.Appended {
+		s.dirty = append(s.dirty, res.Path)
+	}
 	if !res.Appended {
 		s.csvNew++
 	}
@@ -285,7 +286,7 @@ func (s *session) apply(meta insert.Meta, prep prepared) {
 		s.log.Errorf("%s:%d таблица %s: значений больше, чем колонок (%d строк пропущено)", s.sql.Path, meta.Line, meta.Table, totalSurplus)
 	}
 	if prep.cut != "" {
-		// Не молчим: хвост INSERT потерян, исходник остаётся (unitFail, §15).
+		// A lost INSERT body is logged and counted so the source remains on disk.
 		s.unitFail++
 		s.log.Errorf("%s:%d таблица %s: INSERT оборван (%s), записано строк: %d",
 			s.sql.Path, prep.cutLine, meta.Table, prep.cut, prep.data.Rows()-res.SkippedRows)

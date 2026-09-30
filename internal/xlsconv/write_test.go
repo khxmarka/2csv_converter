@@ -8,11 +8,55 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"sql2csv/internal/csvout"
 
 	"github.com/xuri/excelize/v2"
 )
+
+func TestXLSSerializesFileReads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing.xls")
+	xlsMemoryMu.Lock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = File(csvout.NewRegistry(), path)
+	}()
+
+	select {
+	case <-done:
+		xlsMemoryMu.Unlock()
+		t.Fatal("второе чтение .xls не ожидало освобождения памяти первого")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	xlsMemoryMu.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("чтение .xls не продолжилось после освобождения ограничения")
+	}
+}
+
+func TestFileRejectsOversizedXLS(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.xls")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(MaxXLSBytes + 1); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if res := File(csvout.NewRegistry(), path); res.OpenErr == nil {
+		t.Fatal("ожидалась ошибка размера .xls")
+	}
+}
 
 func csvFiles(t *testing.T, dir string) []string {
 	t.Helper()

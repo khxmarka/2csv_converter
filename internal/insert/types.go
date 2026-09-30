@@ -1,4 +1,4 @@
-// Package insert — потоковый разбор INSERT ... VALUES из io.Reader (§4 политики).
+// Package insert parses INSERT ... VALUES statements from an io.Reader without materializing the dump.
 package insert
 
 import (
@@ -6,21 +6,21 @@ import (
 	"io"
 )
 
-// Meta — заголовок одного оператора INSERT.
+// Meta describes one INSERT statement before its VALUES body.
 type Meta struct {
 	Table   string
 	Columns []string
 	Offset  int64
 	Line    int
-	// ValuesLine — строка файла, с которой начинается хвост после VALUES.
-	// ParseValues по ней считает абсолютные номера строк (Handler.Cut).
+	// ValuesLine is the source line where the VALUES body starts. ParseValues
+	// uses it to report absolute lines to Handler.Cut.
 	ValuesLine int
-	// ValuesOffset — байт файла, с которого начинается хвост после VALUES:
-	// ParseValues по нему считает абсолютный байт места ошибки.
+	// ValuesOffset is the source byte where the VALUES body starts. ParseValues
+	// uses it to report absolute error offsets.
 	ValuesOffset int64
 }
 
-// Kind — тип ячейки VALUES.
+// Kind identifies a VALUES cell representation.
 type Kind int
 
 const (
@@ -29,14 +29,14 @@ const (
 	Missing
 )
 
-// Cell — одно значение строки VALUES. Текст без окружающих SQL-кавычек.
+// Cell is one VALUES entry with surrounding SQL quotes removed from Text.
 type Cell struct {
 	Kind Kind
 	Text string
 }
 
-// Skip — отвергнутый INSERT. Если перед этим был Begin без End,
-// получатель должен отбросить уже принятые строки.
+// Skip describes a rejected INSERT. If Begin was emitted without End, the
+// receiver must discard rows already accepted for that statement.
 type Skip struct {
 	Offset int64
 	Line   int
@@ -44,41 +44,38 @@ type Skip struct {
 	Reason string
 }
 
-// ErrRowSurplus — строка VALUES шире допустимой; INSERT не отменяется.
+// ErrRowSurplus reports a VALUES row wider than its accepted schema without rejecting the whole INSERT.
 var ErrRowSurplus = errors.New("значений больше, чем колонок")
 
-// CellWriter принимает ячейки одной строки VALUES без хранения всего текста в слайсе.
+// CellWriter receives one VALUES row without materializing all cell text in memory.
 type CellWriter interface {
 	Null() error
 	Missing() error
-	// Text копирует декодированный SQL-текст значения в w (без SQL-кавычек).
+	// Text writes the decoded value without surrounding SQL quotes.
 	Text(write func(w io.Writer) error) error
 }
 
-// Handler принимает события разбора. Нил-колбэки пропускаются.
-// Ошибка из Begin/Row/End останавливает разбор (это I/O потребителя, не SQL).
+// Handler receives parser events. Nil callbacks are ignored. Callback errors
+// stop parsing because they represent consumer I/O failures rather than SQL syntax.
 type Handler struct {
-	// BeforeValues вызывается после списка колонок и до разбора ячеек VALUES.
-	// skip=true — хвост statement пропускается без Cell.
+	// BeforeValues runs after the column list and before VALUES cells are parsed.
+	// Returning skip avoids parsing or emitting the statement body.
 	BeforeValues func(Meta) (skip bool, err error)
-	// ValuesAt получает границы хвоста statement (после VALUES, до ';'
-	// включительно) как смещение и длину от начала потока. Сканер ячейки не
-	// разбирает и хвост не копирует: вызывающий читает диапазон сам
-	// (io.SectionReader по тому же файлу) и разбирает его ParseValues.
+	// ValuesAt receives the VALUES body range through the terminating semicolon.
+	// The scanner neither parses nor copies it; callers may read the range with
+	// io.SectionReader and pass it to ParseValues.
 	ValuesAt func(meta Meta, off, n int64) error
 	Begin    func(Meta) error
-	// Row получает одну разобранную строку VALUES.
-	// Вернуть ErrRowSurplus — пропустить только эту строку.
+	// Row receives one parsed VALUES row. ErrRowSurplus skips only that row.
 	Row func([]Cell) error
-	// StreamRow, если задан, используется вместо Row: пишет строку без []Cell.
-	// emit заполняет ячейки текущей tuple; потребитель пишет CSV сам.
-	// Вернуть ErrRowSurplus — пропустить строку; остальные строки INSERT продолжаются.
+	// StreamRow replaces Row when set. emit streams cells from the current tuple
+	// so the consumer can write CSV without allocating []Cell. ErrRowSurplus
+	// skips only the current row.
 	StreamRow func(emit func(CellWriter) error) error
-	// RowSurplus вызывается один раз на каждую пропущенную из‑за ширины строку.
+	// RowSurplus runs once for each row skipped because of its width.
 	RowSurplus func()
-	// Cut — INSERT оборван после принятых строк (обрезанный дамп, битая
-	// последняя строка): принятые строки остаются, дальше вызывается End.
-	// line — строка файла, где оборвалось.
+	// Cut reports an INSERT truncated after complete rows. Accepted rows remain,
+	// End still follows, and line identifies the source location of the cut.
 	Cut  func(reason string, line int)
 	End  func() error
 	Skip func(Skip)

@@ -1,424 +1,28 @@
 package app
 
 import (
-	"fmt"
-	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"sort"
-	"strings"
-	"sync"
-	"time"
 
-	"sql2csv/internal/convert"
 	"sql2csv/internal/csvout"
 	"sql2csv/internal/logx"
-	"sql2csv/internal/marks"
 	"sql2csv/internal/scan"
-	"sql2csv/internal/xlsconv"
 )
 
 const maxWorkers = 16
 
-// poolSize — N воркеров на весь запуск: min(GOMAXPROCS, 16), не меньше 1 (§9).
-// Числом файлов не ограничивается: INSERT одного файла тоже идут в этот пул.
+// maxConcurrentDirs bounds concurrent workbook and splitter memory without reducing INSERT workers.
+const maxConcurrentDirs = 4
+
+// poolSize caps the run-wide worker pool at min(GOMAXPROCS, 16), with at least
+// one worker. INSERT units from one file share the same pool as other files.
 func poolSize() int {
 	return min(max(runtime.GOMAXPROCS(0), 1), maxWorkers)
 }
 
-func folderName(f scan.SQLFile) string {
-	if f.TopFolder == "" {
-		return "корень"
-	}
-	return f.TopFolder
-}
-
-func folderKey(f scan.SQLFile) string {
-	if f.TopFolder == "" {
-		return "\x00root"
-	}
-	return f.TopFolder
-}
-
-type accumulator struct {
-	mu         sync.Mutex
-	insertOK   int
-	insertSkip int
-	csv        int
-	filesFail  int
-	tops       map[string]struct{}
-	left       map[string]int
-	active     map[string]activeFolder
-	blocked    map[string]struct{}
-	log        *logx.Logger
-	root       string
-	byTop      map[string]*topAcc
-	// convSkip/splitSkip — верхние папки (ключи marks.Fold), уже записанные
-	// в списки конверта/нарезки: этот этап для них не выполняется.
-	convSkip  map[string]struct{}
-	splitSkip map[string]struct{}
-}
-
-// phases — какие этапы идут для верхней папки. Файлы прямо в корне
-// в списки не пишутся и обрабатываются каждый запуск.
-func (a *accumulator) phases(topFolder string) (convert, split bool) {
-	if topFolder == "" {
-		return true, true
-	}
-	key := marks.Fold(topFolder)
-	_, convDone := a.convSkip[key]
-	_, splitDone := a.splitSkip[key]
-	return !convDone, !splitDone
-}
-
-type activeFolder struct {
-	name  string
-	start time.Time
-}
-
-type topAcc struct {
-	csv         int
-	created     int
-	openErr     int
-	writeErr    int
-	failed      int
-	skipTooMany int
-	piiSkip     int
-	unitFail    int
-	sqlN        int
-	excelN      int
-	splitFail   bool
-	// splitDone — нарезан хотя бы один файл (свежий CSV или лежавший .csv/.txt).
-	splitDone bool
-}
-
-func newAccumulator(log *logx.Logger, root string, files []scan.SQLFile, blocked map[string]struct{}) *accumulator {
-	left := make(map[string]int)
-	for _, f := range files {
-		left[folderKey(f)]++
-	}
-	return &accumulator{
-		convSkip:  make(map[string]struct{}),
-		splitSkip: make(map[string]struct{}),
-		tops:      make(map[string]struct{}),
-		left:      left,
-		active:    make(map[string]activeFolder),
-		blocked:   blocked,
-		log:       log,
-		root:      root,
-		byTop:     make(map[string]*topAcc),
-	}
-}
-
-func (a *accumulator) ensureTop(key string) *topAcc {
-	st := a.byTop[key]
-	if st == nil {
-		st = &topAcc{}
-		a.byTop[key] = st
-	}
-	return st
-}
-
-func (st *topAcc) failReason() string {
-	var parts []string
-	if st.piiSkip > 0 {
-		parts = append(parts, "всё отсеял фильтр")
-	}
-	if st.openErr > 0 || st.failed > 0 || st.unitFail > 0 {
-		parts = append(parts, "не разобрать")
-	}
-	if st.writeErr > 0 {
-		parts = append(parts, "не записать")
-	}
-	if len(parts) == 0 {
-		return "нечего конвертировать"
-	}
-	return strings.Join(parts, "; ")
-}
-
-func (a *accumulator) start(file scan.SQLFile) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	// Папка уже в одном из списков — в строку прогресса не выводится.
-	if convert, split := a.phases(file.TopFolder); !convert || !split {
-		return
-	}
-	a.setActiveLocked(folderKey(file), folderName(file))
-}
-
-func (a *accumulator) setActiveLocked(key, name string) {
-	if _, ok := a.active[key]; ok {
-		return
-	}
-	a.active[key] = activeFolder{name: name, start: time.Now()}
-	a.refreshHang()
-}
-
-func (a *accumulator) add(file scan.SQLFile, out fileOutcome) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.recordLocked(file, out)
-	a.finishFileLocked(file)
-}
-
-func (a *accumulator) record(file scan.SQLFile, out fileOutcome) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.recordLocked(file, out)
-}
-
-func (a *accumulator) finishFiles(files []scan.SQLFile) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for _, file := range files {
-		a.finishFileLocked(file)
-	}
-}
-
-// markSplit учитывает нарезку CSV, записанных этим запуском в директории.
-func (a *accumulator) markSplit(file scan.SQLFile, failed, split bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	st := a.ensureTop(folderKey(file))
-	if split {
-		st.splitDone = true
-	}
-	if failed {
-		st.splitFail = true
-		st.unitFail++
-		a.filesFail++
-	}
-}
-
-func (a *accumulator) recordLocked(file scan.SQLFile, out fileOutcome) {
-	st := a.ensureTop(folderKey(file))
-	switch {
-	case file.IsCSV():
-	case file.IsExcel():
-		st.excelN++
-	default:
-		st.sqlN++
-	}
-	if out.splitFail {
-		st.splitFail = true
-	}
-	if out.split {
-		st.splitDone = true
-		a.csv++
-	}
-	if out.openErr != nil {
-		a.filesFail++
-		st.openErr++
-		a.log.Errorf("%s: не удалось открыть: %v", file.Path, out.openErr)
-		return
-	}
-	if out.skipTooMany {
-		st.skipTooMany++
-		return
-	}
-	if out.failed {
-		a.filesFail++
-		st.failed++
-	}
-	if out.writeErr != nil {
-		a.filesFail++
-		st.writeErr++
-		a.log.Errorf("%s: не удалось создать CSV: %v", file.Path, out.writeErr)
-	}
-	a.insertOK += out.created
-	a.insertSkip += out.skipped
-	a.csv += out.csv
-	st.csv += out.csv
-	st.created += out.created
-	st.piiSkip += out.piiSkip
-	st.unitFail += out.unitFail
-}
-
-func (a *accumulator) finishFileLocked(file scan.SQLFile) {
-	key := folderKey(file)
-	a.left[key]--
-	if a.left[key] == 0 {
-		a.finishTopLocked(key, folderName(file), file.TopFolder)
-	}
-}
-
-func (a *accumulator) finishTopLocked(key, name, topFolder string) {
-	_, cannotComplete := a.blocked[topFolder]
-	st := a.ensureTop(key)
-	delete(a.active, key)
-	a.refreshHang()
-	if cannotComplete {
-		return
-	}
-	convert, split := a.phases(topFolder)
-	a.recordListsLocked(topFolder, convert, split, st.csv > 0, st.splitDone)
-	say, sayErr := a.log.Linef, a.log.Errorf
-	if !convert || !split {
-		// Папка уже в одном из списков: итог только в _log.txt.
-		say, sayErr = a.log.FileLinef, a.log.FileErrorf
-	}
-	if st.splitFail {
-		sayErr("папка %s: не нарезать", name)
-		return
-	}
-	if st.csv > 0 || st.splitDone {
-		say("папка обработана: %s", name)
-		return
-	}
-	if st.sqlN == 0 && st.excelN == 0 {
-		say("папка %s: нет файлов", name)
-		return
-	}
-	sayErr("папка %s: не создано ни одного CSV: %s", name, st.failReason())
-}
-
-// recordListsLocked дописывает верхнюю папку в списки этапов, которые шли в
-// этом запуске: done — есть результат, passed — прошла без результата
-// (нечего делать или не вышло; повторно не открывается).
-func (a *accumulator) recordListsLocked(topFolder string, convert, split, converted, splitDone bool) {
-	if topFolder == "" {
-		return
-	}
-	add := func(l marks.List) {
-		if err := marks.Append(a.root, l, topFolder); err != nil {
-			a.log.Errorf("не удалось дописать %s: %v", marks.Path(a.root, l), err)
-			return
-		}
-		if l == marks.ConvertDone || l == marks.SplitDone {
-			a.tops[topFolder] = struct{}{}
-		}
-	}
-	if convert {
-		if converted {
-			add(marks.ConvertDone)
-		} else {
-			add(marks.ConvertPassed)
-		}
-	}
-	if split {
-		if splitDone {
-			add(marks.SplitDone)
-		} else {
-			add(marks.SplitPassed)
-		}
-	}
-}
-
-func (a *accumulator) refreshHang() {
-	if len(a.active) == 0 {
-		a.log.Hang("")
-		return
-	}
-	folders := make([]activeFolder, 0, len(a.active))
-	for _, folder := range a.active {
-		folders = append(folders, folder)
-	}
-	sort.Slice(folders, func(i, j int) bool { return folders[i].name < folders[j].name })
-	now := time.Now()
-	label := func(f activeFolder) string {
-		return fmt.Sprintf("%s (%d с)", f.name, max(int(now.Sub(f.start)/time.Second), 0))
-	}
-	parts := make([]string, len(folders))
-	for i, folder := range folders {
-		parts[i] = label(folder)
-	}
-	const prefix = "папка в обработке: "
-	line := prefix + strings.Join(parts, ", ")
-	if logx.DisplayWidth(line) > logx.HangWidth {
-		// §8: все не влезают — самая давняя. Строка длиннее экрана переносится,
-		// и \r затирает только её хвост: каждую секунду в консоли мусор.
-		oldest := slices.MinFunc(folders, func(x, y activeFolder) int { return x.start.Compare(y.start) })
-		line = truncateWidth(prefix+label(oldest), logx.HangWidth)
-	}
-	a.log.Hang(line)
-}
-
-// truncateWidth обрезает s до width колонок, заменяя хвост на «…».
-func truncateWidth(s string, width int) string {
-	if logx.DisplayWidth(s) <= width {
-		return s
-	}
-	var b strings.Builder
-	w := 0
-	for _, r := range s {
-		rw := logx.DisplayWidth(string(r))
-		if w+rw > width-1 {
-			break
-		}
-		b.WriteRune(r)
-		w += rw
-	}
-	return b.String() + "…"
-}
-
-func (a *accumulator) tickHang() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if len(a.active) == 0 {
-		return
-	}
-	a.refreshHang()
-}
-
-func (a *accumulator) startHangTicker() func() {
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				a.tickHang()
-			}
-		}
-	}()
-	return func() {
-		close(stop)
-		<-done
-	}
-}
-
-func (a *accumulator) snapshot() (insertOK, insertSkip, csv, filesFail int, tops map[string]struct{}) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	cloned := make(map[string]struct{}, len(a.tops))
-	for k := range a.tops {
-		cloned[k] = struct{}{}
-	}
-	return a.insertOK, a.insertSkip, a.csv, a.filesFail, cloned
-}
-
-func (a *accumulator) completeEmptyTops(topDirs []string) {
-	for _, name := range topDirs {
-		a.mu.Lock()
-		_, hadWork := a.left[name]
-		_, cannotComplete := a.blocked[name]
-		if hadWork || cannotComplete {
-			a.mu.Unlock()
-			continue
-		}
-
-		a.setActiveLocked(name, name)
-		delete(a.active, name)
-		a.refreshHang()
-		convert, split := a.phases(name)
-		a.recordListsLocked(name, convert, split, false, false)
-		if convert && split {
-			a.log.Linef("папка %s: нет файлов", name)
-		} else {
-			a.log.FileLinef("папка %s: нет файлов", name)
-		}
-		a.mu.Unlock()
-	}
-}
-
-// processFiles обрабатывает файлы запуска. convSkip/splitSkip — верхние
-// папки (ключи marks.Fold), для которых этап конверта/нарезки уже закрыт.
+// processFiles handles discovered inputs. convSkip and splitSkip contain Fold
+// keys for top-level folders whose corresponding stage is already complete.
 func processFiles(log *logx.Logger, root string, files []scan.SQLFile, blocked, convSkip, splitSkip map[string]struct{}) *accumulator {
 	acc := newAccumulator(log, root, files, blocked)
 	if convSkip != nil {
@@ -455,11 +59,9 @@ func groupByTop(files []scan.SQLFile) [][]scan.SQLFile {
 	return groups
 }
 
-// groupByDir собирает файлы одной директории в группу. SQL-файлы идут единым
-// непрерывным потоком раньше Excel и сортируются по пути: так SQL-ключ не может
-// быть вытеснен Excel-файлом между двумя INSERT и ошибочно дописаться в Excel CSV.
-// Excel идёт после SQL, заранее лежавшие CSV — после Excel. Внутри ранга файлы
-// сортируются по пути.
+// groupByDir keeps each directory together and orders inputs by ownership risk:
+// path-sorted SQL files first, then Excel, then pre-existing CSV. Keeping SQL
+// contiguous prevents an Excel output from taking an SQL merge key mid-stream.
 func groupByDir(files []scan.SQLFile) [][]scan.SQLFile {
 	order := make([]string, 0)
 	byDir := make(map[string][]scan.SQLFile)
@@ -484,49 +86,7 @@ func groupByDir(files []scan.SQLFile) [][]scan.SQLFile {
 	return groups
 }
 
-type fileOutcome struct {
-	openErr     error
-	writeErr    error
-	created     int
-	skipped     int
-	csv         int
-	skipTooMany bool
-	failed      bool
-	piiSkip     int
-	unitFail    int
-	splitFail   bool
-	split       bool // лежавший .csv/.txt нарезан
-}
-
-func outcomeFromConvert(fr convert.Result) fileOutcome {
-	return fileOutcome{
-		openErr:  fr.OpenErr,
-		created:  fr.Created,
-		skipped:  fr.Skipped,
-		csv:      fr.CSV,
-		failed:   fr.Failed,
-		piiSkip:  fr.PIISkip,
-		unitFail: fr.UnitFail,
-	}
-}
-
-func convertExcel(log *logx.Logger, reg *csvout.Registry, file scan.SQLFile) (out fileOutcome) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			log.Errorf("%s: сбой обработки (%v), файл пропущен", file.Path, rec)
-			out = fileOutcome{skipped: 1, failed: true}
-		}
-	}()
-	xr := xlsconv.File(reg, file.Path)
-	return fileOutcome{
-		openErr:     xr.OpenErr,
-		writeErr:    xr.WriteErr,
-		csv:         xr.CSV,
-		skipTooMany: xr.SkipTooMany,
-	}
-}
-
-// testDirEnter — крюк теста. В бою nil. Вызывается до файлов директории.
+// testDirEnter is a test hook called before a directory's files; it is nil in production.
 var testDirEnter func(scan.SQLFile)
 
 func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, submit func(func()), group []scan.SQLFile) {
@@ -535,8 +95,13 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 	}
 	dir := filepath.Dir(group[0].Path)
 	defer func() {
+		if err := csvout.CleanupTemps(dir); err != nil {
+			log.Errorf("%s: не удалось удалить временные CSV: %v", dir, err)
+			acc.markGroupFailure(group[0])
+		}
 		if rec := recover(); rec != nil {
 			log.Errorf("%s: сбой обработки (%v), папка пропущена", dir, rec)
+			acc.markGroupFailure(group[0])
 		}
 		acc.finishFiles(group)
 	}()
@@ -564,54 +129,9 @@ func processDirGroup(acc *accumulator, log *logx.Logger, reg *csvout.Registry, s
 	if !doSplit {
 		csvs = nil
 	}
-	var produced []scan.SQLFile
-	for _, file := range sqls {
-		acc.start(file)
-		out := outcomeFromConvert(convert.Schedule(log, reg, file, submit))
-		acc.record(file, out)
-		if producedCSV(out) {
-			produced = append(produced, file)
-		}
-	}
-	for _, file := range excels {
-		acc.start(file)
-		out := convertExcel(log, reg, file)
-		acc.record(file, out)
-		if producedCSV(out) {
-			produced = append(produced, file)
-		}
-	}
-	// CSV этого запуска режутся всегда: это часть их создания (§5).
-	failed, splitAny := splitWritten(log, reg, dir)
-	acc.markSplit(group[0], failed, splitAny)
-	ours := outputPaths(reg, dir)
-	for _, file := range csvs {
-		acc.start(file)
-		if _, ok := ours[foldPath(file.Path)]; ok {
-			acc.record(file, fileOutcome{})
-			continue
-		}
-		acc.record(file, splitForeignCSV(log, reg, file))
-	}
-	for _, file := range produced {
-		removeSource(log, file.Path)
-	}
-}
-
-// producedCSV — исходник можно удалить (§15): CSV получен и ни одна единица
-// файла не провалилась. Иначе удаление унесло бы INSERT или лист, которые
-// в CSV не попали (ошибка записи, лишние значения, занятое имя).
-func producedCSV(out fileOutcome) bool {
-	if out.writeErr != nil || out.failed || out.unitFail > 0 {
-		return false
-	}
-	return out.created > 0 || out.csv > 0
-}
-
-func removeSource(log *logx.Logger, path string) {
-	if err := os.Remove(path); err != nil {
-		log.Errorf("%s: не удалось удалить: %v", path, err)
-	}
+	convertDirFiles(acc, log, reg, submit, sqls, excels)
+	// Newly produced CSV files are always split as part of publishing their result.
+	splitDirFiles(acc, log, reg, dir, group[0], csvs)
 }
 
 func fileRank(f scan.SQLFile) int {

@@ -2,26 +2,36 @@ package csvout
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
+func TestSplitProductionLimits(t *testing.T) {
+	if SplitThreshold != 4_000_000 || SplitChunkRows != 2_000_000 {
+		t.Fatalf("split limits = %d/%d", SplitThreshold, SplitChunkRows)
+	}
+}
+
 func TestSplitExactThresholdUntouched(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rows.csv")
-	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", SplitThreshold)
+	const threshold = 4
+	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", threshold)
 	before := fileSHA(t, path)
 
-	res, err := SplitIfNeeded(path, SplitWithHeader)
+	res, err := splitFile(path, SplitWithHeader, threshold, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Split || res.DataRows != SplitThreshold {
+	if res.Split || res.DataRows != threshold {
 		t.Fatalf("split=%v rows=%d", res.Split, res.DataRows)
 	}
 	if fileSHA(t, path) != before {
@@ -36,31 +46,31 @@ func TestSplitExactThresholdUntouched(t *testing.T) {
 func TestSplitJustOverThreshold(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rows.csv")
-	const rows = SplitThreshold + 1
+	const rows = 5
 	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", rows)
 
-	res, err := SplitIfNeeded(path, SplitWithHeader)
+	res, err := splitFile(path, SplitWithHeader, 4, 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !res.Split || res.DataRows != rows {
 		t.Fatalf("split=%v rows=%d", res.Split, res.DataRows)
 	}
-	assertPartData(t, res.Parts, SplitWithHeader, []int64{SplitChunkRows, SplitChunkRows, 1})
+	assertPartData(t, res.Parts, SplitWithHeader, []int64{2, 2, 1})
 	assertNoTemps(t, dir)
 }
 
-func TestSplit1200001Distribution(t *testing.T) {
+func TestSplitDistribution(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "rows.csv")
-	const rows = 1_200_001
+	const rows = 9
 	writePlainRows(t, path, "\"id\"\n", "\"a\"\n", rows)
 
-	res, err := SplitIfNeeded(path, SplitWithHeader)
+	res, err := splitFile(path, SplitWithHeader, 8, 4, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertPartData(t, res.Parts, SplitWithHeader, []int64{500_000, 500_000, 200_001})
+	assertPartData(t, res.Parts, SplitWithHeader, []int64{4, 4, 1})
 	for _, p := range res.Parts {
 		raw := readHead(t, p, len("\"id\"\n"))
 		if string(raw) != "\"id\"\n" {
@@ -121,7 +131,7 @@ func TestSplitForeignFirstNonEmptyIsHeader(t *testing.T) {
 	const raw = "\n\"h\"\r\n\"a\"\r\n\r\n"
 	writeRaw(t, kept, raw)
 	before := fileSHA(t, kept)
-	out, err := SplitIfNeeded(kept, SplitWithHeader)
+	out, err := NewRegistry().SplitIfNeeded(kept, SplitWithHeader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,27 +140,22 @@ func TestSplitForeignFirstNonEmptyIsHeader(t *testing.T) {
 	}
 }
 
-// §14: уже лежащий {stem}_2.csv становится слотом части и заменяется.
-// Поэтому повторная нарезка после обрыва не плодит дубли в _3, _4.
-func TestSplitReplacesOccupiedPartName(t *testing.T) {
+func TestSplitRejectsOccupiedPartName(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "users.csv")
-	writeRaw(t, path, "\"a\"\n\"b\"\n\"c\"\n")
-	writeRaw(t, filepath.Join(dir, "users_2.csv"), "STALE\n")
+	const body = "\"a\"\n\"b\"\n\"c\"\n"
+	writeRaw(t, path, body)
+	part := filepath.Join(dir, "users_2.csv")
+	writeRaw(t, part, "KEEP\n")
 
-	res, err := splitFile(path, SplitNoHeader, 2, 2, nil)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := splitFile(path, SplitNoHeader, 2, 2, nil); !errors.Is(err, ErrNameTaken) {
+		t.Fatalf("ожидался ErrNameTaken, получено %v", err)
 	}
-	assertPartBytes(t, res.Parts, []string{
-		"\"a\"\n\"b\"\n",
-		"\"c\"\n",
-	})
-	if filepath.Base(res.Parts[1]) != "users_2.csv" {
-		t.Fatalf("часть: %s", res.Parts[1])
+	if got, err := os.ReadFile(path); err != nil || string(got) != body {
+		t.Fatalf("монолит изменён: %q, err=%v", got, err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "users_3.csv")); !os.IsNotExist(err) {
-		t.Fatalf("лишняя часть users_3.csv: %v", err)
+	if got, err := os.ReadFile(part); err != nil || string(got) != "KEEP\n" {
+		t.Fatalf("занятая часть изменена: %q, err=%v", got, err)
 	}
 }
 
@@ -186,24 +191,15 @@ func TestSplitPartNamesUseOwnStem(t *testing.T) {
 	}
 }
 
-// §14: провал нарезки оставляет монолит как был; части, лежавшие до прогона,
-// не уничтожаются, новые части этого прогона убираются.
+// Any preexisting part stops splitting before new files are published.
 func TestSplitFailureKeepsMonolithAndPreexistingParts(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "users.csv")
 	const body = "\"a\"\n\"b\"\n\"c\"\n\"d\"\n\"e\"\n\"f\"\n\"g\"\n"
 	writeRaw(t, path, body)
 	writeRaw(t, filepath.Join(dir, "users_3.csv"), "OLD\n")
-	// Каталог на месте четвёртой части: её публикация падает.
-	if err := os.Mkdir(filepath.Join(dir, "users_4.csv"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "users_4.csv", "x"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
 	if _, err := splitFile(path, SplitNoHeader, 2, 2, nil); err == nil {
-		t.Fatal("ожидалась ошибка публикации части")
+		t.Fatal("ожидалась ошибка занятой части")
 	}
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -219,6 +215,64 @@ func TestSplitFailureKeepsMonolithAndPreexistingParts(t *testing.T) {
 		t.Fatalf("лежавшая до прогона users_3.csv уничтожена: %v", err)
 	}
 	assertNoTemps(t, dir)
+}
+
+func TestSplitFailureBeforePublishKeepsMonolith(t *testing.T) {
+	injected := errors.New("injected output failure")
+	for _, tt := range outputFailureCases(injected) {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "users.csv")
+			const body = "\"a\"\n\"b\"\n\"c\"\n"
+			writeRaw(t, path, body)
+			tt.install(t)
+
+			if _, err := splitFile(path, SplitNoHeader, 2, 2, nil); !errors.Is(err, injected) {
+				t.Fatalf("split error = %v, want %v", err, injected)
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != body {
+				t.Fatalf("monolith changed after failed %s: %q, err=%v", tt.name, got, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "users_2.csv")); !os.IsNotExist(err) {
+				t.Fatalf("part remains after failed %s: %v", tt.name, err)
+			}
+			assertNoTemps(t, dir)
+		})
+	}
+}
+
+func TestSplitPublishFailureRollsBackNewParts(t *testing.T) {
+	injected := errors.New("injected publish failure")
+	for failAt := 1; failAt <= 4; failAt++ {
+		t.Run(fmt.Sprintf("publish_%d", failAt), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "users.csv")
+			const body = "\"a\"\n\"b\"\n\"c\"\n\"d\"\n\"e\"\n\"f\"\n\"g\"\n"
+			writeRaw(t, path, body)
+			calls := 0
+			setOutputOps(t, nil, nil, func(src, dst string) error {
+				calls++
+				if calls == failAt {
+					return injected
+				}
+				return replaceFile(src, dst)
+			})
+
+			if _, err := splitFile(path, SplitNoHeader, 2, 2, nil); !errors.Is(err, injected) {
+				t.Fatalf("split error = %v, want %v", err, injected)
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != body {
+				t.Fatalf("monolith changed: %q, err=%v", got, err)
+			}
+			for part := 2; part <= 4; part++ {
+				partPath := filepath.Join(dir, fmt.Sprintf("users_%d.csv", part))
+				if _, err := os.Stat(partPath); !os.IsNotExist(err) {
+					t.Fatalf("published part was not rolled back: %s, err=%v", partPath, err)
+				}
+			}
+			assertNoTemps(t, dir)
+		})
+	}
 }
 
 // Незакрытая кавычка в чужом CSV превращала остаток файла в одну запись
@@ -284,7 +338,7 @@ func TestSplitRejectsConvertedAndNonCSV(t *testing.T) {
 		path := filepath.Join(dir, name)
 		writeRaw(t, path, "\"a\"\n\"b\"\n")
 		before := fileSHA(t, path)
-		if _, err := SplitIfNeeded(path, SplitWithHeader); err == nil {
+		if _, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader); err == nil {
 			t.Fatalf("%s принят", name)
 		}
 		if fileSHA(t, path) != before {
@@ -295,7 +349,7 @@ func TestSplitRejectsConvertedAndNonCSV(t *testing.T) {
 	csvPath := filepath.Join(dir, "DATA.CSV")
 	writeRaw(t, csvPath, "\"h\"\n\"a\"\n")
 	before := fileSHA(t, csvPath)
-	res, err := SplitIfNeeded(csvPath, SplitWithHeader)
+	res, err := NewRegistry().SplitIfNeeded(csvPath, SplitWithHeader)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +374,7 @@ func TestSplitRecordTooLargeKeepsOriginal(t *testing.T) {
 	b.WriteString("\"\n\"a\"\n\"b\"\n\"c\"\n")
 	writeRaw(t, path, b.String())
 	before := fileSHA(t, path)
-	_, err := SplitIfNeeded(path, SplitWithHeader)
+	_, err := NewRegistry().SplitIfNeeded(path, SplitWithHeader)
 	if err == nil || !errors.Is(err, ErrRecordTooLarge) {
 		t.Fatalf("ожидался ErrRecordTooLarge, got %v", err)
 	}
@@ -466,9 +520,6 @@ func assertPartData(t *testing.T, parts []string, mode HeaderMode, want []int64)
 		if n != want[i] {
 			t.Fatalf("%s: строк %d, ожидалось %d", p, n, want[i])
 		}
-		if n > SplitChunkRows {
-			t.Fatalf("%s: кусок больше %d", p, SplitChunkRows)
-		}
 	}
 }
 
@@ -490,7 +541,7 @@ func assertPartBytes(t *testing.T, parts, want []string) {
 
 func assertNoTemps(t *testing.T, dir string) {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dir, ".2csv-*.tmp"))
+	matches, err := filepath.Glob(filepath.Join(dir, tmpDirName, tmpPattern))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,4 +587,40 @@ func TestSplitTextRejectsConvertedAndCSVModeOnTxt(t *testing.T) {
 	if _, err := splitFile(txt, SplitWithHeader, 1, 1, nil); err == nil {
 		t.Fatal(".txt режется только построчно")
 	}
+}
+
+func FuzzRecordReaderPreservesBytes(f *testing.F) {
+	for _, seed := range []struct {
+		data  []byte
+		plain bool
+	}{
+		{data: nil},
+		{data: []byte("a\nb\r\nc\r")},
+		{data: []byte("\"a\n\"\"b\"\",c\r\n")},
+		{data: []byte("open,\"quote\nwithout end")},
+		{data: []byte{0x00, 0xFF, '\r', '\n'}, plain: true},
+	} {
+		f.Add(seed.data, seed.plain)
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte, plain bool) {
+		r := recordReader{
+			br:    bufio.NewReaderSize(bytes.NewReader(data), 256*1024),
+			plain: plain,
+		}
+		var got []byte
+		for {
+			rec, err := r.next()
+			got = append(got, rec...)
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatalf("recordReader.next: %v", err)
+			}
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("recordReader changed bytes:\n got %q\nwant %q", got, data)
+		}
+	})
 }

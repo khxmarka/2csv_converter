@@ -9,19 +9,19 @@ import (
 	"sql2csv/internal/scan"
 )
 
-// Result — итог одного файла: ошибки открытия не роняют процесс, их видит вызывающий.
+// Result summarizes one input file. Open errors are reported to the caller without stopping the run.
 type Result struct {
-	Created  int // успешные INSERT
-	CSV      int // новые CSV-файлы (дописывания не считаются)
+	Created  int // Successfully committed INSERT statements.
+	CSV      int // Newly published CSV files; appends do not count.
 	Skipped  int
 	PIISkip  int
 	UnitFail int
 	Paths    []string
 	OpenErr  error
-	Failed   bool // в файле была критическая ошибка чтения/записи CSV
+	Failed   bool // A critical read or CSV write failure occurred.
 }
 
-// session — счётчики одного .sql. Меняется только из горутины commitQ.
+// session contains state for one SQL file and is mutated only by the commitQ goroutine.
 type session struct {
 	log      *logx.Logger
 	reg      *csvout.Registry
@@ -34,11 +34,12 @@ type session struct {
 	unitFail int
 	failed   bool
 	paths    []string
+	dirty    []string
 }
 
 func skipQuiet(reason string) bool {
 	switch reason {
-	// «нет INTO» — INSERT как слово в GRANT/TRIGGER, а не оператор данных.
+	// A missing INTO marks INSERT used in a GRANT or trigger rather than a data statement.
 	case "INSERT ... SELECT", "INSERT ... SET", "нет VALUES", "пустой список колонок", "нет строк VALUES", "нет INTO":
 		return true
 	default:
@@ -52,7 +53,7 @@ func (s *session) skip(sk insert.Skip) {
 		return
 	}
 	s.unitFail++
-	// Путь со строкой INSERT (file.sql:120): место в файле видно сразу.
+	// Include the INSERT line in the path so operators can locate the failure directly.
 	where := s.sql.Path
 	if sk.Line > 0 {
 		where = fmt.Sprintf("%s:%d", s.sql.Path, sk.Line)

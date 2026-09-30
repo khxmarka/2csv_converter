@@ -10,23 +10,21 @@ import (
 	"sync"
 )
 
-// Registry держит слоты склейки: ключ = (директория .sql, FileBase таблицы).
-// Слот сериализует первое создание файла и последующие дописывания.
+// Registry serializes initial publication and later appends for each
+// (SQL directory, table FileBase) merge key.
 type Registry struct {
 	mu    sync.Mutex
 	byKey map[string]*slot
 	byDir map[string]*sync.Mutex
-	// slotsIn — слоты склейки по canonicalPath директории, для CloseDir.
-	slotsIn map[string][]*slot
-	// outs — CSV этого запуска по canonicalPath директории. Map, а не общий
-	// список: иначе каждый новый CSV сканировал бы все CSV запуска (O(n²)).
+	// outs indexes this run's CSV outputs by canonical directory path to avoid
+	// scanning every prior output for each new file.
 	outs map[string][]output
-	// written — canonicalPath каждого CSV, записанного в этом запуске.
+	// written tracks the canonical path of every CSV published in this run.
 	written map[string]struct{}
 }
 
-// ErrNameTaken — целевое имя уже занято CSV этого запуска от другого ключа.
-// Замена затёрла бы результат, исходник которого потом удаляется (§15).
+// ErrNameTaken reports that another key already owns the target path. Replacing
+// it could erase output whose successful source is later deleted.
 var ErrNameTaken = errors.New("имя CSV уже занято другим источником в этом запуске")
 
 type slot struct {
@@ -34,39 +32,10 @@ type slot struct {
 	path      string
 	nCol      int
 	hasHeader bool
-	// app — открытый на дописывание path. Живёт между INSERT одного .sql,
-	// чтобы не открывать CSV на каждый INSERT; закрывает CloseDir.
-	app *os.File
 }
 
-// appendTo дописывает в path ключа через кэшированный дескриптор. Провал
-// откатывает файл к прежнему размеру (§6). Truncate — по пути: у дескриптора
-// O_APPEND в Windows нет права менять длину файла.
 func (s *slot) appendTo(write func(io.Writer) error) error {
-	if s.app == nil {
-		f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			return err
-		}
-		s.app = f
-	}
-	info, err := s.app.Stat()
-	if err != nil {
-		return err
-	}
-	if err := write(s.app); err != nil {
-		return errors.Join(err, os.Truncate(s.path, info.Size()))
-	}
-	return nil
-}
-
-func (s *slot) closeApp() error {
-	if s.app == nil {
-		return nil
-	}
-	err := s.app.Close()
-	s.app = nil
-	return err
+	return appendFile(s.path, write, false)
 }
 
 type output struct {
@@ -75,7 +44,7 @@ type output struct {
 	hasHeader bool
 }
 
-// Output — CSV, записанный в этом запуске.
+// Output describes a CSV published during the current run.
 type Output struct {
 	Path      string
 	HasHeader bool
@@ -85,7 +54,6 @@ func NewRegistry() *Registry {
 	return &Registry{
 		byKey:   make(map[string]*slot),
 		byDir:   make(map[string]*sync.Mutex),
-		slotsIn: make(map[string][]*slot),
 		outs:    make(map[string][]output),
 		written: make(map[string]struct{}),
 	}
@@ -117,31 +85,13 @@ func (r *Registry) acquire(dir, base string) *slot {
 	if !ok {
 		s = new(slot)
 		r.byKey[key] = s
-		d := canonicalPath(dir)
-		r.slotsIn[d] = append(r.slotsIn[d], s)
 	}
 	r.mu.Unlock()
 	s.mu.Lock()
 	return s
 }
 
-// CloseDir закрывает дескрипторы дописывания CSV директории dir. Вызывать,
-// когда в dir больше не пишут INSERT этого файла: до нарезки и замены CSV
-// (в Windows открытый файл не переименовать) и до конца запуска.
-func (r *Registry) CloseDir(dir string) error {
-	r.mu.Lock()
-	slots := r.slotsIn[canonicalPath(dir)]
-	r.mu.Unlock()
-	var errs []error
-	for _, s := range slots {
-		s.mu.Lock()
-		errs = append(errs, s.closeApp())
-		s.mu.Unlock()
-	}
-	return errors.Join(errs...)
-}
-
-// acquireUnique — отдельный слот без склейки INSERT. Имя файла сериализует lockDir.
+// acquireUnique reserves a non-merge output path under the directory lock.
 func (r *Registry) acquireUnique() *slot {
 	s := new(slot)
 	s.mu.Lock()
@@ -176,7 +126,7 @@ func (r *Registry) isWritten(path string) bool {
 	return ok
 }
 
-// OutputsIn возвращает CSV, которые этот запуск записал в dir.
+// OutputsIn returns CSV files published in dir during this run.
 func (r *Registry) OutputsIn(dir string) []Output {
 	if r == nil {
 		return nil
@@ -190,6 +140,27 @@ func (r *Registry) OutputsIn(dir string) []Output {
 		out[i] = Output{Path: o.path, HasHeader: o.hasHeader}
 	}
 	return out
+}
+
+// SyncFiles makes deferred INSERT appends durable before their source is completed.
+func SyncFiles(paths []string) error {
+	seen := make(map[string]struct{})
+	for _, path := range paths {
+		key := canonicalPath(path)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		if err := errors.Join(syncOutputFile(f), closeOutputFile(f)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Registry) lockDir(dir string) *sync.Mutex {

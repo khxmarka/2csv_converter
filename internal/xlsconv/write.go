@@ -7,10 +7,11 @@ import (
 
 	"sql2csv/internal/csvout"
 
+	"github.com/nkiri/xls"
 	"github.com/xuri/excelize/v2"
 )
 
-// Result — итог записи CSV одного Excel-файла. CSV на диск — только здесь.
+// Result summarizes CSV publication for one Excel workbook.
 type Result struct {
 	SkipTooMany bool
 	CSV         int
@@ -19,9 +20,9 @@ type Result struct {
 	WriteErr    error
 }
 
-// File читает книгу как таблицы листов (не SQL/INSERT) и пишет CSV
-// с заголовком из первой строки листа. Книгу с >5 листами не трогает.
-// Провал одного листа не удаляет уже записанные.
+// File converts worksheets as tables whose first row is the CSV header. A
+// workbook exceeding MaxSheets is left untouched, and one sheet failure does
+// not remove outputs already published for other sheets.
 func File(reg *csvout.Registry, path string) Result {
 	if reg == nil {
 		return Result{OpenErr: errNeedRegistry}
@@ -29,22 +30,30 @@ func File(reg *csvout.Registry, path string) Result {
 	if strings.EqualFold(filepath.Ext(path), ".xlsx") {
 		return fileXLSX(reg, path)
 	}
-	book, err := Read(path)
+	return fileXLS(reg, path)
+}
+
+func fileXLS(reg *csvout.Registry, path string) Result {
+	xlsMemoryMu.Lock()
+	defer xlsMemoryMu.Unlock()
+
+	book, tooMany, err := openXLS(path)
 	if err != nil {
 		return Result{OpenErr: err}
 	}
-	if book.SkipTooMany {
+	if tooMany {
 		return Result{SkipTooMany: true}
 	}
 
 	dir := filepath.Dir(path)
 	stem := bookStem(path)
 	var out Result
-	for _, sh := range book.Sheets {
-		if sh.Empty {
+	for i := 0; i < book.SheetCount(); i++ {
+		sh := book.Sheet(i)
+		if sh == nil {
 			continue
 		}
-		p, err := writeSheet(reg, dir, stem, sh)
+		p, err := writeXLSSheet(reg, dir, stem, sh)
 		if err != nil {
 			if out.WriteErr == nil {
 				out.WriteErr = err
@@ -60,8 +69,50 @@ func File(reg *csvout.Registry, path string) Result {
 	return out
 }
 
+func writeXLSSheet(reg *csvout.Registry, dir, stem string, sh *xls.Sheet) (string, error) {
+	width, last := 0, -1
+	for i := 0; i < sh.RowCount(); i++ {
+		row := sh.Row(i)
+		width = max(width, row.CellCount())
+		for col := 0; col < row.CellCount(); col++ {
+			if row.Cell(col).Value() != "" {
+				last = i
+			}
+		}
+	}
+	if last < 0 {
+		return "", nil
+	}
+	rowValues := func(row *xls.Row) []string {
+		values := make([]string, row.CellCount())
+		for i := range values {
+			values[i] = row.Cell(i).Value()
+		}
+		return values
+	}
+	header := padRow(rowValues(sh.Row(0)), width)
+	data := csvout.CreateData(dir)
+	defer data.Abort()
+	for i := 1; i <= last; i++ {
+		if err := data.Row(rowValues(sh.Row(i))); err != nil {
+			return "", err
+		}
+	}
+	if err := data.Finish(); err != nil {
+		return "", err
+	}
+	res, err := csvout.CommitPlain(reg, dir, csvBase(stem, sh.Name()), header, data)
+	if err != nil {
+		return "", err
+	}
+	return res.Path, nil
+}
+
 func fileXLSX(reg *csvout.Registry, path string) Result {
-	book, err := excelize.OpenFile(path)
+	book, err := excelize.OpenFile(path, excelize.Options{
+		UnzipSizeLimit:    MaxXLSXUnpackedBytes,
+		UnzipXMLSizeLimit: MaxXLSXXMLMemoryBytes,
+	})
 	if err != nil {
 		return Result{OpenErr: err}
 	}
@@ -98,9 +149,9 @@ func fileXLSX(reg *csvout.Registry, path string) Result {
 	return out
 }
 
-// writeXLSXSheet читает лист один раз: первая строка — шапка, остальные —
-// в DataFile без дополнения; ширину по всем строкам применяет CommitPlain.
-// Пустой лист CSV не даёт; хвостовые пустые строки не пишутся (§13).
+// writeXLSXSheet reads a worksheet once and stages rows without padding;
+// CommitPlain applies the widest row. Empty sheets and trailing empty rows do
+// not produce CSV records.
 func writeXLSXSheet(reg *csvout.Registry, book *excelize.File, dir, stem, name string) (string, error) {
 	rows, err := book.Rows(name)
 	if err != nil {
@@ -160,6 +211,15 @@ func writeXLSXSheet(reg *csvout.Registry, book *excelize.File, dir, stem, name s
 	return res.Path, nil
 }
 
+func rowEmpty(row []string) bool {
+	for _, value := range row {
+		if value != "" {
+			return false
+		}
+	}
+	return true
+}
+
 func bookStem(path string) string {
 	base := filepath.Base(path)
 	return strings.TrimSuffix(base, filepath.Ext(base))
@@ -167,39 +227,6 @@ func bookStem(path string) string {
 
 func csvBase(book, sheet string) string {
 	return csvout.FileBaseDefault(book, "book") + "_" + csvout.FileBaseDefault(sheet, "sheet")
-}
-
-func maxWidth(rows [][]string) int {
-	n := 0
-	for _, row := range rows {
-		if len(row) > n {
-			n = len(row)
-		}
-	}
-	return n
-}
-
-func writeSheet(reg *csvout.Registry, dir, book string, sh Sheet) (string, error) {
-	width := maxWidth(sh.Rows)
-	if width < 1 {
-		return "", nil
-	}
-	header := padRow(sh.Rows[0], width)
-	w, err := csvout.CreatePlain(reg, dir, csvBase(book, sh.Name), header)
-	if err != nil {
-		return "", err
-	}
-	for _, row := range sh.Rows[1:] {
-		if err := w.Row(row); err != nil {
-			_ = w.Abort()
-			return "", err
-		}
-	}
-	res, err := w.Commit()
-	if err != nil {
-		return "", err
-	}
-	return res.Path, nil
 }
 
 func padRow(row []string, n int) []string {

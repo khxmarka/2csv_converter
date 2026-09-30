@@ -1,4 +1,4 @@
-// Package cli разбирает аргументы командной строки и вызывает app.
+// Package cli parses command-line arguments and runs the application.
 package cli
 
 import (
@@ -14,12 +14,13 @@ import (
 )
 
 const (
-	exitOK    = 0
-	exitFatal = 1
-	exitUsage = 2
+	exitOK      = 0
+	exitFatal   = 1
+	exitUsage   = 2
+	exitPartial = 3
 )
 
-// Run выполняет запуск и возвращает код выхода процесса.
+// Run executes the command and returns its process exit code.
 func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("2csv", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -50,9 +51,17 @@ func Run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	log := logx.New(stderr)
-	if _, err := app.Run(log, root); err != nil {
+	result, err := app.Run(log, root)
+	if err != nil {
 		log.Errorf("%v", err)
 		return exitFatal
+	}
+	return resultExitCode(result)
+}
+
+func resultExitCode(result app.Result) int {
+	if result.FilesFail > 0 {
+		return exitPartial
 	}
 	return exitOK
 }
@@ -82,24 +91,26 @@ func printUsage(w io.Writer) {
   .sql         INSERT ... VALUES с PII в таблице или минимум в двух колонках → CSV рядом
                табличный дамп (шапка в первой непустой строке, не SQL) → {stem}.csv
   .xlsx, .xls  каждый лист → отдельный CSV рядом с книгой
-               (больше 5 листов — книга целиком пропускается)
-  .csv, .txt   больше 1_000_000 строк режутся на части до 500_000
+               (больше 5 листов или .xls больше 256 MiB — книга пропускается)
+  .csv, .txt   больше 4_000_000 строк режутся на части до 2_000_000
   readme.txt и служебные файлы программы не обрабатываются.
 
 Пул воркеров один на весь запуск.
 Нарезка: {имя}.csv, {имя}_2.csv, {имя}_3.csv (у .txt так же: {имя}_2.txt).
 Режутся и свежие CSV, и уже лежавшие .csv / .txt. У .txt шапки нет.
 .sql, .xlsx и .xls удаляются, если из файла получен CSV и ошибок не было.
-Существующий целевой CSV заменяется, варианты (n) не создаются.
+Целевой CSV, лежавший до запуска, заменяется; результат текущего запуска не затирается;
+варианты (n) не создаются.
 
 Состояния верхних папок — файлы в корне, по одному имени папки на строку:
   _convert_done_.txt     из .sql / Excel получен хотя бы один CSV
-  _convert_passed_.txt   конвертировать нечего или не получилось
+  _convert_passed_.txt   конвертировать нечего
   _splitter_done_.txt    нарезан хотя бы один файл
-  _splitter_passed_.txt  резать нечего или не получилось
+  _splitter_passed_.txt  резать нечего
 Конвертация и нарезка независимы: папка из _convert_* не конвертируется,
 из _splitter_* не режется; из обоих — не открывается совсем.
 Чтобы повторить этап, удалите имя папки из его списка.
+Ошибка этап не закрывает: папка автоматически повторится в следующем запуске.
 Файлы прямо в корне обрабатываются при каждом запуске.
 
 Прогресс: папка в обработке: <имя> (<N> с), обновление раз в секунду.
@@ -111,9 +122,10 @@ func printUsage(w io.Writer) {
   2csv --help   показать эту справку
 
 Коды выхода:
-  0  корень существует и обработан
-  1  выбранный корень отсутствует, не является директорией или уже обрабатывается
+  0  обработка завершена без ошибок
+  1  корень недоступен, занят другим процессом или не удалось настроить вывод
   2  ошибка в аргументах командной строки или неверный ответ combo/db
+  3  обработка завершена, но один или несколько файлов завершились с ошибкой
 
 Правила обработки описаны в CONSTRAINTS_AND_POLICY.md.
 `, config.RootDB, config.RootCombo)

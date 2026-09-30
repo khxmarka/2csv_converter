@@ -20,7 +20,7 @@ const (
 	bofSheet      uint16 = 0x0010
 )
 
-// WriteXLS пишет минимальную BIFF8-книгу (для тестов и фикстур, не для конвертера).
+// WriteXLS writes a minimal BIFF8 workbook for tests and fixtures.
 func WriteXLS(path string, sheets []Sheet) error {
 	if len(sheets) == 0 {
 		return fmt.Errorf("xlsconv: нужен хотя бы один лист")
@@ -30,6 +30,7 @@ func WriteXLS(path string, sheets []Sheet) error {
 		sheet, row, col, sst int
 	}
 	var sst []string
+	sstIndex := make(map[string]int)
 	var cells []cellRef
 	for si, sh := range sheets {
 		for r, row := range sh.Rows {
@@ -37,8 +38,13 @@ func WriteXLS(path string, sheets []Sheet) error {
 				if val == "" {
 					continue
 				}
-				cells = append(cells, cellRef{si, r, c, len(sst)})
-				sst = append(sst, val)
+				idx, ok := sstIndex[val]
+				if !ok {
+					idx = len(sst)
+					sstIndex[val] = idx
+					sst = append(sst, val)
+				}
+				cells = append(cells, cellRef{si, r, c, idx})
 			}
 		}
 	}

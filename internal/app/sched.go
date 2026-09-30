@@ -9,8 +9,8 @@ import (
 	"sql2csv/internal/scan"
 )
 
-// dirWork — одна директория. top меньше у той верхней папки, которая встретилась раньше:
-// её INSERT забирают раньше, и её директории открываются раньше других папок.
+// dirWork groups one directory. Lower top values preserve discovery order so
+// earlier top-level folders submit INSERT work and open directories first.
 type dirWork struct {
 	top   int
 	group []scan.SQLFile
@@ -35,7 +35,7 @@ func (h jobHeap) Less(i, j int) bool {
 
 func (h jobHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
 
-func (h *jobHeap) Push(x any) { *h = append(*h, x.(schedJob)) } //nolint:forcetypeassert // container/heap: в кучу кладём только schedJob
+func (h *jobHeap) Push(x any) { *h = append(*h, x.(schedJob)) } //nolint:forcetypeassert // Only schedJob values enter this heap.
 
 func (h *jobHeap) Pop() any {
 	old := *h
@@ -45,20 +45,20 @@ func (h *jobHeap) Pop() any {
 	return item
 }
 
-// runner — один пул на весь запуск.
-// Свободный воркер открывает следующую директорию только когда в очереди нет готового INSERT.
-// В одной директории по-прежнему один .sql за раз.
+// runner owns one pool for the entire run. A free worker opens another directory
+// only when no INSERT is ready, and each directory still processes one SQL file at a time.
 type runner struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	jobs     jobHeap
-	seq      uint64
-	dirs     []dirWork
-	next     int
-	scanners int
-	limit    int
-	done     bool
-	wg       sync.WaitGroup
+	mu        sync.Mutex
+	cond      *sync.Cond
+	jobs      jobHeap
+	seq       uint64
+	dirs      []dirWork
+	next      int
+	scanners  int
+	limit     int
+	scanLimit int
+	done      bool
+	wg        sync.WaitGroup
 
 	acc *accumulator
 	log *logx.Logger
@@ -85,11 +85,12 @@ func runDirs(acc *accumulator, log *logx.Logger, reg *csvout.Registry, files []s
 	}
 	n := poolSize()
 	r := &runner{
-		dirs:  dirs,
-		limit: n,
-		acc:   acc,
-		log:   log,
-		reg:   reg,
+		dirs:      dirs,
+		limit:     n,
+		scanLimit: min(n, maxConcurrentDirs),
+		acc:       acc,
+		log:       log,
+		reg:       reg,
 	}
 	r.cond = sync.NewCond(&r.mu)
 	for range n {
@@ -116,7 +117,7 @@ func (r *runner) submit(top int, fn func()) {
 }
 
 func (r *runner) fillLocked() {
-	for !r.done && len(r.jobs) == 0 && r.next < len(r.dirs) && r.scanners < r.limit {
+	for !r.done && len(r.jobs) == 0 && r.next < len(r.dirs) && r.scanners < r.scanLimit {
 		dw := r.dirs[r.next]
 		r.next++
 		r.scanners++
@@ -158,7 +159,7 @@ func (r *runner) worker() {
 			r.mu.Unlock()
 			return
 		}
-		item := heap.Pop(&r.jobs).(schedJob) //nolint:forcetypeassert // container/heap: в куче только schedJob
+		item := heap.Pop(&r.jobs).(schedJob) //nolint:forcetypeassert // Only schedJob values enter this heap.
 		if len(r.jobs) == 0 {
 			r.fillLocked()
 		}

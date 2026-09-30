@@ -7,29 +7,126 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
-const tmpPattern = ".2csv-*.tmp"
+const (
+	tmpDirName = ".2csv-tmp"
+	tmpPattern = "output-*.tmp"
+	tmpOwner   = "2csv temporary files\n"
+)
 
-// CleanupTemps удаляет незавершённые временные файлы прошлого аварийного
-// запуска в конкретной рабочей директории.
+var tempMu sync.Mutex
+
+// ErrTooManyValues reports that a VALUES row is wider than its header.
+var ErrTooManyValues = errors.New("значений больше, чем колонок")
+
+var (
+	syncOutputFile    = (*os.File).Sync
+	closeOutputFile   = (*os.File).Close
+	publishOutputFile = replaceFile
+)
+
 func CleanupTemps(dir string) error {
-	paths, err := filepath.Glob(filepath.Join(dir, tmpPattern))
+	tempMu.Lock()
+	defer tempMu.Unlock()
+	root := filepath.Join(dir, tmpDirName)
+	info, err := os.Lstat(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("csvout: %s занят не каталогом", root)
+	}
+	owner, err := os.ReadFile(filepath.Join(root, ".owner"))
+	if err != nil || string(owner) != tmpOwner {
+		return fmt.Errorf("csvout: %s не принадлежит 2csv", root)
+	}
+	paths, err := filepath.Glob(filepath.Join(root, tmpPattern))
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, path := range paths {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		entry, err := os.Lstat(path)
+		if err == nil && entry.Mode().IsRegular() {
+			err = os.Remove(path)
+		}
+		if err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
+		}
+	}
+	if len(errs) == 0 {
+		entries, readErr := os.ReadDir(root)
+		if readErr != nil {
+			errs = append(errs, readErr)
+		} else if len(entries) == 1 && entries[0].Name() == ".owner" {
+			if err := os.Remove(filepath.Join(root, ".owner")); err != nil {
+				errs = append(errs, err)
+			} else if err := os.Remove(root); err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// Writer пишет один INSERT во временный файл. После Commit: если CSV ключа
-// ещё нет — заменяет целевой {table}.csv содержимым temp;
-// если ключ уже открыт в этом запуске — дописывает только строки данных.
+func createTemp(dir string) (*os.File, error) {
+	tempMu.Lock()
+	defer tempMu.Unlock()
+	root := filepath.Join(dir, tmpDirName)
+	created := false
+	if err := os.Mkdir(root, 0o700); err == nil {
+		created = true
+	} else if !os.IsExist(err) {
+		return nil, err
+	}
+	ownerPath := filepath.Join(root, ".owner")
+	if created {
+		if err := os.WriteFile(ownerPath, []byte(tmpOwner), 0o600); err != nil {
+			_ = os.Remove(root)
+			return nil, err
+		}
+	} else {
+		owner, err := os.ReadFile(ownerPath)
+		if err != nil || string(owner) != tmpOwner {
+			return nil, fmt.Errorf("csvout: %s не принадлежит 2csv", root)
+		}
+	}
+	return os.CreateTemp(root, tmpPattern)
+}
+
+func removeTemp(path string) error {
+	err := os.Remove(path)
+	_ = pruneTempDir(filepath.Dir(filepath.Dir(path)))
+	return err
+}
+
+func pruneTempDir(dir string) error {
+	tempMu.Lock()
+	defer tempMu.Unlock()
+	root := filepath.Join(dir, tmpDirName)
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len(entries) != 1 || entries[0].Name() != ".owner" {
+		return nil
+	}
+	if err := os.Remove(filepath.Join(root, ".owner")); err != nil {
+		return err
+	}
+	return os.Remove(root)
+}
+
+// Writer stages one INSERT in a temporary file. Commit publishes the first file
+// for a merge key or appends only data rows to an output created in this run.
 type Writer struct {
 	reg         *Registry
 	slot        *slot
@@ -44,18 +141,17 @@ type Writer struct {
 	wroteHeader bool
 }
 
-// Result — итог успешного Commit.
+// Result describes a successful Commit.
 type Result struct {
 	Path        string
 	PaddedRows  int
 	Appended    bool
-	SkippedRows int // строки шире ключа, пропущенные при влитии
+	SkippedRows int // Rows skipped because they exceed the merge-key width.
 }
 
-// Create открывает временный файл в dir. Заголовок пишется только если это
-// первый успешный INSERT ключа (слот ещё без пути) и список колонок не пуст.
-// Иначе колонки игнорируются, ширина берётся из заголовка или первой строки
-// VALUES, в temp идут только строки данных.
+// Create stages one INSERT in dir. It writes a non-empty column list only for
+// the first successful INSERT of a merge key; later INSERT files contain data
+// rows only and use the established output width.
 func Create(reg *Registry, dir, table string, columns []string) (*Writer, error) {
 	if reg == nil {
 		return nil, fmt.Errorf("csvout: нужен Registry")
@@ -67,10 +163,9 @@ func Create(reg *Registry, dir, table string, columns []string) (*Writer, error)
 	return newWriter(reg, reg.acquire(dir, base), dir, base, columns)
 }
 
-// newWriter открывает temp для уже захваченного слота s. При ошибке слот
-// отпускается.
+// newWriter opens staging output for an acquired slot and releases the slot on failure.
 func newWriter(reg *Registry, s *slot, dir, base string, columns []string) (*Writer, error) {
-	tmp, err := os.CreateTemp(dir, tmpPattern)
+	tmp, err := createTemp(dir)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("временный CSV: %w", err)
@@ -100,8 +195,8 @@ func newWriter(reg *Registry, s *slot, dir, base string, columns []string) (*Wri
 	return w, nil
 }
 
-// CreatePlain открывает CSV со строкой заголовка и без склейки с INSERT.
-// base уже санитайзнут; при Commit целевой {base}.csv заменяется.
+// CreatePlain stages a standalone CSV with a header. base must already be
+// sanitized; Commit replaces the target file.
 func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, error) {
 	if reg == nil {
 		return nil, fmt.Errorf("csvout: нужен Registry")
@@ -117,7 +212,7 @@ func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, er
 		base = "table"
 	}
 	s := reg.acquireUnique()
-	tmp, err := os.CreateTemp(dir, tmpPattern)
+	tmp, err := createTemp(dir)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("временный CSV: %w", err)
@@ -139,15 +234,7 @@ func CreatePlain(reg *Registry, dir, base string, columns []string) (*Writer, er
 	return w, nil
 }
 
-// NCol — ширина заголовка, с которой сверяется арность VALUES.
-func (w *Writer) NCol() int {
-	if w == nil {
-		return 0
-	}
-	return w.nCol
-}
-
-// Row пишет одну строку данных. values уже нормализованы до nCol элементов.
+// Row writes values that have already been normalized to the output width.
 func (w *Writer) Row(values []string) error {
 	if w == nil || w.closed {
 		return fmt.Errorf("csvout: запись в закрытый Writer")
@@ -168,7 +255,7 @@ func (w *Writer) Row(values []string) error {
 	return err
 }
 
-// Commit вливает временный файл в итоговый CSV и снимает блокировку ключа.
+// Commit publishes staged data and releases the merge-key slot.
 func (w *Writer) Commit() (Result, error) {
 	var empty Result
 	if w == nil || w.closed {
@@ -182,10 +269,15 @@ func (w *Writer) Commit() (Result, error) {
 		return empty, err
 	}
 	tmpName := w.tmp.Name()
-	if err := w.tmp.Close(); err != nil {
+	if err := syncOutputFile(w.tmp); err != nil {
+		w.closed = true
+		w.removeTmp()
+		return empty, err
+	}
+	if err := closeOutputFile(w.tmp); err != nil {
 		w.closed = true
 		w.tmp = nil
-		_ = os.Remove(tmpName)
+		_ = removeTemp(tmpName)
 		return empty, err
 	}
 	w.tmp = nil
@@ -193,7 +285,7 @@ func (w *Writer) Commit() (Result, error) {
 
 	if w.appending {
 		err := appendCopy(w.slot.path, tmpName)
-		_ = os.Remove(tmpName)
+		_ = removeTemp(tmpName)
 		if err != nil {
 			return empty, err
 		}
@@ -202,17 +294,18 @@ func (w *Writer) Commit() (Result, error) {
 
 	final, err := w.place(tmpName)
 	if err != nil {
-		_ = os.Remove(tmpName)
+		_ = removeTemp(tmpName)
 		return empty, err
 	}
+	_ = pruneTempDir(w.dir)
 	w.slot.path = final
 	w.slot.nCol = w.nCol
 	w.slot.hasHeader = w.wroteHeader
 	return Result{Path: final, PaddedRows: w.padded}, nil
 }
 
-// place публикует первый CSV ключа. Проверка занятости и регистрация идут
-// под одним lockDir: иначе два ключа с одним именем проскочили бы оба.
+// place publishes the first CSV for a key. Collision checking and registration
+// share lockDir so two keys cannot concurrently claim the same filename.
 func (w *Writer) place(tmpName string) (string, error) {
 	dmu := w.reg.lockDir(w.dir)
 	defer dmu.Unlock()
@@ -220,7 +313,7 @@ func (w *Writer) place(tmpName string) (string, error) {
 	if w.reg.isWritten(path) {
 		return "", fmt.Errorf("%w: %s", ErrNameTaken, filepath.Base(path))
 	}
-	if err := replaceFile(tmpName, path); err != nil {
+	if err := publishOutputFile(tmpName, path); err != nil {
 		return "", err
 	}
 	w.reg.addOutput(w.dir, path, w.wroteHeader)
@@ -239,9 +332,13 @@ func appendCopy(dst, src string) error {
 	})
 }
 
-// appendTo дописывает в конец dst то, что пишет write. Провал откатывает
-// dst к исходному размеру: уже записанный CSV ключа не портится (§6).
+// appendTo appends through write and truncates dst back to its original size on
+// failure, preserving previously committed rows.
 func appendTo(dst string, write func(io.Writer) error) error {
+	return appendFile(dst, write, true)
+}
+
+func appendFile(dst string, write func(io.Writer) error, durable bool) error {
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -251,12 +348,15 @@ func appendTo(dst string, write func(io.Writer) error) error {
 		return errors.Join(err, out.Close())
 	}
 	originalSize := info.Size()
-	bw := bufio.NewWriterSize(out, 64*1024)
+	bw := bufio.NewWriter(out)
 	writeErr := write(bw)
 	if writeErr == nil {
 		writeErr = bw.Flush()
 	}
-	closeErr := out.Close()
+	if writeErr == nil && durable {
+		writeErr = syncOutputFile(out)
+	}
+	closeErr := closeOutputFile(out)
 	if writeErr != nil || closeErr != nil {
 		rollbackErr := os.Truncate(dst, originalSize)
 		return errors.Join(writeErr, closeErr, rollbackErr)
@@ -280,12 +380,11 @@ func (w *Writer) removeTmp() {
 	_ = w.tmp.Close()
 	w.tmp = nil
 	if name != "" {
-		_ = os.Remove(name)
+		_ = removeTemp(name)
 	}
 }
 
-// Abort удаляет временный файл и снимает блокировку ключа.
-// Уже записанный CSV ключа не трогает.
+// Abort removes staged data and releases the key without changing committed output.
 func (w *Writer) Abort() error {
 	if w == nil || w.closed {
 		return nil
@@ -299,7 +398,7 @@ func (w *Writer) Abort() error {
 		w.tmp = nil
 	}
 	if name != "" {
-		return os.Remove(name)
+		return removeTemp(name)
 	}
 	return nil
 }

@@ -1,4 +1,4 @@
-// Package csvout пишет CSV по правилам §5–§6: UTF-8 без BOM, все ячейки в кавычках.
+// Package csvout writes UTF-8 CSV without a BOM and quotes every cell.
 package csvout
 
 import (
@@ -18,13 +18,12 @@ var reservedStems = map[string]struct{}{
 
 const maxCSVBaseUTF16 = 251 // 255 UTF-16 units minus ".csv"
 
-// FileBase делает из имени таблицы безопасную основу имени Windows-файла.
-// Пустое после чистки → "table".
+// FileBase converts a table name to a Windows-safe filename stem, defaulting to "table".
 func FileBase(table string) string {
 	return FileBaseDefault(table, "table")
 }
 
-// FileBaseDefault — тот же санитайз Windows, что FileBase; пустой итог → empty.
+// FileBaseDefault applies FileBase sanitization with a caller-provided empty-name fallback.
 func FileBaseDefault(name, empty string) string {
 	if empty == "" {
 		empty = "table"
@@ -55,8 +54,8 @@ func limitCSVBase(base string) string {
 	return limitCSVBaseSuffix(base, "")
 }
 
-// limitCSVBaseSuffix ограничивает основу вместе с суффиксом вроде «_2».
-// Суффикс сохраняется; при усечении к префиксу добавляется тот же hash, что у limitCSVBase.
+// limitCSVBaseSuffix preserves suffixes such as "_2" while applying the same
+// stable truncation hash as limitCSVBase.
 func limitCSVBaseSuffix(base, suffix string) string {
 	if utf16Units(base)+utf16Units(suffix) <= maxCSVBaseUTF16 {
 		return base + suffix

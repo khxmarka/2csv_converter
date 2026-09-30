@@ -47,6 +47,30 @@ func TestScheduleKeepsInsertOrderWhenLaterParseFinishesFirst(t *testing.T) {
 	}
 }
 
+func TestScheduleFinalSyncFailureMarksFileFailed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.sql")
+	sql := "INSERT INTO users (email) VALUES ('first');\nINSERT INTO users (email) VALUES ('second'),('third');\n"
+	if err := os.WriteFile(path, []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	injected := fmt.Errorf("injected sync failure")
+	oldSync := syncCSVOutputs
+	syncCSVOutputs = func(paths []string) error {
+		if len(paths) != 1 || filepath.Base(paths[0]) != "users.csv" {
+			t.Fatalf("paths = %v", paths)
+		}
+		return injected
+	}
+	t.Cleanup(func() { syncCSVOutputs = oldSync })
+
+	res := Schedule(logx.New(&discardLog{}), csvout.NewRegistry(), scan.SQLFile{Path: path}, nil)
+	if !res.Failed || res.Created != 2 || res.CSV != 1 {
+		t.Fatalf("%+v", res)
+	}
+}
+
 // §6: арность строки VALUES сверяется с шириной ключа (шапка или первая
 // строка первого успешного INSERT), а не со списком колонок текущего INSERT.
 func TestScheduleRowWidthFollowsKeyWidth(t *testing.T) {
