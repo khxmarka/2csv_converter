@@ -166,7 +166,7 @@ func (s *src) skipLineComment() error {
 			}
 			return err
 		}
-		if b == '\n' {
+		if b == '\n' || b == '\r' {
 			return nil
 		}
 	}
