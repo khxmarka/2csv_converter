@@ -178,6 +178,31 @@ func TestParseStringLookingLikeInsert(t *testing.T) {
 	}
 }
 
+func TestParseLinkedInsertMarker(t *testing.T) {
+	sql := "-- exported dump\r" +
+		"https://example.test/catalog\r" +
+		"CREATE https://example.test/catalog `ignored` (`id` bigint(20));\r" +
+		"/*!40000 https://example.test/channel `ignored` DISABLE KEYS */;\r" +
+		"-- data follows\r" +
+		"https://example.test/channel `users` VALUES " +
+		"(1, 'https://example.test/profile'), (2, 'ok');"
+
+	inserts, skips := collect(t, sql)
+	if len(skips) != 0 {
+		t.Fatalf("skips: %+v", skips)
+	}
+	if len(inserts) != 1 || inserts[0].meta.Table != "users" {
+		t.Fatalf("inserts: %+v", inserts)
+	}
+	if len(inserts[0].rows) != 2 || inserts[0].rows[0][1].Text != "https://example.test/profile" {
+		t.Fatalf("rows: %+v", inserts[0].rows)
+	}
+	spilled := collectSpill(t, sql)
+	if len(spilled) != 1 || len(spilled[0].rows) != 2 || spilled[0].rows[0] != "1|https://example.test/profile" {
+		t.Fatalf("spill: %+v", spilled)
+	}
+}
+
 func TestParseSeveralInsertsInOneFile(t *testing.T) {
 	sql := `
 INSERT INTO a (id) VALUES (1);

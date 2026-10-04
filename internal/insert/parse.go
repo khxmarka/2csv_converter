@@ -1,6 +1,7 @@
 package insert
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -16,83 +17,150 @@ func Parse(r io.Reader, h Handler) error {
 	s := newSrc(r)
 	s.skipBOM()
 	for {
-		found, err := seekInsert(s)
+		markerLen, err := seekInsert(s)
 		if err != nil {
 			if err == io.EOF {
 				return nil
 			}
 			return err
 		}
-		if !found {
+		if markerLen == 0 {
 			return nil
 		}
-		if err := parseInsert(s, h); err != nil {
+		if err := parseInsert(s, h, markerLen); err != nil {
 			return err
 		}
 	}
 }
 
-func seekInsert(s *src) (bool, error) {
+func seekInsert(s *src) (int, error) {
 	for {
 		b, err := s.peek()
 		if err == io.EOF {
-			return false, nil
+			return 0, nil
 		}
 		if err != nil {
-			return false, err
+			return 0, err
 		}
 		switch {
 		case isSpace(b):
 			if _, err := s.next(); err != nil {
-				return false, err
+				return 0, err
 			}
 		case b == '-' && s.starts("--"):
 			if err := s.skipLineComment(); err != nil {
-				return false, err
+				return 0, err
 			}
 		case b == '/' && s.starts("/*"):
 			if err := s.skipBlockComment(); err != nil {
-				return false, err
+				return 0, err
 			}
 		case b == '\'', b == '"', b == '`':
 			if err := s.skipQuoted(b); err != nil {
 				if err == io.EOF {
-					return false, nil
+					return 0, nil
 				}
-				return false, err
+				return 0, err
 			}
 		case b == '[':
 			if err := s.skipBracketIdent(); err != nil {
 				if err == io.EOF {
-					return false, nil
+					return 0, nil
 				}
-				return false, err
+				return 0, err
 			}
 		case b == '$':
 			if err := s.skipDollarQuoted(); err != nil {
 				if err == io.EOF {
-					return false, nil
+					return 0, nil
 				}
-				return false, err
+				return 0, err
+			}
+		case s.starts("http://") || s.starts("https://"):
+			markerLen, err := tryLinkedInsert(s)
+			if err != nil {
+				return 0, err
+			}
+			if markerLen > 0 {
+				return markerLen, nil
+			}
+			if err := s.skipBareURL(); err != nil {
+				return 0, err
 			}
 		case identStart(b):
 			word, err := s.consumeUnquotedWord()
 			if err != nil {
-				return false, err
+				return 0, err
 			}
 			if strings.EqualFold(word, "INSERT") {
-				return true, nil
+				return len(word), nil
 			}
 		default:
 			if _, err := s.next(); err != nil {
-				return false, err
+				return 0, err
 			}
 		}
 	}
 }
 
-func parseInsert(s *src, h Handler) error {
-	start := Skip{Offset: s.pos - int64(len("INSERT")), Line: s.line}
+// tryLinkedInsert recognizes dumps where a bare URL replaces INSERT INTO.
+// DDL and prose links remain inert because the complete header must end in VALUES.
+func tryLinkedInsert(s *src) (int, error) {
+	buf, err := s.br.Peek(s.br.Size())
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+	urlEnd := 0
+	for urlEnd < len(buf) && !isSpace(buf[urlEnd]) && buf[urlEnd] != ';' {
+		urlEnd++
+	}
+	if urlEnd == len(buf) {
+		return 0, nil
+	}
+	if !isLinkedInsertHeader(buf[urlEnd:]) {
+		return 0, nil
+	}
+	s.advance(buf[:urlEnd])
+	return urlEnd, nil
+}
+
+func isLinkedInsertHeader(buf []byte) bool {
+	probe := newSrc(bytes.NewReader(buf))
+	if _, err := parseTableName(probe); err != nil {
+		return false
+	}
+	if err := probe.skipSpaceAndComments(); err != nil {
+		return false
+	}
+	if b, err := probe.peek(); err == nil && b == '(' {
+		if _, err := parseColumnList(probe); err != nil {
+			return false
+		}
+	}
+	values, err := probe.tryKeyword("VALUES")
+	return err == nil && values
+}
+
+func (s *src) skipBareURL() error {
+	for {
+		b, err := s.peek()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if isSpace(b) || b == ';' {
+			return nil
+		}
+		if _, err := s.next(); err != nil {
+			return err
+		}
+	}
+}
+
+func parseInsert(s *src, h Handler, markerLen int) error {
+	start := Skip{Offset: s.pos - int64(markerLen), Line: s.line}
 	skip := func(reason string, table string) error {
 		if h.Skip != nil {
 			h.Skip(Skip{Offset: start.Offset, Line: start.Line, Table: table, Reason: reason})
